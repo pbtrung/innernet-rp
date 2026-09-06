@@ -147,24 +147,33 @@ implemented and unit-tested; the `docker-tests/` scenario above (real
 interfaces, real traffic) has not been run and is the remaining gap before
 this milestone is fully done.
 
-## M5 — Permissive mode & mixed-fleet interop
+## M5 — Permissive mode & mixed-fleet interop — mostly DONE (docker-tests scenario still open)
 
-- Implement the strict-vs-permissive branch in `PeerDiff`/
-  `peer_config_builder` (`shared/src/peer.rs:715`): peers with no advertised
-  `rosenpass_public_key` are skipped entirely in strict mode, get a normal
-  no-PSK WireGuard entry in permissive mode.
-- `docker-tests/` scenario: three peers — two with `--enable-rosenpass
-  --rosenpass-permissive`, one plain/legacy — confirm the legacy peer
-  connects fine to the permissive peers (no PSK) while the two
-  Rosenpass-enabled peers still get PQ protection between themselves; and a
-  second scenario without `--rosenpass-permissive` confirming the legacy peer
-  is correctly excluded (strict mode).
-- CLI docs/help text (`doc/innernet.8` source, `--help` output) explaining
-  the fail-open tradeoff explicitly, per design.md §6.
+- Implemented as `client_core::interface::apply_rosenpass_visibility_policy`,
+  called from `fetch()` right before diffing against the WireGuard device —
+  **not** inside `PeerDiff`/`peer_config_builder` as originally sketched.
+  Simpler approach found while implementing: the server already makes a
+  disabled peer "disappear" by filtering it out of `/state` at the SQL
+  level (never present-but-flagged), and `Device::diff`'s existing add/
+  remove logic already turns a peer's absence into a clean removal. Strict
+  mode reuses that exact mechanism — removing peers with no
+  `rosenpass_public_key_hash` from the list *before* it reaches `diff()` —
+  instead of teaching `PeerDiff` a new code path. Permissive mode (or
+  Rosenpass disabled) leaves the list untouched.
+- Covered by unit tests (`client-core/src/interface.rs`): strict mode
+  excludes keyless peers (never excluding self), permissive mode and
+  Rosenpass-disabled both keep everyone.
+- `--rosenpass-permissive`'s `--help` text now explicitly states the
+  fail-open tradeoff (design.md §6) rather than just describing the
+  mechanism.
+- **Not yet done**: the `docker-tests/` mixed-fleet scenario (three real
+  containers — two Rosenpass-enabled with one permissive, one plain/legacy —
+  confirming actual connectivity, not just the peer-list-filtering unit
+  tests above) remains open, same real-interface gap noted in M4.
 
-**Acceptance**: both mixed-fleet scenarios above pass; this is the point at
-which the feature is safe to recommend for real (partial) rollout on a live
-network.
+**Acceptance**: partially met — the policy logic is implemented and unit-
+tested; real three-peer connectivity via `docker-tests/` has not been
+verified and is the remaining gap.
 
 ## M6 — Server as a mesh peer
 

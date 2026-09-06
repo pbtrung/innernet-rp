@@ -12,7 +12,8 @@ use colored::{ColoredString, Colorize};
 use innernet_shared::{
     get_local_addrs, update_hosts_file,
     wg::{self, DeviceExt as _},
-    Endpoint, PeerChange, PeerDiff, RedeemContents, RosenpassOpts, State, REDEEM_TRANSITION_WAIT,
+    Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, RosenpassOpts, State,
+    REDEEM_TRANSITION_WAIT,
 };
 use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
 use thiserror::Error;
@@ -246,6 +247,9 @@ pub fn fetch(
         }
     }
 
+    let our_public_key = config.interface.public_key()?;
+    apply_rosenpass_visibility_policy(&mut peers, rosenpass_opts, &our_public_key);
+
     let device = Device::get(interface, network_opts.backend)?;
     let modifications = device.diff(&peers);
 
@@ -282,7 +286,6 @@ pub fn fetch(
         report_candidates(&rest_client, nat, listen_port)?;
 
         if rosenpass_opts.enable_rosenpass {
-            let our_public_key = config.interface.public_key()?;
             if let Err(e) = crate::rosenpass::sync(
                 data_dir,
                 interface,
@@ -421,5 +424,110 @@ pub fn interface_is_up(backend: Backend, interface_name: &InterfaceName) -> bool
     match Device::list(backend) {
         Ok(interfaces) => interfaces.contains(interface_name),
         _ => false,
+    }
+}
+
+/// In strict Rosenpass mode (`--enable-rosenpass` without `--rosenpass-permissive`), removes
+/// any peer that hasn't advertised a `rosenpass_public_key_hash` from `peers` *before* diffing
+/// against the WireGuard device — the same mechanism the server already uses to make a disabled
+/// peer "disappear" (filtered out of `/state` at the SQL level, never present-but-flagged),
+/// which `Device::diff`'s existing add/remove logic already turns into a clean removal with no
+/// separate code path needed. Permissive mode (or Rosenpass disabled entirely) leaves the list
+/// untouched. See doc/design.md 5.8 for why this is a client-side, per-operator policy rather
+/// than something the server enforces.
+fn apply_rosenpass_visibility_policy(
+    peers: &mut Vec<Peer>,
+    rosenpass_opts: &RosenpassOpts,
+    our_public_key: &str,
+) {
+    if !rosenpass_opts.enable_rosenpass || rosenpass_opts.rosenpass_permissive {
+        return;
+    }
+    peers.retain(|p| p.public_key == our_public_key || p.rosenpass_public_key_hash.is_some());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innernet_shared::PeerContents;
+    use std::net::IpAddr;
+
+    fn test_peer(public_key: &str, rosenpass_public_key_hash: Option<&str>) -> Peer {
+        Peer {
+            id: 1,
+            contents: PeerContents {
+                name: "peer".parse().unwrap(),
+                ip: "10.0.0.2".parse::<IpAddr>().unwrap(),
+                cidr_id: 1,
+                public_key: public_key.to_string(),
+                endpoint: None,
+                persistent_keepalive_interval: None,
+                is_admin: false,
+                is_disabled: false,
+                is_redeemed: true,
+                invite_expires: None,
+                candidates: vec![],
+                rosenpass_public_key: None,
+                rosenpass_public_key_hash: rosenpass_public_key_hash.map(String::from),
+                rosenpass_addr: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_strict_mode_excludes_peers_without_rosenpass_key() {
+        let mut peers = vec![
+            test_peer("self", None),
+            test_peer("has-key", Some("hash")),
+            test_peer("no-key", None),
+        ];
+        let opts = RosenpassOpts {
+            enable_rosenpass: true,
+            rosenpass_permissive: false,
+        };
+
+        apply_rosenpass_visibility_policy(&mut peers, &opts, "self");
+
+        let remaining: Vec<_> = peers.iter().map(|p| p.public_key.as_str()).collect();
+        assert_eq!(remaining, vec!["self", "has-key"]);
+    }
+
+    #[test]
+    fn test_permissive_mode_keeps_all_peers() {
+        let mut peers = vec![test_peer("self", None), test_peer("no-key", None)];
+        let opts = RosenpassOpts {
+            enable_rosenpass: true,
+            rosenpass_permissive: true,
+        };
+
+        apply_rosenpass_visibility_policy(&mut peers, &opts, "self");
+
+        assert_eq!(peers.len(), 2);
+    }
+
+    #[test]
+    fn test_rosenpass_disabled_keeps_all_peers() {
+        let mut peers = vec![test_peer("self", None), test_peer("no-key", None)];
+        let opts = RosenpassOpts {
+            enable_rosenpass: false,
+            rosenpass_permissive: false,
+        };
+
+        apply_rosenpass_visibility_policy(&mut peers, &opts, "self");
+
+        assert_eq!(peers.len(), 2);
+    }
+
+    #[test]
+    fn test_strict_mode_never_excludes_self() {
+        let mut peers = vec![test_peer("self", None)];
+        let opts = RosenpassOpts {
+            enable_rosenpass: true,
+            rosenpass_permissive: false,
+        };
+
+        apply_rosenpass_visibility_policy(&mut peers, &opts, "self");
+
+        assert_eq!(peers.len(), 1);
     }
 }

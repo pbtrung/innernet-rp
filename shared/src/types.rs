@@ -561,9 +561,12 @@ pub struct RosenpassOpts {
 
     /// When Rosenpass is enabled, fall back to plain WireGuard (no preshared key) for peers
     /// that haven't advertised a Rosenpass public key, instead of refusing to connect to them.
-    /// Without this flag, a peer with no advertised key is treated as unreachable. See
-    /// doc/design.md 5.8 for why this is a client-side, per-operator choice rather than
-    /// something the server can enforce.
+    /// Without this flag, a peer with no advertised key is treated as unreachable ("strict"
+    /// mode). This is a fail-open tradeoff: a downgrade to no post-quantum protection for that
+    /// peer happens silently, with no error - a deliberate choice for mixed fleets (e.g. mobile
+    /// peers, which can never advertise a key at all - see doc/design.md 5.8) but one you should
+    /// make consciously per network, not enable by default without considering it. This is
+    /// always a client-side, per-operator choice; the server cannot enforce either mode.
     #[clap(long = "rosenpass-permissive", requires = "enable_rosenpass")]
     pub rosenpass_permissive: bool,
 }

@@ -385,14 +385,25 @@ pub struct RosenpassOpts {
 NetBird will already expect — see §2.1.)
 
 Semantics: with Rosenpass enabled but *not* permissive, a peer with no
-advertised `rosenpass_public_key` is treated as **unreachable** (no
+advertised `rosenpass_public_key_hash` is treated as **unreachable** (no
 WireGuard peer entry is created for it) — this matches NetBird's documented
 "connections will fail" behavior and is the strict/compliance mode. With
 `--rosenpass-permissive`, such peers get a normal WireGuard peer entry with
 no PSK, i.e. today's behavior, while peers that *do* advertise Rosenpass still
-get PQ protection. This logic lives in `PeerDiff`/`peer_config_builder`
-(`shared/src/peer.rs:715`), the single choke point that already decides what
-to do with each peer's config.
+get PQ protection.
+
+Implemented as `client_core::interface::apply_rosenpass_visibility_policy`,
+called from `fetch()` right before diffing against the WireGuard device —
+**not** inside `PeerDiff`/`peer_config_builder` (`shared/src/types.rs:715`,
+the actual location of that logic — not `shared/src/peer.rs` as an earlier
+draft of this doc said) as originally planned. A simpler mechanism was found
+while implementing: the server already makes a disabled peer "disappear" by
+filtering it out of `/state` at the SQL level (never present-but-flagged,
+see `server/src/db/peer.rs`'s `get_all_allowed_peers`), and `Device::diff`'s
+existing add/remove logic already turns a peer's absence into a clean
+removal. Strict mode reuses that exact mechanism — removing peers with no
+advertised key from the list *before* it reaches `diff()` — rather than
+teaching `PeerDiff` a new code path.
 
 **Mobile/non-innernet peers make permissive mode a permanent requirement, not
 a transitional one.** There is no Rosenpass client for Android or iOS, and
