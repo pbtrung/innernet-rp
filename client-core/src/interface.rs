@@ -286,6 +286,7 @@ pub fn fetch(
             if let Err(e) = crate::rosenpass::sync(
                 data_dir,
                 interface,
+                network_opts.backend,
                 rosenpass_opts,
                 &config.server,
                 &our_public_key,

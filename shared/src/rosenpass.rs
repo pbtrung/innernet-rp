@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
-use wireguard_control::InterfaceName;
+use wireguard_control::{InterfaceName, Key};
 
 /// Where a given interface's Rosenpass keypair (and, later, its exchange-daemon config/state)
 /// lives on disk: `<data_dir>/rosenpass/<interface>/`, alongside (not inside) the plain
@@ -115,6 +115,33 @@ pub fn read_public_key_base64_at(path: &Path) -> Result<String, Error> {
     }
 
     Ok(base64::engine::general_purpose::STANDARD.encode(raw))
+}
+
+/// Derives a deterministic placeholder WireGuard preshared key from two peers' Rosenpass public
+/// keys, for the window before their first real exchange completes (which can take a noticeable
+/// moment — the daemon has to start, dial/be dialed, and complete a post-quantum handshake).
+/// Without this, that window would leave the tunnel with no PSK at all.
+///
+/// Both sides must derive the *same* value without coordinating, so the two keys are sorted
+/// before hashing — order of arguments doesn't matter, matching NetBird's equivalent mechanism
+/// (their `DeterministicSeedKey()`) and the same "sort, don't pick a side" principle already
+/// used for the dial/listen tie-break above.
+///
+/// This is **not** a substitute for the real exchange: it provides no post-quantum protection at
+/// all (it's derived from public keys with a public hash function, not a key exchange) — only
+/// bridging the gap so the tunnel isn't left with zero PSK while waiting.
+pub fn interim_preshared_key(a_public_key_base64: &str, b_public_key_base64: &str) -> Key {
+    use sha2::{Digest, Sha256};
+    let (first, second) = if a_public_key_base64 <= b_public_key_base64 {
+        (a_public_key_base64, b_public_key_base64)
+    } else {
+        (b_public_key_base64, a_public_key_base64)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"innernet-rosenpass-interim-psk-v1");
+    hasher.update(first.as_bytes());
+    hasher.update(second.as_bytes());
+    Key(hasher.finalize().into())
 }
 
 /// Paths for a running (or to-be-started) Rosenpass exchange daemon for one interface.
@@ -442,6 +469,22 @@ mod tests {
                 .unwrap(),
             raw
         );
+    }
+
+    #[test]
+    fn test_interim_preshared_key_symmetric_and_deterministic() {
+        let a = "a-public-key";
+        let b = "b-public-key";
+
+        let from_a_b = interim_preshared_key(a, b);
+        let from_b_a = interim_preshared_key(b, a);
+        assert_eq!(
+            from_a_b, from_b_a,
+            "both sides must derive the same interim PSK regardless of argument order"
+        );
+
+        let different = interim_preshared_key(a, "some-other-key");
+        assert_ne!(from_a_b, different);
     }
 
     #[test]

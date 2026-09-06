@@ -109,24 +109,43 @@ WireGuard PSK is touched yet (that's M4).
 other's config, and negotiate, verified by real process runs and the
 `#[ignore]`d tests in `shared/src/rosenpass.rs`.
 
-## M4 — PSK application
+## M4 — PSK application — mostly DONE (docker-tests scenario still open)
 
-- Wire the PSK-handoff mechanism decided in M0 into
-  `PeerConfigBuilder::set_preshared_key` + `DeviceUpdate::apply`, applied
-  without removing/re-adding the peer.
-- Apply the deterministic interim PSK (derived from both sides' Rosenpass
-  public keys, per design.md §5.6) immediately on peer add, before the first
-  real Rosenpass exchange completes.
-- `docker-tests/` scenario: two containers, both `--enable-rosenpass`,
-  confirm (a) traffic flows immediately via the interim PSK, (b) the PSK
-  changes after the first real Rosenpass exchange, (c) it continues rotating
-  (~2 min cadence) without dropped traffic, (d) file/process permissions on
-  the secret key and PSK handoff file are `0o600`/owner-only.
+- `client_core::rosenpass::apply_psks` wires the PSK-handoff mechanism from
+  M0 into `PeerConfigBuilder::set_preshared_key` + `DeviceUpdate::apply`,
+  applied without removing/re-adding the peer, as its own follow-up device
+  update after the main peer diff.
+- A peer with no completed exchange yet gets `interim_preshared_key`
+  (`shared::rosenpass`) applied immediately: both sides derive it
+  independently from their sorted Rosenpass public keys (design.md §5.6),
+  so the tunnel isn't left with zero PSK while waiting.
+- Once a peer's exchange completes, `poll_new_events`'s `exchanged` line is
+  what triggers reading its `key_out` file and applying the real key — a
+  `stale` event is logged but deliberately does **not** touch the
+  already-applied key (see design.md §5.6 on why the file's raw bytes alone
+  can't distinguish the two cases).
+- Covered by unit tests with synthetic log/event data (interim vs. real vs.
+  stale branching) in `client-core/src/rosenpass.rs`, plus the real-binary
+  convergence test from M3 that confirms the underlying mechanism (both
+  sides' `key_out` files) actually produces applicable, matching keys.
+- **Not yet done**: no real WireGuard interface was exercised end-to-end
+  (this sandbox has no root/CAP_NET_ADMIN to create one) — the
+  `DeviceUpdate`/`PeerConfigBuilder` calls themselves are exercised by
+  wireguard-control's own existing test suite, but applying a
+  rosenpass-derived key to a *live* interface and confirming traffic keeps
+  flowing has not been verified. The `docker-tests/` scenario below (real
+  containers, real interfaces) is what would close that gap and remains
+  open:
+  - two containers, both `--enable-rosenpass`, confirm (a) traffic flows
+    immediately via the interim PSK, (b) the PSK changes after the first
+    real Rosenpass exchange, (c) it continues rotating (~2 min cadence)
+    without dropped traffic, (d) file/process permissions on the secret key
+    and PSK handoff file are `0o600`/owner-only.
 
-**Acceptance**: the `docker-tests/` scenario above passes reliably (run it
-multiple times — this is the milestone most likely to be flaky, since it
-depends on real timing/rotation); a captured packet trace or `wg show`
-diff demonstrates the PSK actually changes over the test's lifetime.
+**Acceptance**: partially met — PSK selection/application logic is
+implemented and unit-tested; the `docker-tests/` scenario above (real
+interfaces, real traffic) has not been run and is the remaining gap before
+this milestone is fully done.
 
 ## M5 — Permissive mode & mixed-fleet interop
 

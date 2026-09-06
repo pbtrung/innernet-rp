@@ -13,15 +13,16 @@ use anyhow::{Context as _, Error};
 use base64::Engine;
 use innernet_shared::{
     interface_config::ServerInfo,
-    rosenpass::{self, DaemonPaths, RosenpassKeyPaths, RosenpassPeerConfig},
+    rosenpass::{self, interim_preshared_key, DaemonPaths, RosenpassKeyPaths, RosenpassPeerConfig},
     rosenpass_public_key_hash, Peer, RosenpassContents, RosenpassOpts,
 };
 use std::path::Path;
-use wireguard_control::InterfaceName;
+use wireguard_control::{Backend, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
 
 /// Ensures a Rosenpass keypair exists for this interface (generating one on first use), keeps
 /// the server's record of our own public key/address in sync, caches any peers' keys we don't
-/// already have, and (re)starts the exchange daemon if the resulting peer set/config changed.
+/// already have, (re)starts the exchange daemon if the resulting peer set/config changed, and
+/// applies any newly-derived preshared keys (real or interim) to the WireGuard interface.
 ///
 /// `our_wg_public_key` identifies "ourselves" in `peers` (the just-fetched peer list) — matching
 /// the same way the rest of the fetch loop identifies the local interface's own peer entry.
@@ -32,6 +33,7 @@ use wireguard_control::InterfaceName;
 pub fn sync(
     data_dir: &Path,
     interface: &InterfaceName,
+    backend: Backend,
     rosenpass_opts: &RosenpassOpts,
     server: &ServerInfo,
     our_wg_public_key: &str,
@@ -48,6 +50,7 @@ pub fn sync(
         log::info!("generating rosenpass keypair for {interface}");
         rosenpass::generate_keypair(&key_paths)?;
     }
+    let our_rosenpass_key = rosenpass::read_public_key_base64(&key_paths)?;
 
     let rosenpass_port = wg_listen_port.checked_add(1).unwrap_or_else(|| {
         log::warn!(
@@ -62,7 +65,12 @@ pub fn sync(
         .and_then(|p| p.endpoint.as_ref())
         .map(|wg_endpoint| wg_endpoint.with_port(rosenpass_port));
 
-    sync_registration(server, &key_paths, self_peer, our_rosenpass_addr.as_ref())?;
+    sync_registration(
+        server,
+        &our_rosenpass_key,
+        self_peer,
+        our_rosenpass_addr.as_ref(),
+    )?;
 
     // Exactly one side of each peer pair must dial (set `endpoint`); the other must leave it
     // unset and rely solely on its own `listen` socket. Configuring *both* sides to dial each
@@ -72,7 +80,7 @@ pub fn sync(
     // error. Both peers must independently reach the same dial/listen assignment without
     // coordinating, so it's derived from something both already know: peer ID. The lower ID
     // always dials the higher one - an arbitrary but deterministic, symmetric tie-break, in the
-    // same spirit as sorting both sides' keys for the interim PSK (design.md 5.6).
+    // same spirit as sorting both sides' keys for the interim PSK below.
     let our_peer_id = self_peer.map(|p| p.id);
 
     let rest_client = RestClient::new(server);
@@ -104,6 +112,15 @@ pub fn sync(
 
     rosenpass::ensure_daemon_running(&rosenpass_dir, &key_paths, rosenpass_port, &peer_configs)?;
 
+    apply_psks(
+        interface,
+        backend,
+        &rosenpass_dir,
+        &our_rosenpass_key,
+        &peer_configs,
+        peers,
+    )?;
+
     Ok(())
 }
 
@@ -111,12 +128,11 @@ pub fn sync(
 /// the server has on record (see module docs on why this is idempotent rather than unconditional).
 fn sync_registration(
     server: &ServerInfo,
-    key_paths: &RosenpassKeyPaths,
+    our_rosenpass_key: &str,
     self_peer: Option<&Peer>,
     our_rosenpass_addr: Option<&innernet_shared::Endpoint>,
 ) -> Result<(), Error> {
-    let local_key = rosenpass::read_public_key_base64(key_paths)?;
-    let local_hash = rosenpass_public_key_hash(&local_key);
+    let local_hash = rosenpass_public_key_hash(our_rosenpass_key);
 
     let already_registered = self_peer.is_some_and(|p| {
         p.rosenpass_public_key_hash.as_deref() == Some(local_hash.as_str())
@@ -130,11 +146,122 @@ fn sync_registration(
 
     log::info!("registering rosenpass public key/address with server");
     RestClient::new(server).register_rosenpass_key(&RosenpassContents {
-        public_key: Some(local_key),
+        public_key: Some(our_rosenpass_key.to_string()),
         addr: our_rosenpass_addr.cloned(),
     })?;
 
     Ok(())
+}
+
+/// Applies any newly-available preshared keys to the WireGuard interface: a real,
+/// Rosenpass-derived key for any peer whose exchange just completed (see
+/// `rosenpass::poll_new_events` for why only *new* `exchanged` events are trusted, never a
+/// peer's `key_out` file read blindly), or — for a peer with no exchange completed yet — a
+/// deterministic interim key, so the tunnel isn't left with no PSK at all while the first real
+/// handshake is still in progress. Applied as a single, separate `DeviceUpdate` from the main
+/// peer diff, but just as non-disruptive: wireguard-control merges peer settings onto the
+/// existing peer rather than replacing it.
+fn apply_psks(
+    interface: &InterfaceName,
+    backend: Backend,
+    rosenpass_dir: &Path,
+    our_rosenpass_key: &str,
+    peer_configs: &[RosenpassPeerConfig],
+    peers: &[Peer],
+) -> Result<(), Error> {
+    let daemon_paths = DaemonPaths::new(rosenpass_dir);
+    let events = rosenpass::poll_new_events(&daemon_paths)?;
+
+    let mut builders = Vec::new();
+    for peer_cfg in peer_configs {
+        let Some(peer) = peers.iter().find(|p| p.id == peer_cfg.peer_id) else {
+            continue;
+        };
+        let Ok(wg_pubkey) = Key::from_base64(&peer.public_key) else {
+            log::warn!(
+                "peer {} has an unparseable WireGuard public key, skipping PSK application",
+                peer_cfg.peer_id
+            );
+            continue;
+        };
+
+        let key_out_path = DaemonPaths::peer_key_out_path(rosenpass_dir, peer_cfg.peer_id);
+
+        if let Some(psk) = fresh_exchanged_psk(&events, &key_out_path, peer_cfg.peer_id) {
+            log::info!(
+                "applying fresh rosenpass-derived preshared key for peer {}",
+                peer_cfg.peer_id
+            );
+            builders.push(PeerConfigBuilder::new(&wg_pubkey).set_preshared_key(psk));
+            continue;
+        }
+
+        if events
+            .iter()
+            .any(|e| e.key_out_path == key_out_path && !e.fresh)
+        {
+            log::warn!(
+                "peer {}'s rosenpass session went stale (dropped/expired) - leaving its last \
+                 applied preshared key in place rather than a random one",
+                peer_cfg.peer_id
+            );
+        }
+
+        if !key_out_path.exists() {
+            match rosenpass::read_public_key_base64_at(&peer_cfg.public_key_path) {
+                Ok(peer_key) => {
+                    let interim = interim_preshared_key(our_rosenpass_key, &peer_key);
+                    log::info!(
+                        "applying interim preshared key for peer {} pending its first rosenpass \
+                         exchange",
+                        peer_cfg.peer_id
+                    );
+                    builders.push(PeerConfigBuilder::new(&wg_pubkey).set_preshared_key(interim));
+                },
+                Err(e) => log::warn!(
+                    "failed to derive interim preshared key for peer {}: {e}",
+                    peer_cfg.peer_id
+                ),
+            }
+        }
+    }
+
+    if !builders.is_empty() {
+        DeviceUpdate::new()
+            .add_peers(&builders)
+            .apply(interface, backend)
+            .context("failed to apply rosenpass-derived preshared keys")?;
+    }
+
+    Ok(())
+}
+
+/// Returns the derived key from a fresh `exchanged` event matching `key_out_path`, if there is
+/// one among `events` (only newly-observed events since the last poll — see
+/// `rosenpass::poll_new_events`).
+fn fresh_exchanged_psk(
+    events: &[rosenpass::ExchangeEvent],
+    key_out_path: &Path,
+    peer_id: i64,
+) -> Option<Key> {
+    if !events
+        .iter()
+        .any(|e| e.key_out_path == key_out_path && e.fresh)
+    {
+        return None;
+    }
+    match std::fs::read_to_string(key_out_path)
+        .context("failed to read rosenpass key_out file")
+        .and_then(|contents| {
+            Key::from_base64(contents.trim())
+                .map_err(|e| anyhow::anyhow!("invalid base64 in rosenpass key_out file: {e}"))
+        }) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            log::warn!("failed to read exchanged rosenpass preshared key for peer {peer_id}: {e}");
+            None
+        },
+    }
 }
 
 /// Ensures a peer's raw public key is cached locally at
