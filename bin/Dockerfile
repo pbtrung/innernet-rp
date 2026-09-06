@@ -52,7 +52,8 @@ RUN curl -fsSL -o /tmp/libsodium.tar.gz \
     && make install \
     && rm -rf /tmp/libsodium*
 
-RUN cargo install --version "${ROSENPASS_VERSION}" --locked --root /out rosenpass
+RUN cargo install --version "${ROSENPASS_VERSION}" --locked --root /out rosenpass \
+    && strip /out/bin/rosenpass
 
 # Minimal export stage: `-o type=local,dest=...` extracts this stage's entire filesystem, so keep
 # it to just the one file we actually want.
