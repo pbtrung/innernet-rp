@@ -149,6 +149,40 @@ or unset the port and use a randomized port with
 sudo innernet set-listen-port -u <interface>
 ```
 
+### Post-Quantum Key Exchange with Rosenpass
+
+innernet can optionally use [Rosenpass](https://rosenpass.eu) to add
+post-quantum-secure key material to the WireGuard tunnel between peers, protecting
+against "harvest now, decrypt later" attacks. This requires the `rosenpass` binary
+(version 0.2.1 or newer — earlier versions have a known remote-DoS
+vulnerability, [CVE-2023-53157](https://osv.dev/vulnerability/CVE-2023-53157))
+to be installed and on `PATH`.
+
+To enable it, pass `--enable-rosenpass` to `install`, `up`, or `fetch`:
+
+```sh
+sudo innernet up --enable-rosenpass <interface>
+```
+
+By default, a peer that hasn't enabled Rosenpass (or has no Rosenpass client at
+all — for example a phone running the stock WireGuard app) is treated as
+unreachable. To allow falling back to plain WireGuard for such peers instead, add
+`--rosenpass-permissive`:
+
+```sh
+sudo innernet up --enable-rosenpass --rosenpass-permissive <interface>
+```
+
+**This is a fail-open tradeoff**: a peer without Rosenpass silently gets no
+post-quantum protection on that link, with no error. See
+[`doc/design.md`](doc/design.md) for the full design rationale, including why
+mobile/non-innernet peers make permissive mode a practical necessity rather than
+a temporary migration step, and why this flag is always a per-operator,
+client-side choice rather than something the server enforces.
+
+`innernet-server serve` accepts the same two flags, so the coordination API's own
+WireGuard link can carry a Rosenpass PSK too.
+
 ### Remove Network
 
 To permanently uninstall a created network, use
@@ -187,6 +221,16 @@ Even following all the above precautions, rogue applications on a peer's machine
 
 It's recommended that you carefully consider this possibility before deciding that the source IP is sufficient for your authentication needs on a service.
 
+### `--rosenpass-permissive` is fail-open
+
+If you enable Rosenpass with `--rosenpass-permissive`, a peer that hasn't (or
+can't) enable Rosenpass silently falls back to plain WireGuard for that link —
+there is no error or warning visible to other peers. This is a deliberate
+tradeoff for mixed fleets (see [Post-Quantum Key Exchange with
+Rosenpass](#post-quantum-key-exchange-with-rosenpass) above), not a bug, but
+you should decide on it consciously per network rather than enabling it by
+default without considering whether it fits your threat model.
+
 ## Installation
 
 `innernet` has only been officially tested on Linux and macOS. Experimental OpenBSD support has been added recently. Feedback from early testers is most welcome. Please report any issues you may encounter.
@@ -197,6 +241,11 @@ We hope to support more platforms in the future.
 It's assumed that WireGuard is present on your system, either via kernel support (`Linux 5.6` and later or `OpenBSD 6.8` and later) or by installing the [`wireguard-go`](https://git.zx2c4.com/wireguard-go/about/) userspace implementation.
 
 [WireGuard Installation Instructions](https://www.wireguard.com/install/)
+
+Optionally, if you want post-quantum key exchange (see [Post-Quantum Key Exchange
+with Rosenpass](#post-quantum-key-exchange-with-rosenpass) above), install
+[`rosenpass`](https://rosenpass.eu) version 0.2.1 or newer, e.g. via
+`cargo install rosenpass --locked`.
 
 ### Arch Linux
 

@@ -1,27 +1,27 @@
 # Print an optspec for argparse to handle cmd's options that are independent of any subcommand.
 function __fish_innernet_server_global_optspecs
-	string join \n c/config-dir= d/data-dir= no-routing backend= mtu= h/help V/version
+    string join \n c/config-dir= d/data-dir= no-routing backend= mtu= h/help V/version
 end
 
 function __fish_innernet_server_needs_command
-	# Figure out if the current invocation already has a command.
-	set -l cmd (commandline -opc)
-	set -e cmd[1]
-	argparse -s (__fish_innernet_server_global_optspecs) -- $cmd 2>/dev/null
-	or return
-	if set -q argv[1]
-		# Also print the command, so this can be used to figure out what it is.
-		echo $argv[1]
-		return 1
-	end
-	return 0
+    # Figure out if the current invocation already has a command.
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    argparse -s (__fish_innernet_server_global_optspecs) -- $cmd 2>/dev/null
+    or return
+    if set -q argv[1]
+        # Also print the command, so this can be used to figure out what it is.
+        echo $argv[1]
+        return 1
+    end
+    return 0
 end
 
 function __fish_innernet_server_using_subcommand
-	set -l cmd (__fish_innernet_server_needs_command)
-	test -z "$cmd"
-	and return 1
-	contains -- $cmd[1] $argv
+    set -l cmd (__fish_innernet_server_needs_command)
+    test -z "$cmd"
+    and return 1
+    contains -- $cmd[1] $argv
 end
 
 complete -c innernet-server -n "__fish_innernet_server_needs_command" -s c -l config-dir -r -F
@@ -59,6 +59,8 @@ complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l host-suffix -d 'Use a different suffix for hosts, than \'INTERFACE.wg\' , ex. --host-suffix \'evilnet\' names peers: PEER.evilnet, and --host-suffix \'\' gives peers no suffix, just: PEER' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l no-routing -d 'Whether the routing should be done by innernet or is done by an external tool like e.g. babeld'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l no-write-hosts -d 'Don\'t write to any hosts files'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l enable-rosenpass -d 'Enable Rosenpass post-quantum-secure key exchange alongside WireGuard'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -l rosenpass-permissive -d 'When Rosenpass is enabled, fall back to plain WireGuard (no preshared key) for peers that haven\'t advertised a Rosenpass public key, instead of refusing to connect to them. Without this flag, a peer with no advertised key is treated as unreachable ("strict" mode). This is a fail-open tradeoff: a downgrade to no post-quantum protection for that peer happens silently, with no error - a deliberate choice for mixed fleets (e.g. mobile peers, which can never advertise a key at all - see doc/design.md 5.8) but one you should make consciously per network, not enable by default without considering it. This is always a client-side, per-operator choice; the server cannot enforce either mode'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand serve" -s h -l help -d 'Print help'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l name -d 'Name of new peer' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l ip -d 'Specify desired IP of new peer (within parent CIDR)' -r

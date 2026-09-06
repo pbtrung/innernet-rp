@@ -62,6 +62,8 @@ _arguments "${_arguments_options[@]}" : \
 '--host-suffix=[Use a different suffix for hosts, than '\''INTERFACE.wg'\'' , ex. --host-suffix '\''evilnet'\'' names peers\: PEER.evilnet, and --host-suffix '\'''\'' gives peers no suffix, just\: PEER]:HOST_SUFFIX:_default' \
 '--no-routing[Whether the routing should be done by innernet or is done by an external tool like e.g. babeld]' \
 '(--hosts-path)--no-write-hosts[Don'\''t write to any hosts files]' \
+'--enable-rosenpass[Enable Rosenpass post-quantum-secure key exchange alongside WireGuard]' \
+'--rosenpass-permissive[When Rosenpass is enabled, fall back to plain WireGuard (no preshared key) for peers that haven'\''t advertised a Rosenpass public key, instead of refusing to connect to them. Without this flag, a peer with no advertised key is treated as unreachable ("strict" mode). This is a fail-open tradeoff\: a downgrade to no post-quantum protection for that peer happens silently, with no error - a deliberate choice for mixed fleets (e.g. mobile peers, which can never advertise a key at all - see doc/design.md 5.8) but one you should make consciously per network, not enable by default without considering it. This is always a client-side, per-operator choice; the server cannot enforce either mode]' \
 '-h[Print help]' \
 '--help[Print help]' \
 ':interface:_default' \
@@ -149,7 +151,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (help)
 _arguments "${_arguments_options[@]}" : \
-":: :_innernet-server__help_commands" \
+":: :_innernet-server__subcmd__help_commands" \
 "*::: :->help" \
 && ret=0
 
@@ -234,38 +236,38 @@ _innernet-server_commands() {
     )
     _describe -t commands 'innernet-server commands' commands "$@"
 }
-(( $+functions[_innernet-server__add-cidr_commands] )) ||
-_innernet-server__add-cidr_commands() {
+(( $+functions[_innernet-server__subcmd__add-cidr_commands] )) ||
+_innernet-server__subcmd__add-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server add-cidr commands' commands "$@"
 }
-(( $+functions[_innernet-server__add-peer_commands] )) ||
-_innernet-server__add-peer_commands() {
+(( $+functions[_innernet-server__subcmd__add-peer_commands] )) ||
+_innernet-server__subcmd__add-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server add-peer commands' commands "$@"
 }
-(( $+functions[_innernet-server__completions_commands] )) ||
-_innernet-server__completions_commands() {
+(( $+functions[_innernet-server__subcmd__completions_commands] )) ||
+_innernet-server__subcmd__completions_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server completions commands' commands "$@"
 }
-(( $+functions[_innernet-server__delete-cidr_commands] )) ||
-_innernet-server__delete-cidr_commands() {
+(( $+functions[_innernet-server__subcmd__delete-cidr_commands] )) ||
+_innernet-server__subcmd__delete-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server delete-cidr commands' commands "$@"
 }
-(( $+functions[_innernet-server__disable-peer_commands] )) ||
-_innernet-server__disable-peer_commands() {
+(( $+functions[_innernet-server__subcmd__disable-peer_commands] )) ||
+_innernet-server__subcmd__disable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server disable-peer commands' commands "$@"
 }
-(( $+functions[_innernet-server__enable-peer_commands] )) ||
-_innernet-server__enable-peer_commands() {
+(( $+functions[_innernet-server__subcmd__enable-peer_commands] )) ||
+_innernet-server__subcmd__enable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server enable-peer commands' commands "$@"
 }
-(( $+functions[_innernet-server__help_commands] )) ||
-_innernet-server__help_commands() {
+(( $+functions[_innernet-server__subcmd__help_commands] )) ||
+_innernet-server__subcmd__help_commands() {
     local commands; commands=(
 'new:Create a new network' \
 'uninstall:Permanently uninstall a created network, rendering it unusable. Use with care' \
@@ -282,88 +284,88 @@ _innernet-server__help_commands() {
     )
     _describe -t commands 'innernet-server help commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__add-cidr_commands] )) ||
-_innernet-server__help__add-cidr_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__add-cidr_commands] )) ||
+_innernet-server__subcmd__help__subcmd__add-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help add-cidr commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__add-peer_commands] )) ||
-_innernet-server__help__add-peer_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__add-peer_commands] )) ||
+_innernet-server__subcmd__help__subcmd__add-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help add-peer commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__completions_commands] )) ||
-_innernet-server__help__completions_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__completions_commands] )) ||
+_innernet-server__subcmd__help__subcmd__completions_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help completions commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__delete-cidr_commands] )) ||
-_innernet-server__help__delete-cidr_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__delete-cidr_commands] )) ||
+_innernet-server__subcmd__help__subcmd__delete-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help delete-cidr commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__disable-peer_commands] )) ||
-_innernet-server__help__disable-peer_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__disable-peer_commands] )) ||
+_innernet-server__subcmd__help__subcmd__disable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help disable-peer commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__enable-peer_commands] )) ||
-_innernet-server__help__enable-peer_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__enable-peer_commands] )) ||
+_innernet-server__subcmd__help__subcmd__enable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help enable-peer commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__help_commands] )) ||
-_innernet-server__help__help_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__help_commands] )) ||
+_innernet-server__subcmd__help__subcmd__help_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help help commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__new_commands] )) ||
-_innernet-server__help__new_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__new_commands] )) ||
+_innernet-server__subcmd__help__subcmd__new_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help new commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__rename-cidr_commands] )) ||
-_innernet-server__help__rename-cidr_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__rename-cidr_commands] )) ||
+_innernet-server__subcmd__help__subcmd__rename-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help rename-cidr commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__rename-peer_commands] )) ||
-_innernet-server__help__rename-peer_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__rename-peer_commands] )) ||
+_innernet-server__subcmd__help__subcmd__rename-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help rename-peer commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__serve_commands] )) ||
-_innernet-server__help__serve_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__serve_commands] )) ||
+_innernet-server__subcmd__help__subcmd__serve_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help serve commands' commands "$@"
 }
-(( $+functions[_innernet-server__help__uninstall_commands] )) ||
-_innernet-server__help__uninstall_commands() {
+(( $+functions[_innernet-server__subcmd__help__subcmd__uninstall_commands] )) ||
+_innernet-server__subcmd__help__subcmd__uninstall_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server help uninstall commands' commands "$@"
 }
-(( $+functions[_innernet-server__new_commands] )) ||
-_innernet-server__new_commands() {
+(( $+functions[_innernet-server__subcmd__new_commands] )) ||
+_innernet-server__subcmd__new_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server new commands' commands "$@"
 }
-(( $+functions[_innernet-server__rename-cidr_commands] )) ||
-_innernet-server__rename-cidr_commands() {
+(( $+functions[_innernet-server__subcmd__rename-cidr_commands] )) ||
+_innernet-server__subcmd__rename-cidr_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server rename-cidr commands' commands "$@"
 }
-(( $+functions[_innernet-server__rename-peer_commands] )) ||
-_innernet-server__rename-peer_commands() {
+(( $+functions[_innernet-server__subcmd__rename-peer_commands] )) ||
+_innernet-server__subcmd__rename-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server rename-peer commands' commands "$@"
 }
-(( $+functions[_innernet-server__serve_commands] )) ||
-_innernet-server__serve_commands() {
+(( $+functions[_innernet-server__subcmd__serve_commands] )) ||
+_innernet-server__subcmd__serve_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server serve commands' commands "$@"
 }
-(( $+functions[_innernet-server__uninstall_commands] )) ||
-_innernet-server__uninstall_commands() {
+(( $+functions[_innernet-server__subcmd__uninstall_commands] )) ||
+_innernet-server__subcmd__uninstall_commands() {
     local commands; commands=()
     _describe -t commands 'innernet-server uninstall commands' commands "$@"
 }
