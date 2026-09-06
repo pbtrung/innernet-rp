@@ -366,18 +366,47 @@ Please run the release script from a Linux machine: generated shell completions 
 
 ### Building static amd64/arm64 binaries for deployment
 
-If you just want to build `innernet`/`innernet-server` binaries to copy onto your
-own nodes (not a full crates.io/GitHub release), run:
+If you just want to build `innernet`/`innernet-server` (and optionally
+`rosenpass`) binaries to copy onto your own nodes — not a full crates.io/GitHub
+release — run:
 
 ```sh
-./build-multiarch.sh
+./bin/build-multiarch.sh
 ```
 
-This cross-compiles statically-linked binaries for both `x86_64` and `aarch64`
-Linux via Docker (no local Rust cross-toolchain or `rustup` needed — only
-Docker), writing them to `dist/x86_64-unknown-linux-musl/` and
-`dist/aarch64-unknown-linux-musl/`. The musl target is used specifically so the
-binaries have no runtime dependencies at all (verify with `ldd`, which reports
-"not a dynamic executable") — a plain glibc build would dynamically link
-whatever `libsqlite3` happens to be on the build machine, which your nodes
-would then also need installed at a compatible version.
+Requires only Docker (with the `buildx` plugin, bundled by default in current
+Docker installs) — no local Rust cross-toolchain or `rustup` needed. Produces,
+for both `x86_64` and `aarch64` Linux, into `bin/dist/<target-triple>/`:
+
+- **`innernet`, `innernet-server`** — cross-compiled via Docker
+  (`messense/rust-musl-cross` images) against the `musl` target, so the
+  binaries have no runtime dependencies at all (verify with `ldd`, which
+  reports "not a dynamic executable"). A plain glibc build would instead
+  dynamically link whatever `libsqlite3` happens to be on the build machine,
+  which your nodes would then also need installed at a compatible version.
+- **`rosenpass`** (unless you set `SKIP_ROSENPASS=1`, which skips it — it's
+  the slowest part of the build) — built from [`bin/Dockerfile`](bin/Dockerfile)
+  via `docker buildx build --platform` (using QEMU emulation for whichever
+  architecture isn't your machine's own), with `libsodium` statically
+  embedded so it never depends on the target node having a compatible
+  `libsodium` installed. It can't be built fully static like
+  `innernet`/`innernet-server`: its `oqs-sys` dependency uses `bindgen`,
+  which loads `libclang` via `dlopen()` at build time, and Rust's
+  fully-static `musl` builds can't `dlopen()` anything — see the comments in
+  `bin/Dockerfile` for the full explanation. Set `ROSENPASS_VERSION` to build
+  a different release (defaults to a version known to fix
+  [CVE-2023-53157](https://osv.dev/vulnerability/CVE-2023-53157); the
+  Dockerfile refuses to build anything older than that fix).
+
+To also package the results as tar.gz archives ready to attach to a GitHub
+release:
+
+```sh
+RELEASE_VERSION=2.0.0 ./bin/build-multiarch.sh
+```
+
+This writes `bin/dist/release/innernet-rp-2.0.0-<target-triple>.tar.gz` for
+each architecture and prints the exact `gh release create` command to publish
+them (requires the [`gh` CLI](https://cli.github.com), authenticated —
+publishing itself is left as a manual step, since it's a public, visible
+action on the repo).

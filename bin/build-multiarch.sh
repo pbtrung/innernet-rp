@@ -99,7 +99,7 @@ for target in "${!TARGETS[@]}"; do
     if [ -n "$RELEASE_VERSION" ]; then
         release_dir="$OUT_DIR/release"
         mkdir -p "$release_dir"
-        archive="$release_dir/innernet-${RELEASE_VERSION}-${target}.tar.gz"
+        archive="$release_dir/innernet-rp-${RELEASE_VERSION}-${target}.tar.gz"
         tar -czf "$archive" -C "$arch_out_dir" $(ls "$arch_out_dir")
         echo "==> packaged $archive"
     fi
