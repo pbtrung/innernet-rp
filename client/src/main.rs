@@ -12,7 +12,7 @@ use innernet_client_core::{
     DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
 };
 use innernet_shared::{
-    interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, AddCidrOpts,
+    interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, wg_export, AddCidrOpts,
     AddDeleteAssociationOpts, AddPeerOpts, Association, AssociationContents, Cidr, CidrTree,
     DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts,
     Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
@@ -162,6 +162,15 @@ enum Command {
 
         #[clap(flatten)]
         sub_opts: AddPeerOpts,
+    },
+
+    /// Refresh a previously `--export-wg-conf`-exported static config's peer list, without
+    /// rotating its keys or requiring the non-innernet device to do anything.
+    ExportPeerConfig {
+        interface: Interface,
+
+        /// Path to the previously-exported config file to refresh in place.
+        path: PathBuf,
     },
 
     /// Rename a peer
@@ -595,11 +604,57 @@ fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Re
         let (peer, invitation) =
             create_peer(&opts.config_dir, interface, &cidrs, &peers, new_peer_info)?;
 
-        invitation.save_new(&target_path)?;
-        prompts::print_invitation_info(&peer, &target_path);
+        if sub_opts.export_wg_conf {
+            let interface_info = &invitation.interface_config().interface;
+            let rendered = wg_export::render_wg_quick_conf(
+                &interface_info.private_key,
+                interface_info.address,
+                &peers,
+            )?;
+            wg_export::write_exported_conf(std::path::Path::new(&target_path), &rendered)?;
+            log::info!(
+                "Exported a standalone wg-quick config to {} for a non-innernet WireGuard \
+                 client. {}",
+                target_path.yellow(),
+                "This is a point-in-time snapshot with no auto-refresh - see \
+                 `innernet export-peer-config` to update it later."
+                    .yellow(),
+            );
+        } else {
+            invitation.save_new(&target_path)?;
+            prompts::print_invitation_info(&peer, &target_path);
+        }
     } else {
         log::info!("Exited without creating peer.");
     }
+
+    Ok(())
+}
+
+/// Refreshes a previously `--export-wg-conf`-exported static config's `[Peer]` blocks in place,
+/// from the current peer list, without generating a new keypair or touching the `[Interface]`
+/// section — the exported device keeps using the same identity/keys. See doc/design.md 5.10.
+fn export_peer_config(interface: &InterfaceName, opts: &Opts, path: &Path) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&server);
+
+    let existing = std::fs::read_to_string(path).with_path(path)?;
+    let (private_key, address) = wg_export::parse_exported_interface(&existing)?;
+
+    log::info!("Fetching peers");
+    let peers = rest_client.get_peers()?;
+
+    let rendered = wg_export::render_wg_quick_conf(&private_key, address, &peers)?;
+    wg_export::write_exported_conf(path, &rendered)?;
+
+    log::info!(
+        "Refreshed {} from the current peer list. {}",
+        path.to_string_lossy().yellow(),
+        "Still a point-in-time snapshot - re-run this command again after future peer/endpoint \
+         changes."
+            .yellow(),
+    );
 
     Ok(())
 }
@@ -1223,6 +1278,9 @@ fn run(opts: &Opts) -> Result<(), Error> {
             interface,
             sub_opts,
         } => add_peer(&interface, opts, sub_opts)?,
+        Command::ExportPeerConfig { interface, path } => {
+            export_peer_config(&interface, opts, &path)?
+        },
         Command::RenamePeer {
             interface,
             sub_opts,

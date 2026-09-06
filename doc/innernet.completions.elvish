@@ -38,6 +38,7 @@ set edit:completion:arg-completer[innernet] = {|@words|
             cand uninstall 'Uninstall an innernet network'
             cand down 'Bring down the interface (equivalent to ''wg-quick down INTERFACE'')'
             cand add-peer 'Add a new peer'
+            cand export-peer-config 'Refresh a previously `--export-wg-conf`-exported static config''s peer list, without rotating its keys or requiring the non-innernet device to do anything'
             cand rename-peer 'Rename a peer'
             cand add-cidr 'Add a new CIDR'
             cand rename-cidr 'Rename a CIDR'
@@ -124,8 +125,13 @@ set edit:completion:arg-completer[innernet] = {|@words|
             cand --invite-expires 'Invite expiration period (eg. ''30d'', ''7w'', ''2h'', ''60m'', ''1000s'')'
             cand --auto-ip 'Auto-assign the peer the first available IP within the CIDR'
             cand --yes 'Bypass confirmation'
+            cand --export-wg-conf 'Export a standard wg-quick-compatible .conf instead of an innernet invitation, for a non-innernet WireGuard client (e.g. a phone) that can''t run `innernet redeem-invite`. This is a point-in-time snapshot with no auto-refresh - see `export-peer-config` to refresh one later without rotating its keys. See doc/design.md 5.10 for the tradeoffs'
             cand -h 'Print help (see more with ''--help'')'
             cand --help 'Print help (see more with ''--help'')'
+        }
+        &'innernet;export-peer-config'= {
+            cand -h 'Print help'
+            cand --help 'Print help'
         }
         &'innernet;rename-peer'= {
             cand --name 'Name of peer to rename'
@@ -227,6 +233,7 @@ set edit:completion:arg-completer[innernet] = {|@words|
             cand uninstall 'Uninstall an innernet network'
             cand down 'Bring down the interface (equivalent to ''wg-quick down INTERFACE'')'
             cand add-peer 'Add a new peer'
+            cand export-peer-config 'Refresh a previously `--export-wg-conf`-exported static config''s peer list, without rotating its keys or requiring the non-innernet device to do anything'
             cand rename-peer 'Rename a peer'
             cand add-cidr 'Add a new CIDR'
             cand rename-cidr 'Rename a CIDR'
@@ -256,6 +263,8 @@ set edit:completion:arg-completer[innernet] = {|@words|
         &'innernet;help;down'= {
         }
         &'innernet;help;add-peer'= {
+        }
+        &'innernet;help;export-peer-config'= {
         }
         &'innernet;help;rename-peer'= {
         }

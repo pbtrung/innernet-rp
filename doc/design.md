@@ -453,52 +453,58 @@ severe and simply wrong consequence, so the server's Rosenpass sync only
 ever adds PSK protection to server↔peer links; it never gates a peer's
 visibility or reachability based on Rosenpass status.
 
-### 5.10 Static config export for non-innernet peers (e.g. mobile)
+### 5.10 Static config export for non-innernet peers (e.g. mobile) — implemented
 
 Not required for Rosenpass itself, but directly motivated by §5.8's finding
 that mobile peers can never run Rosenpass and today have no way to join an
-innernet mesh at all (§8 background). Proposed as a small, independent
-client-side feature, not gated on any other milestone:
+innernet mesh at all. Implemented (M9) as a small, independent client-side
+feature:
 
-- New flag on `innernet add-peer`, e.g. `--export-wg-conf <path>` (and
-  optionally `--export-wg-conf-qr`, since the official WireGuard mobile apps
-  can add a tunnel by scanning a `[Interface]`/`[Peer]` config as a QR code),
-  that renders a standard `wg-quick`-compatible `.conf` instead of (or
-  alongside) the innernet-native `PeerInvitation`:
-  - `[Interface]`: the newly generated `PrivateKey`
-    (`client-core/src/peer.rs:37`) and the peer's allocated `Address`
-    (`IpNet`). No `DNS`/`PostUp` assumptions — hostsfile-style name resolution
-    (`hostsfile` crate) only works for innernet-managed peers and can't be
-    replicated for a static config.
-  - `[Peer]` blocks: one per existing peer, from the same
-    `existing_peers`/`existing_cidrs` snapshot `add_peer()` already fetches
-    (`client/src/main.rs`) — each peer's `PublicKey`, its already-resolved
-    `Endpoint` (the same value `inject_endpoints` computes server-side), and
-    `AllowedIPs` from that peer's CIDR.
-  - **Never** include a Rosenpass field or PSK. An exported peer is, by
-    construction, permissive-only (§5.8); the exporter should refuse (or warn
-    loudly) when generating a config for a network/CIDR that has
-    `require_rosenpass` set, since such a peer could never satisfy that
-    policy.
-- **Staleness is a first-class limitation, not an edge case.** This is a
-  one-time snapshot with no fetch loop: any later peer add/remove, endpoint
-  change, or CIDR edit silently never reaches the exported peer. The CLI
-  should say so loudly at export time ("this config will not auto-update —
-  re-run to regenerate"). A companion `innernet export-peer-config <name>`
-  (re-rendering from the peer's *already-registered* public key, rather than
-  generating a new keypair) would let an operator refresh an already-deployed
-  static peer's view of the mesh without rotating its identity or breaking
-  its current tunnel in the interim.
-- **Secret handling.** The rendered `.conf` (and any QR code encoding it)
-  contains a raw WireGuard private key in plaintext — treat the output
-  path/image with the same care as `InterfaceConfig`'s existing `0o600`
-  handling. A QR code is easy to leave on a screen or in a photo library by
-  accident, so default to rendering it to the terminal for live scanning
-  rather than saving it as an image file, unless the operator explicitly
-  opts in to a saved file.
-- Entirely additive to `client/src/main.rs`'s existing `add_peer()` — no new
-  server endpoint, no schema change, and no dependency on any Rosenpass
-  milestone. See milestones.md M9.
+- `--export-wg-conf` on `innernet add-peer` (`shared/src/types.rs`
+  `AddPeerOpts`) renders a standard `wg-quick`-compatible `.conf`
+  (`shared::wg_export::render_wg_quick_conf`) instead of the innernet-native
+  `PeerInvitation`:
+  - `[Interface]`: the newly generated `PrivateKey` and the peer's allocated
+    `Address`, both already produced by `create_peer()`
+    (`client-core/src/peer.rs`) via `PeerInvitation::interface_config()`, a
+    small accessor added for this purpose. No `DNS`/`PostUp` — hostsfile-style
+    name resolution only works for innernet-managed peers; peer names appear
+    only as `#` comments in the exported file, for readability.
+  - `[Peer]` blocks: one per entry in the same already-fetched peer list
+    `add_peer()` uses to build a normal invitation — no extra server round
+    trip. Each peer's `PublicKey`, `AllowedIPs` (that peer's own `/32` or
+    `/128`, matching exactly what `PeerDiff`/`peer_config_builder`
+    (`shared/src/types.rs`) already computes for a normal client), and
+    `Endpoint` when known (omitted, not defaulted to anything, when a peer
+    has none yet). Disabled and not-yet-redeemed peers, and the exported
+    peer's own entry, are excluded.
+  - Never includes a Rosenpass field or PSK — an exported peer is, by
+    construction, permissive-only (§5.8). The `require_rosenpass`
+    "advisory policy bit" floated below was never actually built in this
+    implementation (M1–M8's code has no such field), so there's no check to
+    add here; the README documents the operational guidance instead.
+- **Staleness is a first-class limitation, stated plainly, not an edge
+  case.** Both the CLI's log output (at export and at refresh time) and the
+  exported file's own header comment say this is a point-in-time snapshot
+  with no auto-refresh. `innernet export-peer-config <interface> <path>`
+  refreshes an already-exported file's `[Peer]` blocks from the current
+  peer list, in place, without rotating its keys — implemented as a refresh
+  of the *file* (via `shared::wg_export::parse_exported_interface`, which
+  reads back the `[Interface]` section from a file this exporter itself
+  produced), not a lookup by peer name as originally sketched: the private
+  key was never sent to or stored by the server (the same property every
+  other key in this design relies on), so there's no name-keyed lookup that
+  could recover it — only the originally-exported file can.
+- **Secret handling.** The rendered `.conf` contains a raw WireGuard private
+  key in plaintext. `shared::wg_export::write_exported_conf` sets `0o600`
+  before writing, matching `InterfaceConfig`'s existing discipline — an
+  initial implementation missed this (defaulting to the OS's normal file
+  permissions), caught by a permissions-asserting test before it shipped.
+  QR code export (`--export-wg-conf-qr`) was not implemented in this pass.
+- Entirely additive to `client/src/main.rs`'s existing `add_peer()` and a
+  new `export-peer-config` subcommand — no new server endpoint, no schema
+  change, and no dependency on any Rosenpass milestone (implemented after
+  M8 here, but doesn't depend on it). See milestones.md M9.
 
 ## 6. Security considerations
 

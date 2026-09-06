@@ -71,6 +71,7 @@ complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l invite-expires -d 'Invite expiration period (eg. \'30d\', \'7w\', \'2h\', \'60m\', \'1000s\')' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l auto-ip -d 'Auto-assign the peer the first available IP within the CIDR'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l yes -d 'Bypass confirmation'
+complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -l export-wg-conf -d 'Export a standard wg-quick-compatible .conf instead of an innernet invitation, for a non-innernet WireGuard client (e.g. a phone) that can\'t run `innernet redeem-invite`. This is a point-in-time snapshot with no auto-refresh - see `export-peer-config` to refresh one later without rotating its keys. See doc/design.md 5.10 for the tradeoffs'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand add-peer" -s h -l help -d 'Print help'
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand disable-peer" -l name -d 'Name of peer to enable/disable' -r
 complete -c innernet-server -n "__fish_innernet_server_using_subcommand disable-peer" -l yes -d 'Bypass confirmation'

@@ -73,6 +73,30 @@ to view the current network and all CIDRs visible to this peer.
 
 Since we created an admin peer, we can also add new peers and CIDRs from this peer via `innernet` instead of having to always run commands on the server.
 
+### Adding a Non-innernet Peer (e.g. a Phone)
+
+A device that can't run the `innernet` client itself — for example a phone using
+the stock WireGuard app — has no way to redeem an innernet invitation. Instead,
+you can export a standard `wg-quick`-compatible config for it:
+
+```sh
+sudo innernet add-peer <interface> --export-wg-conf
+```
+
+This produces a plain `.conf` file (or you can import it as a QR code using the
+WireGuard app's scanner) instead of an innernet invitation. **This is a
+point-in-time snapshot**: unlike a normal innernet peer, it has no fetch loop, so
+future peer/endpoint/CIDR changes never reach it automatically. To refresh its
+peer list later without rotating its keys or touching the device itself, run:
+
+```sh
+sudo innernet export-peer-config <interface> /path/to/exported.conf
+```
+
+Because such a peer can never run [Rosenpass](#post-quantum-key-exchange-with-rosenpass)
+(there's no such client for mobile), a network with any exported peers needs
+`--rosenpass-permissive` if Rosenpass is enabled at all.
+
 ### Adding Associations between CIDRs
 
 In order for peers from one CIDR to be able to contact peers in another CIDR, those two CIDRs must be "associated" with each other.

@@ -126,9 +126,18 @@ _arguments "${_arguments_options[@]}" : \
 '--invite-expires=[Invite expiration period (eg. '\''30d'\'', '\''7w'\'', '\''2h'\'', '\''60m'\'', '\''1000s'\'')]:INVITE_EXPIRES:_default' \
 '--auto-ip[Auto-assign the peer the first available IP within the CIDR]' \
 '--yes[Bypass confirmation]' \
+'--export-wg-conf[Export a standard wg-quick-compatible .conf instead of an innernet invitation, for a non-innernet WireGuard client (e.g. a phone) that can'\''t run \`innernet redeem-invite\`. This is a point-in-time snapshot with no auto-refresh - see \`export-peer-config\` to refresh one later without rotating its keys. See doc/design.md 5.10 for the tradeoffs]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 ':interface:_default' \
+&& ret=0
+;;
+(export-peer-config)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':interface:_default' \
+':path -- Path to the previously-exported config file to refresh in place:_files' \
 && ret=0
 ;;
 (rename-peer)
@@ -309,6 +318,10 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(export-peer-config)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (rename-peer)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -388,6 +401,7 @@ _innernet_commands() {
 'uninstall:Uninstall an innernet network' \
 'down:Bring down the interface (equivalent to '\''wg-quick down INTERFACE'\'')' \
 'add-peer:Add a new peer' \
+'export-peer-config:Refresh a previously \`--export-wg-conf\`-exported static config'\''s peer list, without rotating its keys or requiring the non-innernet device to do anything' \
 'rename-peer:Rename a peer' \
 'add-cidr:Add a new CIDR' \
 'rename-cidr:Rename a CIDR' \
@@ -451,6 +465,11 @@ _innernet__subcmd__enable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet enable-peer commands' commands "$@"
 }
+(( $+functions[_innernet__subcmd__export-peer-config_commands] )) ||
+_innernet__subcmd__export-peer-config_commands() {
+    local commands; commands=()
+    _describe -t commands 'innernet export-peer-config commands' commands "$@"
+}
 (( $+functions[_innernet__subcmd__fetch_commands] )) ||
 _innernet__subcmd__fetch_commands() {
     local commands; commands=()
@@ -466,6 +485,7 @@ _innernet__subcmd__help_commands() {
 'uninstall:Uninstall an innernet network' \
 'down:Bring down the interface (equivalent to '\''wg-quick down INTERFACE'\'')' \
 'add-peer:Add a new peer' \
+'export-peer-config:Refresh a previously \`--export-wg-conf\`-exported static config'\''s peer list, without rotating its keys or requiring the non-innernet device to do anything' \
 'rename-peer:Rename a peer' \
 'add-cidr:Add a new CIDR' \
 'rename-cidr:Rename a CIDR' \
@@ -528,6 +548,11 @@ _innernet__subcmd__help__subcmd__down_commands() {
 _innernet__subcmd__help__subcmd__enable-peer_commands() {
     local commands; commands=()
     _describe -t commands 'innernet help enable-peer commands' commands "$@"
+}
+(( $+functions[_innernet__subcmd__help__subcmd__export-peer-config_commands] )) ||
+_innernet__subcmd__help__subcmd__export-peer-config_commands() {
+    local commands; commands=()
+    _describe -t commands 'innernet help export-peer-config commands' commands "$@"
 }
 (( $+functions[_innernet__subcmd__help__subcmd__fetch_commands] )) ||
 _innernet__subcmd__help__subcmd__fetch_commands() {

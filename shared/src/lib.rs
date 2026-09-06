@@ -19,6 +19,7 @@ pub mod prompts;
 pub mod rosenpass;
 pub mod types;
 pub mod wg;
+pub mod wg_export;
 
 pub use anyhow::Error;
 pub use types::*;

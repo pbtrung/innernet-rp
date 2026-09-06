@@ -301,35 +301,56 @@ silently dropped.
 Rosenpass end to end; the man pages remain stale until regenerated with
 `help2man`, and no release has been tagged.
 
-## M9 — Static config export for non-innernet peers (independent track)
+## M9 — Static config export for non-innernet peers (independent track) — mostly DONE (QR and docker-tests round-trip not done)
 
-Not part of the Rosenpass rollout and doesn't gate or depend on M0–M8 — can
-ship before, after, or in parallel. Tracked here because it was motivated
-directly by M5/§5.8's finding that mobile peers (no Rosenpass client exists
-for Android/iOS) have no join path at all today, static or otherwise
-(design.md §5.10).
+Not part of the Rosenpass rollout and doesn't gate or depend on M0–M8, and
+indeed shipped after them in this implementation. Tracked here because it
+was motivated directly by M5/§5.8's finding that mobile peers (no Rosenpass
+client exists for Android/iOS) have no join path at all today, static or
+otherwise (design.md §5.10).
 
-- Add `--export-wg-conf <path>` (and optionally `--export-wg-conf-qr`) to
-  `innernet add-peer` (`client/src/main.rs`), rendering a standard
-  `wg-quick`-compatible `.conf` from the same `existing_peers`/
-  `existing_cidrs` snapshot and freshly generated keypair `add_peer()`
-  already produces (`client-core/src/peer.rs:37`), instead of an innernet
-  `PeerInvitation`.
-- Refuse (or loudly warn) if the target network/CIDR has `require_rosenpass`
-  set (§5.8), since an exported peer can never satisfy it.
-- Add `innernet export-peer-config <name>`: re-render a static config for an
-  *already-registered* peer (no new keypair, no re-registration) so an
-  operator can refresh a deployed phone's view of the mesh after peer/CIDR
-  changes, without rotating its identity or breaking its current tunnel.
-- CLI output must state plainly, every time, that the exported config is a
-  point-in-time snapshot with no auto-refresh.
-- Tests: round-trip the exported `.conf` through a real `wg-quick`/stock
-  WireGuard client in `docker-tests/` (or the Android app manually) and
-  confirm it can reach the mesh; confirm the `require_rosenpass` refusal;
-  confirm secret-file permissions (`0o600`) on any saved output, and that the
-  default QR path renders to the terminal only, not an image file.
+- `--export-wg-conf` added to `innernet add-peer` (`shared/src/types.rs`
+  `AddPeerOpts`, wired in `client/src/main.rs`), rendering a standard
+  `wg-quick`-compatible `.conf` (`shared::wg_export::render_wg_quick_conf`)
+  from the same already-fetched peer list and freshly generated keypair
+  `add_peer()`/`create_peer()` already produce — no extra server round trip,
+  instead of an innernet `PeerInvitation`. Manually verified against a
+  realistic peer list: produces a well-formed `[Interface]`/`[Peer]` config.
+- `innernet export-peer-config <interface> <path>` implemented as a
+  **refresh of an existing exported file**, not a lookup by peer name as
+  originally sketched: the peer's private key can only ever come from the
+  file the admin already exported (it was never sent to or stored by the
+  server — the same "private keys never touch the server" property this
+  whole design already relies on elsewhere), so re-deriving it from a "name"
+  alone isn't possible. `shared::wg_export::parse_exported_interface` reads
+  back just the `[Interface]` section from a file this exporter itself
+  produced (deliberately not a general `wg-quick` parser for arbitrary
+  third-party files), then `[Peer]` blocks are re-rendered from the current
+  peer list and the file is overwritten in place — same keys, refreshed
+  peers.
+- CLI output states plainly, every time (both commands' log messages, and
+  the exported file's own header comment), that this is a point-in-time
+  snapshot with no auto-refresh.
+- **Found and fixed a real gap while implementing**: the exported file
+  contains a private key but was initially written with default file
+  permissions, not `0o600` like every other file in this codebase holding a
+  WireGuard private key. Added `wg_export::write_exported_conf` (used by
+  both `add-peer --export-wg-conf` and `export-peer-config`) to fix this,
+  with a regression test asserting the mode.
+- The `require_rosenpass`/per-network-policy-bit idea from §5.8 was never
+  actually built in this implementation (it was only ever a suggested
+  "advisory" concept, not implemented in M1-M8's code) — there's no such
+  field to check, so no refusal logic was added here either. The README
+  documents the operational guidance instead (a network with any exported
+  peers needs `--rosenpass-permissive` if Rosenpass is enabled).
+- **Not done**: `--export-wg-conf-qr` (rendering a scannable QR code to the
+  terminal) was not implemented - out of scope for this pass, left as a
+  clearly separate follow-up rather than attempted half-done. Round-tripping
+  the exported `.conf` through a real `wg-quick`/stock WireGuard client in
+  `docker-tests/` (or an actual phone) was not done - same real-interface
+  gap noted throughout M4-M7.
 
-**Acceptance**: a phone (or any stock WireGuard client) can join an innernet
-network from a single exported config/QR code with no innernet client
-installed; re-export reflects a since-changed peer list without touching the
-phone's existing keys.
+**Acceptance**: partially met — an exported config renders correctly (unit-
+tested and manually verified) and refreshes in place without rotating keys;
+actually joining a real mesh with it (docker-tests or a real device) has not
+been verified.

@@ -159,7 +159,7 @@ _innernet-server() {
             return 0
             ;;
         innernet__subcmd__server__subcmd__add__subcmd__peer)
-            opts="-h --name --ip --auto-ip --cidr --admin --yes --save-config --invite-expires --help"
+            opts="-h --name --ip --auto-ip --cidr --admin --yes --save-config --invite-expires --export-wg-conf --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

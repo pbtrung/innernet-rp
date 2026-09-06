@@ -358,6 +358,11 @@ pub fn gather_new_peer_info(
 
     let invite_save_path = if let Some(location) = &args.save_config {
         location.clone()
+    } else if args.export_wg_conf {
+        input(
+            "Save exported wg-quick config to",
+            Prefill::Default(format!("{name}.conf")),
+        )?
     } else {
         input(
             "Save peer invitation file to",

@@ -79,6 +79,7 @@ _arguments "${_arguments_options[@]}" : \
 '--invite-expires=[Invite expiration period (eg. '\''30d'\'', '\''7w'\'', '\''2h'\'', '\''60m'\'', '\''1000s'\'')]:INVITE_EXPIRES:_default' \
 '--auto-ip[Auto-assign the peer the first available IP within the CIDR]' \
 '--yes[Bypass confirmation]' \
+'--export-wg-conf[Export a standard wg-quick-compatible .conf instead of an innernet invitation, for a non-innernet WireGuard client (e.g. a phone) that can'\''t run \`innernet redeem-invite\`. This is a point-in-time snapshot with no auto-refresh - see \`export-peer-config\` to refresh one later without rotating its keys. See doc/design.md 5.10 for the tradeoffs]' \
 '-h[Print help]' \
 '--help[Print help]' \
 ':interface:_default' \

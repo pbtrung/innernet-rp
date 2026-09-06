@@ -41,6 +41,7 @@ Register-ArgumentCompleter -Native -CommandName 'innernet' -ScriptBlock {
             [CompletionResult]::new('uninstall', 'uninstall', [CompletionResultType]::ParameterValue, 'Uninstall an innernet network')
             [CompletionResult]::new('down', 'down', [CompletionResultType]::ParameterValue, 'Bring down the interface (equivalent to ''wg-quick down INTERFACE'')')
             [CompletionResult]::new('add-peer', 'add-peer', [CompletionResultType]::ParameterValue, 'Add a new peer')
+            [CompletionResult]::new('export-peer-config', 'export-peer-config', [CompletionResultType]::ParameterValue, 'Refresh a previously `--export-wg-conf`-exported static config''s peer list, without rotating its keys or requiring the non-innernet device to do anything')
             [CompletionResult]::new('rename-peer', 'rename-peer', [CompletionResultType]::ParameterValue, 'Rename a peer')
             [CompletionResult]::new('add-cidr', 'add-cidr', [CompletionResultType]::ParameterValue, 'Add a new CIDR')
             [CompletionResult]::new('rename-cidr', 'rename-cidr', [CompletionResultType]::ParameterValue, 'Rename a CIDR')
@@ -134,8 +135,14 @@ Register-ArgumentCompleter -Native -CommandName 'innernet' -ScriptBlock {
             [CompletionResult]::new('--invite-expires', '--invite-expires', [CompletionResultType]::ParameterName, 'Invite expiration period (eg. ''30d'', ''7w'', ''2h'', ''60m'', ''1000s'')')
             [CompletionResult]::new('--auto-ip', '--auto-ip', [CompletionResultType]::ParameterName, 'Auto-assign the peer the first available IP within the CIDR')
             [CompletionResult]::new('--yes', '--yes', [CompletionResultType]::ParameterName, 'Bypass confirmation')
+            [CompletionResult]::new('--export-wg-conf', '--export-wg-conf', [CompletionResultType]::ParameterName, 'Export a standard wg-quick-compatible .conf instead of an innernet invitation, for a non-innernet WireGuard client (e.g. a phone) that can''t run `innernet redeem-invite`. This is a point-in-time snapshot with no auto-refresh - see `export-peer-config` to refresh one later without rotating its keys. See doc/design.md 5.10 for the tradeoffs')
             [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
             [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help (see more with ''--help'')')
+            break
+        }
+        'innernet;export-peer-config' {
+            [CompletionResult]::new('-h', '-h', [CompletionResultType]::ParameterName, 'Print help')
+            [CompletionResult]::new('--help', '--help', [CompletionResultType]::ParameterName, 'Print help')
             break
         }
         'innernet;rename-peer' {
@@ -252,6 +259,7 @@ Register-ArgumentCompleter -Native -CommandName 'innernet' -ScriptBlock {
             [CompletionResult]::new('uninstall', 'uninstall', [CompletionResultType]::ParameterValue, 'Uninstall an innernet network')
             [CompletionResult]::new('down', 'down', [CompletionResultType]::ParameterValue, 'Bring down the interface (equivalent to ''wg-quick down INTERFACE'')')
             [CompletionResult]::new('add-peer', 'add-peer', [CompletionResultType]::ParameterValue, 'Add a new peer')
+            [CompletionResult]::new('export-peer-config', 'export-peer-config', [CompletionResultType]::ParameterValue, 'Refresh a previously `--export-wg-conf`-exported static config''s peer list, without rotating its keys or requiring the non-innernet device to do anything')
             [CompletionResult]::new('rename-peer', 'rename-peer', [CompletionResultType]::ParameterValue, 'Rename a peer')
             [CompletionResult]::new('add-cidr', 'add-cidr', [CompletionResultType]::ParameterValue, 'Add a new CIDR')
             [CompletionResult]::new('rename-cidr', 'rename-cidr', [CompletionResultType]::ParameterValue, 'Rename a CIDR')
@@ -288,6 +296,9 @@ Register-ArgumentCompleter -Native -CommandName 'innernet' -ScriptBlock {
             break
         }
         'innernet;help;add-peer' {
+            break
+        }
+        'innernet;help;export-peer-config' {
             break
         }
         'innernet;help;rename-peer' {

@@ -181,6 +181,12 @@ impl PeerInvitation {
         }
     }
 
+    /// The generated keypair/address this invitation carries, e.g. for rendering a static
+    /// `wg-quick` config instead of an innernet-native invitation (see `wg_export`).
+    pub fn interface_config(&self) -> &InterfaceConfig {
+        &self.interface_config
+    }
+
     /// Save a new invitation file, failing if it already exists.
     pub fn save_new(&self, path: impl AsRef<Path>) -> Result<(), io::Error> {
         let mut file = OpenOptions::new()

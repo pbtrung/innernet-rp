@@ -43,6 +43,9 @@ _innernet() {
             innernet,enable-peer)
                 cmd="innernet__subcmd__enable__subcmd__peer"
                 ;;
+            innernet,export-peer-config)
+                cmd="innernet__subcmd__export__subcmd__peer__subcmd__config"
+                ;;
             innernet,fetch)
                 cmd="innernet__subcmd__fetch"
                 ;;
@@ -109,6 +112,9 @@ _innernet() {
             innernet__subcmd__help,enable-peer)
                 cmd="innernet__subcmd__help__subcmd__enable__subcmd__peer"
                 ;;
+            innernet__subcmd__help,export-peer-config)
+                cmd="innernet__subcmd__help__subcmd__export__subcmd__peer__subcmd__config"
+                ;;
             innernet__subcmd__help,fetch)
                 cmd="innernet__subcmd__help__subcmd__fetch"
                 ;;
@@ -155,7 +161,7 @@ _innernet() {
 
     case "${cmd}" in
         innernet)
-            opts="-v -c -d -h -V --verbose --config-dir --data-dir --no-routing --backend --mtu --help --version install show up fetch uninstall down add-peer rename-peer add-cidr rename-cidr delete-cidr list-cidrs disable-peer enable-peer add-association delete-association list-associations set-listen-port override-endpoint override-peer-endpoint completions help"
+            opts="-v -c -d -h -V --verbose --config-dir --data-dir --no-routing --backend --mtu --help --version install show up fetch uninstall down add-peer export-peer-config rename-peer add-cidr rename-cidr delete-cidr list-cidrs disable-peer enable-peer add-association delete-association list-associations set-listen-port override-endpoint override-peer-endpoint completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -233,7 +239,7 @@ _innernet() {
             return 0
             ;;
         innernet__subcmd__add__subcmd__peer)
-            opts="-h --name --ip --auto-ip --cidr --admin --yes --save-config --invite-expires --help"
+            opts="-h --name --ip --auto-ip --cidr --admin --yes --save-config --invite-expires --export-wg-conf --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -366,6 +372,20 @@ _innernet() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        innernet__subcmd__export__subcmd__peer__subcmd__config)
+            opts="-h --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         innernet__subcmd__fetch)
             opts="-h --hosts-path --no-write-hosts --host-suffix --no-nat-traversal --exclude-nat-candidates --no-nat-candidates --enable-rosenpass --rosenpass-permissive --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
@@ -393,7 +413,7 @@ _innernet() {
             return 0
             ;;
         innernet__subcmd__help)
-            opts="install show up fetch uninstall down add-peer rename-peer add-cidr rename-cidr delete-cidr list-cidrs disable-peer enable-peer add-association delete-association list-associations set-listen-port override-endpoint override-peer-endpoint completions help"
+            opts="install show up fetch uninstall down add-peer export-peer-config rename-peer add-cidr rename-cidr delete-cidr list-cidrs disable-peer enable-peer add-association delete-association list-associations set-listen-port override-endpoint override-peer-endpoint completions help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -519,6 +539,20 @@ _innernet() {
             return 0
             ;;
         innernet__subcmd__help__subcmd__enable__subcmd__peer)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        innernet__subcmd__help__subcmd__export__subcmd__peer__subcmd__config)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
