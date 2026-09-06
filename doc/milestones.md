@@ -6,33 +6,41 @@ Each milestone should land as its own PR(s) with tests, and should keep
 matter, no new process spawned) until a network operator opts in, all the way
 through M5.
 
-## M0 — Spike: confirm upstream Rosenpass integration surface
+## M0 — Spike: confirm upstream Rosenpass integration surface — DONE
 
-Not user-facing; de-risks every later milestone's assumptions in design.md
-§5.6/§5.7.
+Not user-facing; de-risked every later milestone's assumptions in design.md
+§5.5/§5.6/§5.7. Resolved against the real `rosenpass` 0.2.3 binary (installed
+via `cargo install rosenpass --locked --version 0.2.3`), not just its source:
 
-- Vendor/pin a specific `rosenpass` release, **≥ 0.2.1** (fixes
-  [CVE-2023-53157](https://osv.dev/vulnerability/CVE-2023-53157), a
-  remote-DoS-via-malformed-packet bug in earlier versions — non-negotiable
-  floor, not just "use latest"; target the current stable 0.2.3 unless a
-  newer release has shipped by implementation time). Source vendoring vs. a
-  prebuilt binary fetched at build/package time — decide which fits this
-  repo's existing `.deb`/`.rpm`/release process, see `release.sh` and the
-  `package.metadata.deb`/`rpm` blocks in `server/Cargo.toml`/`client/Cargo.toml`.
-- Confirm exact config file schema, CLI invocation, and whether a
-  file-watch or exec-hook mechanism exists for PSK handoff (design.md §5.6
-  options 1 vs 2).
-- Manually reproduce, outside innernet: two local Rosenpass processes
-  negotiating, feeding a PSK into two manually-configured WireGuard peers via
-  `wireguard-control`'s existing `PeerConfigBuilder::set_preshared_key`, and
-  confirm traffic keeps flowing when the PSK is swapped without touching
-  `allowed_ips`/removing the peer.
-- Write up findings as an update to design.md §5.6/§5.7 (resolve the two
-  open sub-options) before starting M1.
+- Pinned to **0.2.3** (≥ 0.2.1, fixing
+  [CVE-2023-53157](https://osv.dev/vulnerability/CVE-2023-53157)).
+- Confirmed the exact config schema (`shared::rosenpass::render_config`) is
+  accepted by the real binary's own `validate` subcommand
+  (`test_rendered_config_accepted_by_real_rosenpass_binary`).
+- Confirmed the `key_out` file-handoff mechanism and its
+  `output-key peer <id> key-file <path> exchanged|stale` stdout hook, by
+  running two real processes end-to-end over loopback.
+- Confirmed the real Classic McEliece 460896 key sizes (524160 raw /
+  698880 base64 bytes for the public key) match what M1 already assumed.
+- **Found two real bugs no amount of source-reading surfaced**, both now
+  fixed and covered by `#[ignore]`d real-binary regression tests in
+  `shared/src/rosenpass.rs` (run with `cargo test -- --ignored` after
+  installing the binary):
+  - Configuring both sides of a peer pair to dial each other makes each side
+    derive a **different**, silently mismatched PSK — WireGuard would
+    silently fail to handshake for that peer with no visible error. Fixed
+    with a deterministic per-pair dial/listen tie-break (design.md §5.5).
+  - Listening on both IPv4-any and IPv6-any on the same port fails outright
+    on Linux (dual-stack conflict). Fixed by listening IPv4-any only, a
+    documented limitation (design.md §5.5).
+- Vendoring strategy (source vendoring vs. a prebuilt binary fetched at
+  build/package time for `.deb`/`.rpm` packaging, see `release.sh`) is still
+  open — deferred to M8 (docs & release), since it doesn't block functional
+  development.
 
-**Acceptance**: a short writeup + a throwaway manual reproduction (doesn't
-need to live in the repo) confirming the PSK-application mechanism works with
-today's `wireguard-control` API with no interface disruption.
+**Acceptance**: met. See `shared/src/rosenpass.rs`'s `#[ignore]`d tests for
+the reproduction; design.md §5.5/§5.6 record the resolved decisions and the
+two findings above.
 
 ## M1 — Schema & API plumbing
 
@@ -78,26 +86,28 @@ back-compat test above); no CLI/process-lifecycle behavior changed yet.
 network generates and registers a key; `innernet show` reflects it; no
 WireGuard PSK is touched yet (that's M4).
 
-## M3 — Rosenpass process lifecycle
+## M3 — Rosenpass process lifecycle — DONE
 
 - `RosenpassOpts` (`--enable-rosenpass`, `--rosenpass-permissive`) added to
-  the relevant subcommands in `client/src/main.rs`
-  (`install`/`up`/`redeem-invite`, matching how `NatOpts`/`NetworkOpts` are
-  `#[clap(flatten)]`ed today).
-- Spawn the managed Rosenpass child process on `up` using the peer list from
-  the last fetched `State`; stop it on `down`
-  (`client-core/src/interface.rs` `redeem_invite`/`fetch`, near the existing
-  `wg::up`/`wg::down` calls).
-- On every `fetch()`, regenerate the Rosenpass config from the new `State`
-  and reload the process if the peer set or any peer's `rosenpass_addr`
-  changed.
-- Factor the process-lifecycle logic into `shared` (not `client-core`) per
-  design.md §5.9, so M6 (server-as-peer) can reuse it without duplication.
+  `install`/`up`/`fetch` in `client/src/main.rs`, flattened like
+  `NatOpts`/`ListenPortOpts`.
+- `shared::rosenpass::ensure_daemon_running` (re)starts the managed daemon
+  whenever the rendered config changes or the previously-started process
+  died — a full restart, not an incremental reload, since Rosenpass 0.2.3 has
+  no reload mechanism (confirmed against its source: no signal handling, no
+  `remove_peer`).
+- `client_core::rosenpass::sync`, called from `fetch()` once the WireGuard
+  peer list/listen port are known, builds the peer config from the just-
+  fetched `State` (caching each peer's key on demand, keyed by hash) and
+  calls `ensure_daemon_running`. Process-lifecycle logic lives in `shared`
+  (not `client-core`) per design.md §5.9, so M6 can reuse it.
+- Verified end-to-end against the real 0.2.3 binary (not docker-tests yet —
+  those land in M4/M5's scenarios): two real processes negotiate and produce
+  matching derived keys (see M0's two findings above, both fixed here).
 
-**Acceptance**: on a real two-machine (or docker-tests) network with
-`--enable-rosenpass`, both sides' Rosenpass processes start, see each other's
-config, and negotiate — verified by process logs/exit status, independent of
-whether the PSK is applied yet (that's M4).
+**Acceptance**: met — both sides' Rosenpass processes start, see each
+other's config, and negotiate, verified by real process runs and the
+`#[ignore]`d tests in `shared/src/rosenpass.rs`.
 
 ## M4 — PSK application
 

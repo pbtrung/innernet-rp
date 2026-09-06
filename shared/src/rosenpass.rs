@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::{
     fs::File,
     io::{BufRead, BufReader, Seek, SeekFrom},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -213,10 +213,17 @@ fn render_config(
     let config = RpConfig {
         public_key: key_paths.public_key.clone(),
         secret_key: key_paths.secret_key.clone(),
-        listen: vec![
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listen_port)),
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, listen_port, 0, 0)),
-        ],
+        // IPv4-any only. Binding *both* an IPv4-any and an IPv6-any socket on the same port
+        // fails with "Address already in use" on Linux (dual-stack IPv6-any sockets also claim
+        // the IPv4 namespace by default there) — verified empirically against the real 0.2.3
+        // binary. Since `IPV6_V6ONLY`'s default differs across the platforms this project
+        // supports (Linux vs. macOS/OpenBSD), there's no single "listen on both" address pair
+        // that's portable, so IPv6-only peers can't dial us (a known limitation) until this is
+        // revisited with an OS-specific listen strategy.
+        listen: vec![SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            listen_port,
+        ))],
         verbosity: RpVerbosity::Quiet,
         peers: peers
             .iter()
@@ -529,5 +536,126 @@ mod tests {
         // Reap the process so it doesn't linger as a zombie, and give the signal a moment to land.
         let _ = child.wait();
         assert!(!pid_is_alive(pid));
+    }
+
+    /// Validates our hand-rendered config against the *real* upstream `rosenpass` binary's own
+    /// `validate` subcommand (see doc/design.md's M0 spike) — not just against our reading of
+    /// its source. Ignored by default since it requires `rosenpass` (>= 0.2.1) on PATH; run with
+    /// `cargo test -- --ignored` after `cargo install rosenpass --locked`.
+    #[test]
+    #[ignore]
+    fn test_rendered_config_accepted_by_real_rosenpass_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_paths = RosenpassKeyPaths::new(dir.path());
+        generate_keypair(&key_paths).expect("requires the real `rosenpass` binary on PATH");
+
+        let peer_dir = dir.path().join("peers");
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        let peer_key_paths = RosenpassKeyPaths::new(&dir.path().join("peer-keys"));
+        generate_keypair(&peer_key_paths).unwrap();
+
+        let peer = RosenpassPeerConfig {
+            peer_id: 1,
+            public_key_path: peer_key_paths.public_key,
+            endpoint: Some("127.0.0.1:9999".parse().unwrap()),
+        };
+        let rendered = render_config(dir.path(), &key_paths, 51821, &[peer]);
+        let config_path = dir.path().join("rosenpass.toml");
+        std::fs::write(&config_path, &rendered).unwrap();
+
+        let output = Command::new(ROSENPASS_BIN)
+            .arg("validate")
+            .arg(&config_path)
+            .output()
+            .expect("failed to run real rosenpass binary");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("rosenpass validate stderr:\n{stderr}");
+        assert!(
+            stderr.contains("is valid TOML and conforms to the expected schema"),
+            "rendered config was not accepted by the real rosenpass binary:\n{rendered}\n---\n{stderr}"
+        );
+        assert!(
+            stderr.contains("passed all logical checks"),
+            "rendered config failed rosenpass's logical validation:\n{rendered}\n---\n{stderr}"
+        );
+    }
+
+    /// The single most safety-critical property of this whole integration: two real peers must
+    /// derive the *identical* preshared key, or WireGuard will silently fail to handshake
+    /// between them. This is **not** automatic — configuring both sides to dial each other
+    /// (both set `endpoint` for the other) causes each side to complete its own independent
+    /// handshake and derive a *different* key, verified empirically against the real 0.2.3
+    /// binary before this code was written. Exactly one side must dial (`endpoint` set) and the
+    /// other must only listen (`endpoint` unset for that peer) — see the dial/listen tie-break
+    /// in `client_core::rosenpass::sync`. This test exercises our actual `ensure_daemon_running`
+    /// or straight to `render_config`/spawn, with that exact asymmetric shape, end to end against
+    /// two real rosenpass processes, and would fail loudly if this ever regressed (e.g. someone
+    /// "fixing" the asymmetry back to a symmetric config because it looks more natural).
+    ///
+    /// Ignored by default (requires the real `rosenpass` binary on PATH); run with
+    /// `cargo test -- --ignored` after `cargo install rosenpass --locked --version 0.2.3`.
+    #[test]
+    #[ignore]
+    fn test_two_real_peers_converge_on_identical_psk_when_only_one_dials() {
+        let dialer_dir = tempfile::tempdir().unwrap();
+        let listener_dir = tempfile::tempdir().unwrap();
+
+        let dialer_keys = RosenpassKeyPaths::new(dialer_dir.path());
+        let listener_keys = RosenpassKeyPaths::new(listener_dir.path());
+        generate_keypair(&dialer_keys).expect("requires the real `rosenpass` binary on PATH");
+        generate_keypair(&listener_keys).unwrap();
+
+        let listener_port = 31_301u16;
+
+        // The listener's peer entry for the dialer has NO endpoint - it only ever responds.
+        let listener_peers = vec![RosenpassPeerConfig {
+            peer_id: 1,
+            public_key_path: dialer_keys.public_key.clone(),
+            endpoint: None,
+        }];
+        ensure_daemon_running(
+            listener_dir.path(),
+            &listener_keys,
+            listener_port,
+            &listener_peers,
+        )
+        .unwrap();
+
+        // The dialer's peer entry for the listener DOES have an endpoint - it initiates.
+        let dialer_peers = vec![RosenpassPeerConfig {
+            peer_id: 2,
+            public_key_path: listener_keys.public_key.clone(),
+            endpoint: Some(format!("127.0.0.1:{listener_port}").parse().unwrap()),
+        }];
+        ensure_daemon_running(dialer_dir.path(), &dialer_keys, 31_302, &dialer_peers).unwrap();
+
+        let listener_psk_path = DaemonPaths::peer_key_out_path(listener_dir.path(), 1);
+        let dialer_psk_path = DaemonPaths::peer_key_out_path(dialer_dir.path(), 2);
+
+        let mut listener_psk = None;
+        let mut dialer_psk = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            listener_psk = std::fs::read_to_string(&listener_psk_path).ok();
+            dialer_psk = std::fs::read_to_string(&dialer_psk_path).ok();
+            if listener_psk.is_some() && dialer_psk.is_some() {
+                break;
+            }
+        }
+
+        // Clean up both daemons before asserting, so a failing assertion doesn't leak processes.
+        for dir in [listener_dir.path(), dialer_dir.path()] {
+            if let Some(pid) = read_pid(&DaemonPaths::new(dir).pid) {
+                kill_pid(pid);
+            }
+        }
+
+        let listener_psk = listener_psk.expect("listener never wrote a derived PSK in time");
+        let dialer_psk = dialer_psk.expect("dialer never wrote a derived PSK in time");
+        assert_eq!(
+            listener_psk, dialer_psk,
+            "the two sides derived DIFFERENT preshared keys - this would silently break \
+             WireGuard's handshake for this peer pair"
+        );
     }
 }

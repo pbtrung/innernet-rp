@@ -268,7 +268,7 @@ This slots into the same place `update_hosts_file` already gets called
 (`interface.rs:264`), i.e. "things that get regenerated from the fetched
 state."
 
-### 5.5 Endpoint reuse (no separate NAT traversal)
+### 5.5 Endpoint reuse (no separate NAT traversal) — and a critical asymmetry
 
 Following NetBird's approach directly: don't build new NAT-traversal/endpoint
 discovery for Rosenpass. A peer's `rosenpass_addr` should default to "same
@@ -277,28 +277,72 @@ address the WireGuard endpoint/candidate system has already resolved. This
 avoids duplicating `NatTraverse` (`client-core/src/nat.rs`) for a second
 protocol.
 
+**However — and this was not obvious from reading Rosenpass's source, only
+discovered by actually running two real 0.2.3 processes against each other —
+configuring *both* sides of a peer pair to dial each other is actively
+broken, not merely redundant.** Each side ends up completing its own
+independent handshake and deriving a **different** preshared key from the
+other side — verified empirically: with both sides' peer entries carrying an
+`endpoint`, the two `key_out` files stably (not transiently) disagreed, even
+after the exchange settled. WireGuard requires an *identical* PSK configured
+on both peers, so applying each side's own value would silently break that
+tunnel with no visible error — the daemons look healthy, the files get
+written, nothing logs a failure. Re-running with **exactly one** side's peer
+entry carrying an `endpoint` (the other left unset, relying solely on its own
+`listen` socket) produced identical keys on both sides, matching upstream's
+own `tests/integration_test.rs`, which uses exactly this asymmetric shape.
+
+The fix: for every peer pair, exactly one side must dial. Since both sides
+must independently reach the same assignment without coordinating, it's
+derived from something both already know — the lower peer ID always dials
+the higher one (an arbitrary but deterministic, symmetric tie-break, the same
+"sort, don't pick a side" principle already used for the interim PSK below).
+Implemented in `client_core::rosenpass::sync`. A regression test
+(`#[ignore]`d, requires the real binary —
+`test_two_real_peers_converge_on_identical_psk_when_only_one_dials` in
+`shared/src/rosenpass.rs`) runs two real processes end-to-end and asserts
+their derived keys match, specifically to catch anyone "fixing" this back to
+a symmetric configuration because it looks more natural.
+
+A second, unrelated portability finding from the same testing: `listen`
+should be **IPv4-any only**, not both IPv4-any and IPv6-any. Binding both on
+the same port fails with "Address already in use" on Linux, because
+dual-stack IPv6-any sockets also claim the IPv4 namespace there by default
+(`IPV6_V6ONLY` defaults to off on Linux, on on macOS/OpenBSD) — there's no
+single address pair that's portable across every OS this project supports.
+IPv6-only peers can't dial a Rosenpass listener as a result; a known,
+documented limitation rather than a silent gap.
+
 ### 5.6 Applying the PSK
 
-Two sub-options, to be settled by the milestone-0 spike (§ in milestones.md)
-since they depend on exactly what the vendored Rosenpass version supports:
+**Resolved by the M0 spike, verified against the real 0.2.3 binary (not just
+its source):** file handoff, not Rosenpass's direct `wg set` integration.
+Rosenpass writes each peer's derived key, base64-encoded, to a `key_out` file
+on every exchange, and separately prints
+`output-key peer <id> key-file <path> exchanged|stale` to stdout — the
+"exchanged"/"stale" distinction matters and isn't optional to observe:
+upstream overwrites the *same* `key_out` file with random bytes on `stale`
+(invalidating a dropped session), so the file's raw contents alone can't
+distinguish a genuine PSK from that random overwrite. innernet redirects the
+daemon's stdout to a persistent log file (see §5.4) and only ever applies a
+key read after an `exchanged` line names that exact path.
 
-1. **File handoff**: Rosenpass writes each peer's derived key to a file
-   (`key_out` or equivalent); innernet watches that file (or the exchange
-   process signals completion) and applies it with
-   `PeerConfigBuilder::new(&pubkey).set_preshared_key(key)` +
-   `DeviceUpdate::new().add_peer(builder).apply(...)` — no interface
-   disruption, per §5's note that wireguard-control already merges settings
-   onto the existing peer.
-2. **Direct integration**: if the vendored Rosenpass ships a mode that calls
-   `wg set` itself (its `rp` wrapper is described as doing exactly this
-   upstream), let it manage the PSK directly and skip our own watcher,
-   trading a little control for less code.
+Once read, the key is applied via
+`PeerConfigBuilder::new(&pubkey).set_preshared_key(key)` +
+`DeviceUpdate::new().add_peer(builder).apply(...)` — no interface disruption,
+since wireguard-control merges peer settings onto the existing peer rather
+than replacing it. Rosenpass's alternative direct-`wg`-integration mode
+(`wg` field in its peer config, calling `wg set ... preshared-key /dev/stdin`
+itself) was rejected: it requires the `wg` CLI tool as an extra packaging
+dependency innernet doesn't otherwise need (wireguard-control talks to the
+kernel directly via netlink), and it would apply PSKs through a second,
+less-controlled code path outside innernet's own choke point for peer config.
 
-Either way, apply an **interim PSK** the same way NetBird does — a value
-both sides can derive independently from the two Rosenpass public keys before
-the first real exchange completes — so the tunnel isn't blocked waiting on
-Rosenpass. Document (per NetBird's own admission) that this interim window is
-not PQ-secure.
+Apply an **interim PSK** the same way NetBird does — a value both sides can
+derive independently from the two Rosenpass public keys before the first
+real exchange completes — so the tunnel isn't blocked waiting on Rosenpass.
+Document (per NetBird's own admission) that this interim window is not
+PQ-secure.
 
 ### 5.7 Subprocess vs. embedding
 

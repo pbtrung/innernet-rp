@@ -64,6 +64,17 @@ pub fn sync(
 
     sync_registration(server, &key_paths, self_peer, our_rosenpass_addr.as_ref())?;
 
+    // Exactly one side of each peer pair must dial (set `endpoint`); the other must leave it
+    // unset and rely solely on its own `listen` socket. Configuring *both* sides to dial each
+    // other is not merely redundant - verified against the real `rosenpass` binary, it makes
+    // each side independently complete its own handshake, and the two sides derive *different*
+    // (silently mismatched) preshared keys, breaking that WireGuard tunnel with no visible
+    // error. Both peers must independently reach the same dial/listen assignment without
+    // coordinating, so it's derived from something both already know: peer ID. The lower ID
+    // always dials the higher one - an arbitrary but deterministic, symmetric tie-break, in the
+    // same spirit as sorting both sides' keys for the interim PSK (design.md 5.6).
+    let our_peer_id = self_peer.map(|p| p.id);
+
     let rest_client = RestClient::new(server);
     let peer_configs: Vec<RosenpassPeerConfig> = peers
         .iter()
@@ -71,11 +82,18 @@ pub fn sync(
         .filter_map(|p| {
             let hash = p.rosenpass_public_key_hash.as_deref()?;
             match ensure_cached_peer_key(&rest_client, &rosenpass_dir, p.id, hash) {
-                Ok(public_key_path) => Some(RosenpassPeerConfig {
-                    peer_id: p.id,
-                    public_key_path,
-                    endpoint: p.rosenpass_addr.as_ref().and_then(|e| e.resolve().ok()),
-                }),
+                Ok(public_key_path) => {
+                    let we_dial = our_peer_id.is_some_and(|our_id| our_id < p.id);
+                    let endpoint = we_dial
+                        .then(|| p.rosenpass_addr.as_ref())
+                        .flatten()
+                        .and_then(|e| e.resolve().ok());
+                    Some(RosenpassPeerConfig {
+                        peer_id: p.id,
+                        public_key_path,
+                        endpoint,
+                    })
+                },
                 Err(e) => {
                     log::warn!("failed to cache rosenpass key for peer {}: {e}", p.id);
                     None
