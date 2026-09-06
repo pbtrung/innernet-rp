@@ -5,10 +5,13 @@
 use crate::{chmod, ensure_dirs_exist};
 use anyhow::{bail, Context as _, Error};
 use base64::Engine;
+use serde::Serialize;
 use std::{
     fs::File,
+    io::{BufRead, BufReader, Seek, SeekFrom},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 use wireguard_control::InterfaceName;
 
@@ -93,23 +96,307 @@ pub fn generate_keypair(paths: &RosenpassKeyPaths) -> Result<(), Error> {
 /// `PeerContents::rosenpass_public_key`), validating it's exactly the expected length for a
 /// Classic McEliece 460896 key.
 pub fn read_public_key_base64(paths: &RosenpassKeyPaths) -> Result<String, Error> {
-    let raw = std::fs::read(&paths.public_key).with_context(|| {
-        format!(
-            "failed to read rosenpass public key at {:?}",
-            paths.public_key
-        )
-    })?;
+    read_public_key_base64_at(&paths.public_key)
+}
+
+/// Like [`read_public_key_base64`], but for any raw public-key file — also used for peers'
+/// cached keys, not just our own (see [`DaemonPaths::peer_public_key_path`]).
+pub fn read_public_key_base64_at(path: &Path) -> Result<String, Error> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("failed to read rosenpass public key at {path:?}"))?;
 
     if raw.len() != ROSENPASS_PUBLIC_KEY_LEN {
         bail!(
             "rosenpass public key at {:?} has unexpected length {} (expected {})",
-            paths.public_key,
+            path,
             raw.len(),
             ROSENPASS_PUBLIC_KEY_LEN
         );
     }
 
     Ok(base64::engine::general_purpose::STANDARD.encode(raw))
+}
+
+/// Paths for a running (or to-be-started) Rosenpass exchange daemon for one interface.
+#[derive(Debug, Clone)]
+pub struct DaemonPaths {
+    /// The TOML config file passed to `rosenpass exchange-config`.
+    pub config: PathBuf,
+    /// The daemon's stdout+stderr, redirected to a file (rather than a pipe) because the daemon
+    /// must outlive the short-lived `innernet` CLI invocation that spawned it — nothing holds a
+    /// live pipe across separate `innernet up`/`fetch` invocations. See [`poll_new_events`] for
+    /// why we need this log at all rather than only reading `key_out` files directly.
+    pub log: PathBuf,
+    /// How many bytes of `log` have already been scanned by [`poll_new_events`], so repeated
+    /// calls (across separate CLI invocations) don't reprocess old lines.
+    pub log_offset: PathBuf,
+    /// The daemon's PID, so a later `innernet` invocation can tell whether it's still running
+    /// and, if the config changed, stop it before starting a new one (Rosenpass has no config
+    /// reload mechanism — see doc/design.md 5.6/8 — so a changed peer set means a full restart).
+    pub pid: PathBuf,
+}
+
+impl DaemonPaths {
+    pub fn new(rosenpass_dir: &Path) -> Self {
+        Self {
+            config: rosenpass_dir.join("rosenpass.toml"),
+            log: rosenpass_dir.join("rosenpass.log"),
+            log_offset: rosenpass_dir.join("rosenpass.log.offset"),
+            pid: rosenpass_dir.join("rosenpass.pid"),
+        }
+    }
+
+    /// Where a given peer's raw (non-base64) public key is cached locally, fetched on demand
+    /// from the server and reused as long as its hash matches what's currently advertised. See
+    /// the server-side `PeerContents::rosenpass_public_key_hash` docs for why this is cached
+    /// rather than re-fetched every time.
+    pub fn peer_public_key_path(rosenpass_dir: &Path, peer_id: i64) -> PathBuf {
+        rosenpass_dir.join("peers").join(format!("{peer_id}.pub"))
+    }
+
+    /// Where Rosenpass writes the derived preshared key for a given peer (base64-encoded, per
+    /// upstream's `key_out` mechanism).
+    pub fn peer_key_out_path(rosenpass_dir: &Path, peer_id: i64) -> PathBuf {
+        rosenpass_dir.join("peers").join(format!("{peer_id}.psk"))
+    }
+}
+
+/// One peer to include in the Rosenpass exchange daemon's config.
+#[derive(Debug, Clone)]
+pub struct RosenpassPeerConfig {
+    pub peer_id: i64,
+    /// Path to that peer's cached raw public key file (see [`DaemonPaths::peer_public_key_path`]).
+    pub public_key_path: PathBuf,
+    /// Where to dial this peer, if known. `None` means we only ever respond to this peer's
+    /// connection attempts, never initiate — still useful if the peer dials us.
+    pub endpoint: Option<SocketAddr>,
+}
+
+// Mirrors rosenpass's own `rosenpass::config::{Rosenpass, RosenpassPeer, Verbosity}` (see
+// upstream src/config.rs) closely enough to serialize a config file it accepts — field names
+// and shapes must match exactly. We only ever *write* this (never parse rosenpass's own config
+// back), so only `Serialize` is needed. The upstream struct's `wg` (direct `wg set` integration)
+// and `pre_shared_key` (an extra *input* PSK ingredient) fields are omitted entirely, which is
+// equivalent to leaving them `None` (see doc/design.md 5.6 for why innernet uses the `key_out`
+// file handoff rather than upstream's direct WireGuard integration).
+#[derive(Serialize)]
+struct RpConfig {
+    public_key: PathBuf,
+    secret_key: PathBuf,
+    listen: Vec<SocketAddr>,
+    verbosity: RpVerbosity,
+    peers: Vec<RpPeer>,
+}
+
+#[derive(Serialize)]
+enum RpVerbosity {
+    Quiet,
+}
+
+#[derive(Serialize)]
+struct RpPeer {
+    public_key: PathBuf,
+    endpoint: Option<String>,
+    key_out: PathBuf,
+}
+
+/// Renders the Rosenpass exchange-daemon config for this interface: our own keypair, our
+/// listen address(es) on `listen_port` (both IPv4-any and IPv6-any, matching upstream's own
+/// `add_if_any` convenience), and one peer entry per `peers` with its `key_out` set to where
+/// we'll look for its derived PSK (see [`DaemonPaths::peer_key_out_path`]).
+fn render_config(
+    rosenpass_dir: &Path,
+    key_paths: &RosenpassKeyPaths,
+    listen_port: u16,
+    peers: &[RosenpassPeerConfig],
+) -> String {
+    let config = RpConfig {
+        public_key: key_paths.public_key.clone(),
+        secret_key: key_paths.secret_key.clone(),
+        listen: vec![
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listen_port)),
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, listen_port, 0, 0)),
+        ],
+        verbosity: RpVerbosity::Quiet,
+        peers: peers
+            .iter()
+            .map(|p| RpPeer {
+                public_key: p.public_key_path.clone(),
+                endpoint: p.endpoint.map(|a| a.to_string()),
+                key_out: DaemonPaths::peer_key_out_path(rosenpass_dir, p.peer_id),
+            })
+            .collect(),
+    };
+    toml::to_string_pretty(&config).expect("rosenpass config is always representable as TOML")
+}
+
+/// Ensures a Rosenpass exchange daemon is running for this interface with an up-to-date peer
+/// list, (re)starting it only if the rendered config actually changed or the previously-started
+/// process is no longer alive. A full restart (rather than an in-place reload) is used because
+/// Rosenpass 0.2.3 has no config-reload mechanism (confirmed by inspecting upstream's source —
+/// no signal handling, no `remove_peer`, no IPC) — every peer-set/endpoint change requires
+/// stopping and restarting the whole exchange, which briefly drops PQ protection for every peer
+/// on that interface, not just the one that changed. Document this as a known limitation rather
+/// than something silently absorbed.
+pub fn ensure_daemon_running(
+    rosenpass_dir: &Path,
+    key_paths: &RosenpassKeyPaths,
+    listen_port: u16,
+    peers: &[RosenpassPeerConfig],
+) -> Result<(), Error> {
+    ensure_dirs_exist(&[rosenpass_dir, &rosenpass_dir.join("peers")])?;
+    let paths = DaemonPaths::new(rosenpass_dir);
+
+    let new_config = render_config(rosenpass_dir, key_paths, listen_port, peers);
+    let existing_config = std::fs::read_to_string(&paths.config).ok();
+    let config_unchanged = existing_config.as_deref() == Some(new_config.as_str());
+    let daemon_alive = read_pid(&paths.pid).is_some_and(pid_is_alive);
+
+    if config_unchanged && daemon_alive {
+        return Ok(());
+    }
+
+    if daemon_alive {
+        log::info!("rosenpass peer set/config changed, restarting exchange daemon");
+        if let Some(pid) = read_pid(&paths.pid) {
+            kill_pid(pid);
+        }
+    }
+
+    std::fs::write(&paths.config, &new_config)
+        .with_context(|| format!("failed to write rosenpass config to {:?}", paths.config))?;
+
+    spawn_daemon(&paths)
+}
+
+fn spawn_daemon(paths: &DaemonPaths) -> Result<(), Error> {
+    let log_file = File::create(&paths.log)
+        .with_context(|| format!("failed to create rosenpass log file at {:?}", paths.log))?;
+    let log_file_err = log_file
+        .try_clone()
+        .context("failed to duplicate rosenpass log file handle for stderr")?;
+    // Reset the read offset: this is a fresh log for a fresh process.
+    std::fs::write(&paths.log_offset, b"0")
+        .with_context(|| format!("failed to reset {:?}", paths.log_offset))?;
+
+    let child = Command::new(ROSENPASS_BIN)
+        .arg("exchange-config")
+        .arg(&paths.config)
+        .stdin(Stdio::null())
+        .stdout(log_file)
+        .stderr(log_file_err)
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to run `{ROSENPASS_BIN} exchange-config` - is rosenpass (>= 0.2.1) \
+                 installed and on PATH?"
+            )
+        })?;
+
+    // Deliberately not calling `.wait()`: dropping this `Child` handle does not terminate the
+    // process (Rust's `Child` has no "kill on drop" behavior), which is exactly what we need —
+    // the daemon must outlive this short-lived `innernet` invocation. Its PID is persisted so a
+    // later invocation can find and, if needed, stop it.
+    std::fs::write(&paths.pid, child.id().to_string())
+        .with_context(|| format!("failed to write rosenpass pid file to {:?}", paths.pid))?;
+
+    Ok(())
+}
+
+fn read_pid(pid_path: &Path) -> Option<u32> {
+    std::fs::read_to_string(pid_path).ok()?.trim().parse().ok()
+}
+
+/// Checks whether a process is alive by shelling out to `kill -0`, the same "small external
+/// utility" idiom already used elsewhere in this codebase (see `wg::cmd`) rather than reaching
+/// for a raw-syscall dependency.
+fn pid_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn kill_pid(pid: u32) {
+    if let Err(e) = Command::new("kill")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        log::warn!("failed to signal rosenpass process {pid}: {e}");
+    }
+}
+
+/// One `output-key` event parsed from the daemon's log — see upstream's `app_server.rs`, which
+/// prints `output-key peer <id-b64> key-file <path> exchanged|stale` to stdout on every key
+/// output, specifically so it can be detected externally like this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeEvent {
+    pub key_out_path: PathBuf,
+    pub fresh: bool,
+}
+
+/// Scans any log lines written since the last call, returning the events found. Distinguishing
+/// `exchanged` (a genuine new PSK) from `stale` matters: on `stale`, upstream overwrites the
+/// *same* `key_out` file with random bytes to invalidate it (its own comment: "erasing outdated
+/// key from peer") — so the file's raw contents alone can't tell us which case produced them.
+/// Only an `exchanged` event's contents should ever be applied to WireGuard.
+pub fn poll_new_events(paths: &DaemonPaths) -> Result<Vec<ExchangeEvent>, Error> {
+    let offset: u64 = std::fs::read_to_string(&paths.log_offset)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    let mut file = match File::open(&paths.log) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e).context("failed to open rosenpass log"),
+    };
+    let len = file.metadata()?.len();
+    if len < offset {
+        // The log was truncated/recreated (e.g. a restart) since we last read it; start over.
+        file.seek(SeekFrom::Start(0))?;
+    } else {
+        file.seek(SeekFrom::Start(offset))?;
+    }
+
+    let mut new_offset = offset.min(len);
+    let mut events = vec![];
+    for line in BufReader::new(&mut file).lines() {
+        let line = line.context("failed to read rosenpass log line")?;
+        new_offset += line.len() as u64 + 1; // +1 for the newline
+        if let Some(event) = parse_output_key_line(&line) {
+            events.push(event);
+        }
+    }
+
+    std::fs::write(&paths.log_offset, new_offset.to_string())
+        .with_context(|| format!("failed to update {:?}", paths.log_offset))?;
+
+    Ok(events)
+}
+
+fn parse_output_key_line(line: &str) -> Option<ExchangeEvent> {
+    // `output-key peer <peerid-b64> key-file <path> exchanged|stale`
+    let rest = line.strip_prefix("output-key peer ")?;
+    let (_peer_id, rest) = rest.split_once(" key-file ")?;
+    let (path, why) = rest.rsplit_once(' ')?;
+    let fresh = match why {
+        "exchanged" => true,
+        "stale" => false,
+        _ => return None,
+    };
+    // Upstream prints the path via `{:?}` (Rust Debug for PathBuf), which quotes it.
+    let path = path.trim_matches('"');
+    Some(ExchangeEvent {
+        key_out_path: PathBuf::from(path),
+        fresh,
+    })
 }
 
 #[cfg(test)]
@@ -148,5 +435,99 @@ mod tests {
                 .unwrap(),
             raw
         );
+    }
+
+    #[test]
+    fn test_parse_output_key_line() {
+        let exchanged = parse_output_key_line(
+            r#"output-key peer YBVIgpfLbi/knrMCTEb0L6eVy0daiZnJJQkxBK9s+2I= key-file "/data/rosenpass/peers/3.psk" exchanged"#,
+        )
+        .unwrap();
+        assert!(exchanged.fresh);
+        assert_eq!(
+            exchanged.key_out_path,
+            PathBuf::from("/data/rosenpass/peers/3.psk")
+        );
+
+        let stale = parse_output_key_line(
+            r#"output-key peer YBVIgpfLbi/knrMCTEb0L6eVy0daiZnJJQkxBK9s+2I= key-file "/data/rosenpass/peers/3.psk" stale"#,
+        )
+        .unwrap();
+        assert!(!stale.fresh);
+
+        assert!(parse_output_key_line("some unrelated log line").is_none());
+    }
+
+    #[test]
+    fn test_render_config_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_paths = RosenpassKeyPaths::new(dir.path());
+        let peer = RosenpassPeerConfig {
+            peer_id: 3,
+            public_key_path: DaemonPaths::peer_public_key_path(dir.path(), 3),
+            endpoint: Some("1.2.3.4:9999".parse().unwrap()),
+        };
+
+        let rendered = render_config(dir.path(), &key_paths, 51821, &[peer]);
+
+        assert!(rendered.contains("public-key"));
+        assert!(rendered.contains("secret-key"));
+        assert!(rendered.contains("51821"));
+        assert!(rendered.contains("1.2.3.4:9999"));
+        assert!(rendered.contains("3.pub"));
+        assert!(rendered.contains("3.psk"));
+        // Never include upstream's direct-`wg`-integration or extra-PSK-input fields.
+        assert!(!rendered.contains("wireguard"));
+        assert!(!rendered.contains("pre-shared-key") && !rendered.contains("pre_shared_key"));
+    }
+
+    #[test]
+    fn test_poll_new_events_only_returns_new_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let rosenpass_dir = dir.path();
+        std::fs::create_dir_all(rosenpass_dir).unwrap();
+        let paths = DaemonPaths::new(rosenpass_dir);
+
+        std::fs::write(
+            &paths.log,
+            "output-key peer AAAA key-file \"/x/1.psk\" exchanged\n",
+        )
+        .unwrap();
+        std::fs::write(&paths.log_offset, "0").unwrap();
+
+        let first = poll_new_events(&paths).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].fresh);
+
+        // Calling again without new log content should yield nothing new.
+        let second = poll_new_events(&paths).unwrap();
+        assert_eq!(second.len(), 0);
+
+        // Appending a new line should surface only that line.
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.log)
+            .unwrap();
+        use std::io::Write;
+        writeln!(log, "output-key peer AAAA key-file \"/x/1.psk\" stale").unwrap();
+        drop(log);
+
+        let third = poll_new_events(&paths).unwrap();
+        assert_eq!(third.len(), 1);
+        assert!(!third[0].fresh);
+    }
+
+    #[test]
+    fn test_pid_liveness_and_kill() {
+        // Spawn a short-lived real process to exercise the actual `kill -0`/`kill` shellouts,
+        // rather than mocking process liveness.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+
+        assert!(pid_is_alive(pid));
+        kill_pid(pid);
+        // Reap the process so it doesn't linger as a zombie, and give the signal a moment to land.
+        let _ = child.wait();
+        assert!(!pid_is_alive(pid));
     }
 }

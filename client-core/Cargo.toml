@@ -20,6 +20,7 @@ version = "2.0.0"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 colored.workspace = true
 innernet-shared = { version = "2.0.0", path = "../shared" }
 log = "0.4"

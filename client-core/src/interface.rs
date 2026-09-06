@@ -246,20 +246,6 @@ pub fn fetch(
         }
     }
 
-    if server_is_reachable && rosenpass_opts.enable_rosenpass {
-        let our_public_key = config.interface.public_key()?;
-        if let Err(e) = crate::rosenpass::sync(
-            data_dir,
-            interface,
-            rosenpass_opts,
-            &config.server,
-            &our_public_key,
-            &peers,
-        ) {
-            log::warn!("failed to sync rosenpass keypair/registration: {e}");
-        }
-    }
-
     let device = Device::get(interface, network_opts.backend)?;
     let modifications = device.diff(&peers);
 
@@ -294,6 +280,21 @@ pub fn fetch(
     let listen_port = device.listen_port.unwrap_or(51820);
     if server_is_reachable {
         report_candidates(&rest_client, nat, listen_port)?;
+
+        if rosenpass_opts.enable_rosenpass {
+            let our_public_key = config.interface.public_key()?;
+            if let Err(e) = crate::rosenpass::sync(
+                data_dir,
+                interface,
+                rosenpass_opts,
+                &config.server,
+                &our_public_key,
+                listen_port,
+                &peers,
+            ) {
+                log::warn!("failed to sync rosenpass keypair/registration/daemon: {e}");
+            }
+        }
     }
 
     if nat.no_nat_traversal {

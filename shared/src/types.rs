@@ -158,6 +158,17 @@ impl Endpoint {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// Returns a copy of this endpoint with a different port, same host. Used to derive a
+    /// Rosenpass listen address from a peer's WireGuard endpoint (see doc/design.md 5.5 — no
+    /// separate NAT traversal/endpoint discovery for Rosenpass, it reuses whatever address the
+    /// WireGuard endpoint/candidate system already resolved).
+    pub fn with_port(&self, port: u16) -> Self {
+        Self {
+            host: self.host.clone(),
+            port,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug)]
