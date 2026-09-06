@@ -5,6 +5,19 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::ServerError;
 
 pub async fn form_body<F: DeserializeOwned>(req: Request<Body>) -> Result<F, ServerError> {
+    form_body_with_limit(req, 16 * 1024).await
+}
+
+/// Like [`form_body`], but with a caller-specified max body size instead of the default 16 KiB.
+///
+/// Used by endpoints whose legitimate payload is much larger than a typical form body (e.g. a
+/// Rosenpass public key, a ~512 KiB Classic McEliece key rather than a compact WireGuard key) —
+/// still a firm, bounded ceiling, just a larger one, checked against `Content-Length` before the
+/// body is ever read into memory.
+pub async fn form_body_with_limit<F: DeserializeOwned>(
+    req: Request<Body>,
+    max_content_len: usize,
+) -> Result<F, ServerError> {
     let content_len: usize = req
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -12,7 +25,7 @@ pub async fn form_body<F: DeserializeOwned>(req: Request<Body>) -> Result<F, Ser
         .and_then(|header| header.parse().ok())
         .ok_or(ServerError::InvalidQuery)?;
 
-    if content_len > 16 * 1024 {
+    if content_len > max_content_len {
         return Err(ServerError::InvalidQuery);
     }
 

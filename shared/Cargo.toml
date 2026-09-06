@@ -20,9 +20,11 @@ version = "2.0.0"
 [dependencies]
 anyhow = "1"
 atty = "0.2"
+base64 = "0.22"
 clap = { version = "4.3", features = ["derive", "wrap_help"] }
 colored.workspace = true
 dialoguer.workspace = true
+hex = "0.4"
 hostsfile = { version = "2.0.0", path = "../hostsfile" }
 indoc = "2.0.1"
 innernet-publicip = { version = "2.0.0", path = "../publicip" }
@@ -32,6 +34,7 @@ log = "0.4"
 once_cell = "1.17.1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 toml = "0.8.10"
 url = "2"
 wireguard-control = { version = "2.0.0", path = "../wireguard-control" }

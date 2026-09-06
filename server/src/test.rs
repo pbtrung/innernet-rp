@@ -273,6 +273,9 @@ pub fn peer_contents(
         is_redeemed: true,
         invite_expires: None,
         candidates: vec![],
+        rosenpass_public_key: None,
+        rosenpass_public_key_hash: None,
+        rosenpass_addr: None,
     })
 }
 

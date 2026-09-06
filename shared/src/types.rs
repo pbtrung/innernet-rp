@@ -185,6 +185,32 @@ impl From<Option<Endpoint>> for EndpointContents {
     }
 }
 
+/// Base64-encoded length of a Rosenpass static public key: a Classic McEliece 460896 key,
+/// 524160 raw bytes (a fixed, standardized parameter of that post-quantum KEM, unlike
+/// WireGuard's compact 32-byte Curve25519 keys). 524160 is a multiple of 3, so it encodes to
+/// exactly this many base64 characters with no padding.
+pub const ROSENPASS_PUBLIC_KEY_BASE64_LEN: usize = 698_880;
+
+/// Validates that a submitted string has the exact shape of a genuine Rosenpass static public
+/// key: the exact expected length for a Classic McEliece 460896 key, and valid base64. Unlike a
+/// generic "cap the size" check, an exact-length check also rejects undersized garbage.
+pub fn is_valid_rosenpass_public_key(key: &str) -> bool {
+    use base64::Engine;
+    key.len() == ROSENPASS_PUBLIC_KEY_BASE64_LEN
+        && base64::engine::general_purpose::STANDARD
+            .decode(key)
+            .is_ok()
+}
+
+/// Payload for registering (or clearing) a peer's own Rosenpass public key/address.
+#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+pub struct RosenpassContents {
+    #[serde(default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub addr: Option<Endpoint>,
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 pub struct AssociationContents {
     pub cidr_id_1: i64,
@@ -569,6 +595,20 @@ pub struct HostsOpts {
     pub host_suffix: Option<String>,
 }
 
+/// Computes a hex-encoded SHA-256 fingerprint of a base64-encoded Rosenpass public key.
+///
+/// Rosenpass's static public key is a Classic McEliece 460896 key (~512 KiB base64-encoded),
+/// not a compact WireGuard-style key. Embedding the raw key in every peer entry of the bulk
+/// `/v1/user/state` response would multiply that ~512 KiB by every peer, on every poll. Instead,
+/// only this fingerprint travels in bulk broadcasts (see [`PeerContents::rosenpass_public_key_hash`]);
+/// the full key is fetched on demand, once per unique key, via a dedicated per-peer endpoint.
+pub fn rosenpass_public_key_hash(public_key_base64: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(public_key_base64.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PeerContents {
     pub name: Hostname,
@@ -583,6 +623,27 @@ pub struct PeerContents {
     pub invite_expires: Option<SystemTime>,
     #[serde(default)]
     pub candidates: Vec<Endpoint>,
+
+    /// The peer's Rosenpass static public key (base64), a Classic McEliece 460896 key (~512 KiB
+    /// encoded). Populated when registering/echoing a single peer's own key (e.g. the
+    /// `PUT /v1/user/rosenpass` registration response, or the dedicated per-peer key-fetch
+    /// endpoint) — **must** be `None` when a peer appears inside a bulk broadcast like
+    /// `/v1/user/state`, where [`rosenpass_public_key_hash`] is used instead to avoid multiplying
+    /// ~512 KiB by every peer on every poll.
+    #[serde(default)]
+    pub rosenpass_public_key: Option<String>,
+
+    /// Hex-encoded SHA-256 fingerprint of [`Self::rosenpass_public_key`] (see
+    /// [`rosenpass_public_key_hash`]). This is what actually travels in bulk peer-list broadcasts;
+    /// a client that doesn't already have the full key cached for this fingerprint fetches it
+    /// on demand and caches it locally, keyed by fingerprint.
+    #[serde(default)]
+    pub rosenpass_public_key_hash: Option<String>,
+
+    /// The address other peers' Rosenpass processes should dial to reach this peer's Rosenpass
+    /// listener. Reuses the same [`Endpoint`] type/parser as the WireGuard `endpoint` field.
+    #[serde(default)]
+    pub rosenpass_addr: Option<Endpoint>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -825,6 +886,11 @@ pub struct State {
 pub struct ServerCapabilities {
     #[serde(default)]
     pub unspecified_ip_in_override_endpoint: bool,
+    /// Whether this server understands and stores the `rosenpass_public_key`/
+    /// `rosenpass_public_key_hash`/`rosenpass_addr` peer fields. Lets a client detect "this
+    /// server supports Rosenpass" without a version bump.
+    #[serde(default)]
+    pub rosenpass: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -976,6 +1042,9 @@ mod tests {
                 is_redeemed: true,
                 invite_expires: None,
                 candidates: vec![],
+                rosenpass_public_key: None,
+                rosenpass_public_key_hash: None,
+                rosenpass_addr: None,
             },
         };
         let builder =
@@ -1011,6 +1080,9 @@ mod tests {
                 is_redeemed: true,
                 invite_expires: None,
                 candidates: vec![],
+                rosenpass_public_key: None,
+                rosenpass_public_key_hash: None,
+                rosenpass_addr: None,
             },
         };
         let builder =
@@ -1046,6 +1118,9 @@ mod tests {
                 is_redeemed: true,
                 invite_expires: None,
                 candidates: vec![],
+                rosenpass_public_key: None,
+                rosenpass_public_key_hash: None,
+                rosenpass_addr: None,
             },
         };
         let builder =

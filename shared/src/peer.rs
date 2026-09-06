@@ -24,6 +24,9 @@ impl NewPeerInfo {
             persistent_keepalive_interval: Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS),
             invite_expires: Some(SystemTime::now() + self.invite_expires.into()),
             candidates: vec![],
+            rosenpass_public_key: None,
+            rosenpass_public_key_hash: None,
+            rosenpass_addr: None,
         }
     }
 }

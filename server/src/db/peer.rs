@@ -1,6 +1,9 @@
 use super::DatabaseCidr;
 use crate::ServerError;
-use innernet_shared::{IpNetExt, Peer, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
+use innernet_shared::{
+    rosenpass_public_key_hash, Endpoint, IpNetExt, Peer, PeerContents,
+    PERSISTENT_KEEPALIVE_INTERVAL_SECS,
+};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use rusqlite::{params, types::Type, Connection};
@@ -22,6 +25,8 @@ pub static CREATE_TABLE_SQL: &str = "CREATE TABLE peers (
       is_redeemed     INTEGER DEFAULT 0 NOT NULL,   /* Has the peer redeemed their invite yet?                          */
       invite_expires  INTEGER,                      /* The UNIX time that an invited peer can no longer redeem.         */
       candidates      TEXT,                         /* A list of additional endpoints that peers can use to connect.    */
+      rosenpass_public_key TEXT,                     /* The peer's Rosenpass static public key (base64), if enabled.     */
+      rosenpass_addr  TEXT,                          /* The optional external endpoint of the peer's Rosenpass listener. */
       FOREIGN KEY (cidr_id)
          REFERENCES cidrs (id)
             ON UPDATE RESTRICT
@@ -40,6 +45,8 @@ pub static COLUMNS: &[&str] = &[
     "is_redeemed",
     "invite_expires",
     "candidates",
+    "rosenpass_public_key",
+    "rosenpass_addr",
 ];
 
 /// Regex to match the requirements of hostname(7), needed to have peers also be reachable hostnames.
@@ -84,6 +91,8 @@ impl DatabasePeer {
             is_redeemed,
             invite_expires,
             candidates,
+            rosenpass_public_key,
+            rosenpass_addr,
             ..
         } = &contents;
         log::info!("creating peer {:?}", contents);
@@ -116,7 +125,7 @@ impl DatabasePeer {
 
         conn.execute(
             &format!(
-                "INSERT INTO peers ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO peers ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 COLUMNS[1..].join(", ")
             ),
             params![
@@ -130,6 +139,8 @@ impl DatabasePeer {
                 is_redeemed,
                 invite_expires,
                 candidates,
+                rosenpass_public_key,
+                rosenpass_addr.as_ref().map(|addr| addr.to_string()),
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -158,6 +169,10 @@ impl DatabasePeer {
             is_admin: contents.is_admin,
             is_disabled: contents.is_disabled,
             candidates: contents.candidates,
+            rosenpass_public_key: contents.rosenpass_public_key,
+            rosenpass_addr: contents.rosenpass_addr,
+            // rosenpass_public_key_hash is a derived value computed on read for bulk broadcasts
+            // (see from_row) and is never itself persisted.
             ..self.contents.clone()
         };
 
@@ -168,7 +183,9 @@ impl DatabasePeer {
                 endpoint = ?3,
                 is_admin = ?4,
                 is_disabled = ?5,
-                candidates = ?6
+                candidates = ?6,
+                rosenpass_public_key = ?7,
+                rosenpass_addr = ?8
             WHERE id = ?1",
             params![
                 self.id,
@@ -180,6 +197,11 @@ impl DatabasePeer {
                 new_contents.is_admin,
                 new_contents.is_disabled,
                 new_candidates,
+                new_contents.rosenpass_public_key,
+                new_contents
+                    .rosenpass_addr
+                    .as_ref()
+                    .map(|addr| addr.to_string()),
             ],
         )?;
 
@@ -249,6 +271,11 @@ impl DatabasePeer {
             vec![]
         };
 
+        let rosenpass_public_key: Option<String> = row.get(11)?;
+        let rosenpass_addr = row
+            .get::<_, Option<String>>(12)?
+            .and_then(|addr| addr.parse::<Endpoint>().ok());
+
         let persistent_keepalive_interval = Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS);
 
         Ok(Peer {
@@ -265,9 +292,26 @@ impl DatabasePeer {
                 is_redeemed,
                 invite_expires,
                 candidates,
+                // Loaded as the raw key here; callers that broadcast to many peers (e.g. the
+                // `/v1/user/state` handler) must redact this to `rosenpass_public_key_hash`
+                // (via `rosenpass_public_key_hash()`) before serializing a response.
+                rosenpass_public_key,
+                rosenpass_public_key_hash: None,
+                rosenpass_addr,
             },
         }
         .into())
+    }
+
+    /// Redacts a peer's full Rosenpass public key down to just its fingerprint, for inclusion in
+    /// a bulk broadcast to many peers (see [`rosenpass_public_key_hash`] for why this matters).
+    pub fn redact_rosenpass_key_for_broadcast(peer: &mut Peer) {
+        peer.contents.rosenpass_public_key_hash = peer
+            .contents
+            .rosenpass_public_key
+            .take()
+            .as_deref()
+            .map(rosenpass_public_key_hash);
     }
 
     pub fn get(conn: &Connection, id: i64) -> Result<Self, ServerError> {

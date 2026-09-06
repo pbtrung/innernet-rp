@@ -175,6 +175,9 @@ mod tests {
                 persistent_keepalive_interval: None,
                 invite_expires: None,
                 candidates: vec![],
+                rosenpass_public_key: None,
+                rosenpass_public_key_hash: None,
+                rosenpass_addr: None,
             },
         }]
     });

@@ -100,6 +100,9 @@ fn populate_database(conn: &Connection, db_init_data: DbInitData) -> Result<(), 
             persistent_keepalive_interval: Some(PERSISTENT_KEEPALIVE_INTERVAL_SECS),
             invite_expires: None,
             candidates: vec![],
+            rosenpass_public_key: None,
+            rosenpass_public_key_hash: None,
+            rosenpass_addr: None,
         },
     )
     .map_err(|_| anyhow!("failed to create innernet peer."))?;

@@ -79,6 +79,9 @@ mod handlers {
             .map(|peer| peer.inner)
             .collect::<Vec<_>>();
         inject_endpoints(&session, &mut peers);
+        for peer in &mut peers {
+            DatabasePeer::redact_rosenpass_key_for_broadcast(peer);
+        }
         json_response(&peers)
     }
 

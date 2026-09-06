@@ -3,15 +3,20 @@ use std::collections::VecDeque;
 use crate::{
     api::inject_endpoints,
     db::{DatabaseCidr, DatabasePeer},
-    util::{form_body, json_response, status_response},
+    util::{form_body, form_body_with_limit, json_response, status_response},
     Context, ServerError, Session,
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    Endpoint, EndpointContents, PeerContents, RedeemContents, ServerCapabilities, State,
-    REDEEM_TRANSITION_WAIT,
+    is_valid_rosenpass_public_key, Endpoint, EndpointContents, PeerContents, RedeemContents,
+    RosenpassContents, ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
 use wireguard_control::{DeviceUpdate, PeerConfigBuilder};
+
+/// A Rosenpass public key is much larger than a typical form body (~683 KiB exact size, see
+/// [`innernet_shared::ROSENPASS_PUBLIC_KEY_BASE64_LEN`]) — this caps the request body well above
+/// that, but still at a firm, bounded ceiling rather than leaving it unbounded.
+const ROSENPASS_MAX_BODY_LEN: usize = 768 * 1024;
 
 pub async fn routes(
     req: Request<Body>,
@@ -47,6 +52,24 @@ pub async fn routes(
             let form = form_body(req).await?;
             handlers::candidates(form, session).await
         },
+        (&Method::PUT, Some("rosenpass")) => {
+            if !session.user_capable() {
+                return Err(ServerError::Unauthorized);
+            }
+            let form = form_body_with_limit(req, ROSENPASS_MAX_BODY_LEN).await?;
+            handlers::register_rosenpass_key(form, session).await
+        },
+        (&Method::GET, Some("rosenpass")) => {
+            if !session.user_capable() {
+                return Err(ServerError::Unauthorized);
+            }
+            let id: i64 = components
+                .pop_front()
+                .ok_or(ServerError::NotFound)?
+                .parse()
+                .map_err(|_| ServerError::NotFound)?;
+            handlers::rosenpass_key(id, session).await
+        },
         _ => Err(ServerError::NotFound),
     }
 }
@@ -71,12 +94,16 @@ mod handlers {
             .map(|p| p.inner)
             .collect();
         inject_endpoints(&session, &mut peers);
+        for peer in &mut peers {
+            DatabasePeer::redact_rosenpass_key_for_broadcast(peer);
+        }
         json_response(State { peers, cidrs })
     }
 
     pub async fn capabilities() -> Result<Response<Body>, ServerError> {
         let capabilities = ServerCapabilities {
             unspecified_ip_in_override_endpoint: true,
+            rosenpass: true,
         };
 
         json_response(capabilities)
@@ -175,6 +202,64 @@ mod handlers {
         )?;
 
         status_response(StatusCode::NO_CONTENT)
+    }
+
+    /// Register (or clear) the requesting peer's own Rosenpass public key/address.
+    ///
+    /// The full key never appears in a bulk broadcast like `/state` (see
+    /// [`DatabasePeer::redact_rosenpass_key_for_broadcast`]) — other peers fetch it on demand,
+    /// once per unique key, via [`rosenpass_key`].
+    pub async fn register_rosenpass_key(
+        contents: RosenpassContents,
+        session: Session,
+    ) -> Result<Response<Body>, ServerError> {
+        if let Some(key) = contents.public_key.as_deref() {
+            if !is_valid_rosenpass_public_key(key) {
+                log::warn!("rejecting malformed rosenpass public key registration");
+                return Err(ServerError::InvalidQuery);
+            }
+        }
+
+        let conn = session.context.db.lock();
+        let mut selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
+        selected_peer.update(
+            &conn,
+            PeerContents {
+                rosenpass_public_key: contents.public_key,
+                rosenpass_addr: contents.addr,
+                ..selected_peer.contents.clone()
+            },
+        )?;
+
+        status_response(StatusCode::NO_CONTENT)
+    }
+
+    /// Fetch a specific peer's full Rosenpass public key, by peer ID.
+    ///
+    /// This is deliberately **not** part of the bulk `/state` response (see module docs on
+    /// [`RosenpassContents`] and [`DatabasePeer::redact_rosenpass_key_for_broadcast`]) — a client
+    /// fetches this once per unique key it doesn't already have cached, rather than re-fetching a
+    /// ~683 KiB blob per peer on every poll.
+    ///
+    /// Scoped identically to `/state`: only peers visible to the requester (same CIDR
+    /// authorization) can be looked up this way, so this endpoint can't be used to enumerate or
+    /// fingerprint peers outside the requester's authorized network segment.
+    pub async fn rosenpass_key(id: i64, session: Session) -> Result<Response<Body>, ServerError> {
+        let conn = session.context.db.lock();
+        let selected_peer = DatabasePeer::get(&conn, session.peer.id)?;
+        let visible = selected_peer
+            .get_all_allowed_peers(&conn)?
+            .into_iter()
+            .any(|p| p.id == id);
+        if !visible {
+            return Err(ServerError::NotFound);
+        }
+
+        let peer = DatabasePeer::get(&conn, id)?;
+        json_response(RosenpassContents {
+            public_key: peer.contents.rosenpass_public_key.clone(),
+            addr: peer.contents.rosenpass_addr.clone(),
+        })
     }
 }
 
@@ -563,5 +648,179 @@ mod tests {
         assert!(developer_1.candidates.contains(&nat_candidate_2));
 
         Ok(())
+    }
+
+    /// A syntactically valid (but not cryptographically meaningful) Rosenpass public key: the
+    /// exact expected base64 length, made of a valid base64 character, so it decodes cleanly.
+    fn dummy_rosenpass_key() -> String {
+        "A".repeat(innernet_shared::ROSENPASS_PUBLIC_KEY_BASE64_LEN)
+    }
+
+    #[tokio::test]
+    async fn test_rosenpass_registration_hidden_from_bulk_state() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let key = dummy_rosenpass_key();
+
+        assert_eq!(
+            server
+                .form_request(
+                    test::DEVELOPER1_PEER_IP,
+                    "PUT",
+                    "/v1/user/rosenpass",
+                    &RosenpassContents {
+                        public_key: Some(key.clone()),
+                        addr: Some("1.2.3.4:9999".parse().unwrap()),
+                    },
+                )
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        // The bulk /state response must never contain the raw key, only its fingerprint.
+        let res = server
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let whole_body = hyper::body::aggregate(res).await?;
+        let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
+        let developer_1 = peers
+            .iter()
+            .find(|p| p.id == test::DEVELOPER1_PEER_ID)
+            .unwrap();
+        assert_eq!(developer_1.rosenpass_public_key, None);
+        assert_eq!(
+            developer_1.rosenpass_public_key_hash,
+            Some(innernet_shared::rosenpass_public_key_hash(&key))
+        );
+        assert_eq!(
+            developer_1.rosenpass_addr,
+            Some("1.2.3.4:9999".parse().unwrap())
+        );
+
+        // A peer within scope can fetch the full key on demand, by ID.
+        let res = server
+            .request(
+                test::DEVELOPER1_PEER_IP,
+                "GET",
+                &format!("/v1/user/rosenpass/{}", test::DEVELOPER1_PEER_ID),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let whole_body = hyper::body::aggregate(res).await?;
+        let fetched: RosenpassContents = serde_json::from_reader(whole_body.reader())?;
+        assert_eq!(fetched.public_key, Some(key));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rosenpass_key_rejects_malformed_input() -> Result<(), Error> {
+        let server = test::Server::new()?;
+
+        // Wrong length entirely.
+        assert_eq!(
+            server
+                .form_request(
+                    test::DEVELOPER1_PEER_IP,
+                    "PUT",
+                    "/v1/user/rosenpass",
+                    &RosenpassContents {
+                        public_key: Some("not-a-real-key".into()),
+                        addr: None,
+                    },
+                )
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // Right length, but not valid base64 (using a non-base64 character throughout).
+        let bad_key = "!".repeat(innernet_shared::ROSENPASS_PUBLIC_KEY_BASE64_LEN);
+        assert_eq!(
+            server
+                .form_request(
+                    test::DEVELOPER1_PEER_IP,
+                    "PUT",
+                    "/v1/user/rosenpass",
+                    &RosenpassContents {
+                        public_key: Some(bad_key),
+                        addr: None,
+                    },
+                )
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rosenpass_key_not_visible_outside_authorized_cidr() -> Result<(), Error> {
+        let server = test::Server::new()?;
+        let key = dummy_rosenpass_key();
+
+        // user1 is not in developer1's authorized CIDR set (see test::Server fixtures).
+        assert_eq!(
+            server
+                .form_request(
+                    test::USER1_PEER_IP,
+                    "PUT",
+                    "/v1/user/rosenpass",
+                    &RosenpassContents {
+                        public_key: Some(key),
+                        addr: None,
+                    },
+                )
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let res = server
+            .request(
+                test::DEVELOPER1_PEER_IP,
+                "GET",
+                &format!("/v1/user/rosenpass/{}", test::USER1_PEER_ID),
+            )
+            .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // And user1's key must not leak into developer1's /state response either.
+        let res = server
+            .request(test::DEVELOPER1_PEER_IP, "GET", "/v1/user/state")
+            .await;
+        let whole_body = hyper::body::aggregate(res).await?;
+        let State { peers, .. } = serde_json::from_reader(whole_body.reader())?;
+        assert!(!peers.iter().any(|p| p.id == test::USER1_PEER_ID));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_peer_contents_backward_compatible_without_rosenpass_fields() {
+        // A server/client running an older binary would send a PeerContents JSON blob with no
+        // rosenpass_* fields at all. This must still deserialize successfully, defaulting them
+        // all to None, per the `#[serde(default)]` backward-compat pattern already used for
+        // `candidates`.
+        let old_shaped_json = r#"{
+            "name": "peer1",
+            "ip": "10.0.0.1",
+            "cidr_id": 1,
+            "public_key": "4CNZorWVtohO64n6AAaH/JyFjIIgBFrfJK2SGtKjzEE=",
+            "endpoint": null,
+            "persistent_keepalive_interval": null,
+            "is_admin": false,
+            "is_disabled": false,
+            "is_redeemed": true,
+            "invite_expires": null
+        }"#;
+        let contents: PeerContents = serde_json::from_str(old_shaped_json)
+            .expect("old-shaped PeerContents JSON without rosenpass fields must still parse");
+        assert_eq!(contents.rosenpass_public_key, None);
+        assert_eq!(contents.rosenpass_public_key_hash, None);
+        assert_eq!(contents.rosenpass_addr, None);
+        assert_eq!(contents.candidates, vec![]);
     }
 }

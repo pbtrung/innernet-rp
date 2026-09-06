@@ -10,8 +10,9 @@ pub use peer::DatabasePeer;
 
 const INVITE_EXPIRATION_VERSION: usize = 1;
 const ENDPOINT_CANDIDATES_VERSION: usize = 2;
+const ROSENPASS_VERSION: usize = 3;
 
-pub const CURRENT_VERSION: usize = ENDPOINT_CANDIDATES_VERSION;
+pub const CURRENT_VERSION: usize = ROSENPASS_VERSION;
 
 pub fn auto_migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     let old_version: usize = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -26,6 +27,17 @@ pub fn auto_migrate(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> 
 
     if old_version < ENDPOINT_CANDIDATES_VERSION {
         conn.execute("ALTER TABLE peers ADD COLUMN candidates TEXT", params![])?;
+    }
+
+    if old_version < ROSENPASS_VERSION {
+        conn.execute(
+            "ALTER TABLE peers ADD COLUMN rosenpass_public_key TEXT",
+            params![],
+        )?;
+        conn.execute(
+            "ALTER TABLE peers ADD COLUMN rosenpass_addr TEXT",
+            params![],
+        )?;
     }
 
     if old_version != CURRENT_VERSION {
