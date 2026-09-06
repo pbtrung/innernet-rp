@@ -1,0 +1,56 @@
+# Maintainer: Trung Pham <trung.pham@zedercorp.com.vn>
+#
+# Packages prebuilt innernet/innernet-server/rosenpass binaries from a GitHub release of this
+# repo (built by bin/build-multiarch.sh + bin/Dockerfile, RELEASE_VERSION=<pkgver>) - this does
+# NOT build from source. Update pkgver to match a published `vX.Y.Z` release tag, then run
+# `updpkgsums` (from pacman-contrib) to fill in the two source_$CARCH sha256sums below before
+# `makepkg`.
+
+pkgname=innernet-rp-bin
+pkgver=2.0.0
+pkgrel=1
+pkgdesc="A private network system built on WireGuard, with optional post-quantum key exchange via Rosenpass (prebuilt binaries)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/pbtrung/innernet-rp"
+license=('MIT')
+depends=('systemd')
+optdepends=('wireguard-tools: wg/wg-quick CLI tools for manual interface inspection')
+provides=('innernet' 'innernet-server')
+conflicts=('innernet' 'innernet-server')
+options=('!strip') # bin/build-multiarch.sh already strips these binaries
+
+_target_x86_64='x86_64-unknown-linux-musl'
+_target_aarch64='aarch64-unknown-linux-musl'
+
+source_x86_64=("innernet-rp-${pkgver}-${_target_x86_64}.tar.gz::https://github.com/pbtrung/innernet-rp/releases/download/v${pkgver}/innernet-rp-${pkgver}-${_target_x86_64}.tar.gz")
+source_aarch64=("innernet-rp-${pkgver}-${_target_aarch64}.tar.gz::https://github.com/pbtrung/innernet-rp/releases/download/v${pkgver}/innernet-rp-${pkgver}-${_target_aarch64}.tar.gz")
+
+# makepkg only accepts local sources that live alongside the PKGBUILD itself (no `../` path
+# traversal - verified: it looks up just the basename in $startdir), so innernet@.service and
+# innernet-server@.service here are symlinks to the real files at client/innernet@.service and
+# server/innernet-server@.service (the same ones this repo's .deb/.rpm packaging metadata uses) -
+# not copies, so there's nothing to keep in sync by hand.
+source=(
+  'innernet@.service'
+  'innernet-server@.service'
+)
+sha256sums=('943edf174992bb72dd07501903873be40159449935c6ef90a305cad51b359167'
+            'f629debbb6539e37ac81a039447b04e66dd3e39c316e414414378e2dbb62eb69')
+
+# Placeholders only: 'SKIP' disables integrity verification entirely for these two downloads
+# (makepkg will accept whatever it fetches, unverified) - not a safe value to ship. Before
+# actually building/distributing this package, run `updpkgsums` once a real vX.Y.Z release
+# exists, to replace these with real checksums pinned to that specific release's assets.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    install -Dm755 "$srcdir/innernet" "$pkgdir/usr/bin/innernet"
+    install -Dm755 "$srcdir/innernet-server" "$pkgdir/usr/bin/innernet-server"
+    install -Dm755 "$srcdir/rosenpass" "$pkgdir/usr/bin/rosenpass"
+
+    install -Dm644 "$srcdir/innernet@.service" \
+        "$pkgdir/usr/lib/systemd/system/innernet@.service"
+    install -Dm644 "$srcdir/innernet-server@.service" \
+        "$pkgdir/usr/lib/systemd/system/innernet-server@.service"
+}
