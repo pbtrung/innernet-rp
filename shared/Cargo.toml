@@ -48,5 +48,8 @@ netlink-sys.workspace = true
 [target.'cfg(any(target_os = "macos", target_os= "openbsd"))'.dependencies]
 nix = "0.26"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 selinux = ["hostsfile/selinux"]

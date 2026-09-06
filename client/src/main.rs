@@ -16,8 +16,8 @@ use innernet_shared::{
     AddDeleteAssociationOpts, AddPeerOpts, Association, AssociationContents, Cidr, CidrTree,
     DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts,
     Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
-    OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
-    WrappedIoError,
+    OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts, RosenpassOpts,
+    ServerCapabilities, WrappedIoError,
 };
 use std::{
     io,
@@ -82,6 +82,9 @@ enum Command {
 
         #[clap(flatten)]
         nat: NatOpts,
+
+        #[clap(flatten)]
+        rosenpass: RosenpassOpts,
     },
 
     /// Enumerate all innernet connections
@@ -116,6 +119,9 @@ enum Command {
         #[clap(flatten)]
         nat: NatOpts,
 
+        #[clap(flatten)]
+        rosenpass: RosenpassOpts,
+
         interface: Option<Interface>,
     },
 
@@ -128,6 +134,9 @@ enum Command {
 
         #[clap(flatten)]
         nat: NatOpts,
+
+        #[clap(flatten)]
+        rosenpass: RosenpassOpts,
     },
 
     /// Uninstall an innernet network.
@@ -272,6 +281,7 @@ enum Command {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install(
     opts: &Opts,
     hosts_opts: &HostsOpts,
@@ -279,6 +289,7 @@ fn install(
     nat_opts: &NatOpts,
     invite: &Path,
     listen_port: Option<u16>,
+    rosenpass_opts: &RosenpassOpts,
 ) -> Result<(), Error> {
     let mut config = InterfaceConfig::from_file(invite)?;
     if let Some(listen_port) = listen_port {
@@ -309,6 +320,7 @@ fn install(
             nat_opts,
             &interface_name,
             true,
+            rosenpass_opts,
         )
         .is_ok()
         {
@@ -398,6 +410,7 @@ fn up(
     loop_interval: Option<Duration>,
     hosts_opts: HostsOpts,
     nat_opts: &NatOpts,
+    rosenpass_opts: &RosenpassOpts,
 ) -> Result<(), Error> {
     loop {
         let interfaces = match &specific_interface {
@@ -414,6 +427,7 @@ fn up(
                 nat_opts,
                 &interface,
                 true,
+                rosenpass_opts,
             )?;
         }
 
@@ -1156,7 +1170,16 @@ fn run(opts: &Opts) -> Result<(), Error> {
             hosts,
             install_opts,
             nat,
-        } => install(opts, &hosts, &install_opts, &nat, &invite, listen_port)?,
+            rosenpass,
+        } => install(
+            opts,
+            &hosts,
+            &install_opts,
+            &nat,
+            &invite,
+            listen_port,
+            &rosenpass,
+        )?,
         Command::Show {
             short,
             tree,
@@ -1166,6 +1189,7 @@ fn run(opts: &Opts) -> Result<(), Error> {
             interface,
             hosts,
             nat,
+            rosenpass,
         } => {
             fetch(
                 &opts.config_dir,
@@ -1175,6 +1199,7 @@ fn run(opts: &Opts) -> Result<(), Error> {
                 &nat,
                 &interface,
                 false,
+                &rosenpass,
             )?;
         },
         Command::Up {
@@ -1183,12 +1208,14 @@ fn run(opts: &Opts) -> Result<(), Error> {
             hosts,
             nat,
             interval,
+            rosenpass,
         } => up(
             interface,
             opts,
             daemon.then(|| Duration::from_secs(interval)),
             hosts,
             &nat,
+            &rosenpass,
         )?,
         Command::Down { interface } => wg::down(&interface, opts.network.backend)?,
         Command::Uninstall { interface, yes } => uninstall(&interface, opts, yes)?,

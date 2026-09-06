@@ -16,6 +16,7 @@ pub mod interface_config;
 mod netlink;
 pub mod peer;
 pub mod prompts;
+pub mod rosenpass;
 pub mod types;
 pub mod wg;
 

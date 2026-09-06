@@ -12,7 +12,7 @@ use colored::{ColoredString, Colorize};
 use innernet_shared::{
     get_local_addrs, update_hosts_file,
     wg::{self, DeviceExt as _},
-    Endpoint, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
+    Endpoint, PeerChange, PeerDiff, RedeemContents, RosenpassOpts, State, REDEEM_TRANSITION_WAIT,
 };
 use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
 use thiserror::Error;
@@ -153,6 +153,7 @@ fn update_keypair(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fetch(
     config_dir: &Path,
     data_dir: &Path,
@@ -161,6 +162,7 @@ pub fn fetch(
     nat: &NatOpts,
     interface: &InterfaceName,
     bring_up_interface: bool,
+    rosenpass_opts: &RosenpassOpts,
 ) -> Result<(), Error> {
     let config = InterfaceConfig::from_interface(config_dir, interface)?;
     let interface_up = interface_is_up(network_opts.backend, interface);
@@ -241,6 +243,20 @@ pub fn fetch(
 
         if let Some(peer) = peers.iter_mut().find(|p| p.ip == *peer_ip) {
             peer.endpoint = Some(endpoint_override.clone());
+        }
+    }
+
+    if server_is_reachable && rosenpass_opts.enable_rosenpass {
+        let our_public_key = config.interface.public_key()?;
+        if let Err(e) = crate::rosenpass::sync(
+            data_dir,
+            interface,
+            rosenpass_opts,
+            &config.server,
+            &our_public_key,
+            &peers,
+        ) {
+            log::warn!("failed to sync rosenpass keypair/registration: {e}");
         }
     }
 

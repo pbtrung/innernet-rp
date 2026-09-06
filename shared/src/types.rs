@@ -542,6 +542,21 @@ pub struct NatOpts {
     pub no_nat_candidates: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct RosenpassOpts {
+    /// Enable Rosenpass post-quantum-secure key exchange alongside WireGuard.
+    #[clap(long = "enable-rosenpass")]
+    pub enable_rosenpass: bool,
+
+    /// When Rosenpass is enabled, fall back to plain WireGuard (no preshared key) for peers
+    /// that haven't advertised a Rosenpass public key, instead of refusing to connect to them.
+    /// Without this flag, a peer with no advertised key is treated as unreachable. See
+    /// doc/design.md 5.8 for why this is a client-side, per-operator choice rather than
+    /// something the server can enforce.
+    #[clap(long = "rosenpass-permissive", requires = "enable_rosenpass")]
+    pub rosenpass_permissive: bool,
+}
+
 impl NatOpts {
     pub fn all_disabled() -> Self {
         Self {

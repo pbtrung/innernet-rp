@@ -19,6 +19,7 @@ pub mod interface;
 mod nat;
 pub mod peer;
 pub mod rest_client;
+pub mod rosenpass;
 
 pub const DEFAULT_CONFIG_DIR: &str = "/etc/innernet";
 

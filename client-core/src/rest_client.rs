@@ -1,5 +1,6 @@
 use innernet_shared::{
-    interface_config::ServerInfo, Cidr, CidrContents, Peer, PeerContents, INNERNET_PUBKEY_HEADER,
+    interface_config::ServerInfo, Cidr, CidrContents, Peer, PeerContents, RosenpassContents,
+    INNERNET_PUBKEY_HEADER,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use std::{io, time::Duration};
@@ -45,6 +46,21 @@ impl<'a> RestClient<'a> {
     pub fn get_peers(&self) -> Result<Vec<Peer>, RestError> {
         let peers = self.http("GET", "/admin/peers")?;
         Ok(peers)
+    }
+
+    /// Register (or clear) this peer's own Rosenpass public key/address with the server.
+    ///
+    /// The full key (~683 KiB base64) is only ever sent here or fetched via
+    /// [`Self::get_rosenpass_key`], never included in the bulk `/user/state` this peer polls —
+    /// see the server-side `PeerContents::rosenpass_public_key_hash` docs for why.
+    pub fn register_rosenpass_key(&self, contents: &RosenpassContents) -> Result<(), RestError> {
+        self.http_form("PUT", "/user/rosenpass", contents)
+    }
+
+    /// Fetch a specific peer's full Rosenpass public key/address, by peer ID. Scoped
+    /// server-side to peers visible to this session (same as `/user/state`).
+    pub fn get_rosenpass_key(&self, peer_id: i64) -> Result<RosenpassContents, RestError> {
+        self.http("GET", &format!("/user/rosenpass/{peer_id}"))
     }
 
     #[allow(clippy::result_large_err)]
