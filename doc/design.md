@@ -432,11 +432,26 @@ haven't enabled it — visibility, not enforcement.
 `peers.id` row zero / the "innernet-server" peer seen in
 `server/src/api/user.rs` tests). For full protection of the
 coordination-API traffic itself (§3, auth model note), the server process
-should run the same Rosenpass process-management logic as the client. Since
-`server/src/lib.rs`/`initialize.rs` apply WireGuard changes directly (not
-through `client-core`), the process-lifecycle logic in §5.4 should be
-factored into `shared` so both `client-core` and `server` can call it, rather
-than duplicated.
+runs the same Rosenpass process-management logic as the client
+(`server/src/rosenpass.rs`) — the daemon-lifecycle and PSK-application
+pieces (`ensure_daemon_running`/`apply_psks`) are factored into `shared` so
+both `client-core` and `server` call the identical code, differing only in
+how they source data: the server has every peer's row (including its own)
+directly in its database, so registering its own key or reading a peer's key
+is a direct DB read/write, never an HTTP round trip.
+
+**The server does not apply strict/permissive peer-exclusion to its own
+device**, even without `--rosenpass-permissive` — this is a deliberate,
+narrower scope than a first reading of "run the same logic as the client"
+might suggest. Client-side strict mode (§5.8) excludes a peer from *that
+client's* WireGuard interface, which only affects peer-to-peer connectivity
+between two mesh members. Doing the equivalent on the server would make a
+peer unable to reach the coordination API *at all* — breaking invite
+redemption and state fetching for a reason unrelated to whether that
+specific link happens to have post-quantum protection yet. That's a far more
+severe and simply wrong consequence, so the server's Rosenpass sync only
+ever adds PSK protection to server↔peer links; it never gates a peer's
+visibility or reachability based on Rosenpass status.
 
 ### 5.10 Static config export for non-innernet peers (e.g. mobile)
 

@@ -30,6 +30,7 @@ selinux = ["innernet-shared/selinux"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4.3", features = ["derive", "wrap_help"] }
 clap_complete = "4.3"

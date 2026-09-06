@@ -175,16 +175,44 @@ this milestone is fully done.
 tested; real three-peer connectivity via `docker-tests/` has not been
 verified and is the remaining gap.
 
-## M6 — Server as a mesh peer
+## M6 — Server as a mesh peer — mostly DONE (docker-tests scenario still open)
 
-- Apply the same process-lifecycle logic (factored into `shared` in M3) to
-  `innernet-server` itself, so the coordination API's own WireGuard link can
-  carry a Rosenpass PSK too (design.md §5.9).
-- Extend `server/src/initialize.rs`/`lib.rs`'s direct `DeviceUpdate` calls
-  to apply Rosenpass-derived PSKs the same way the client does.
+- `server/src/rosenpass.rs`: a new periodic task (`spawn`, wired into
+  `serve()` alongside the existing endpoint-refresher/invite-sweeper/
+  hostfile-writer tasks) runs the server's own Rosenpass keypair lifecycle,
+  daemon, and PSK application — reusing the exact same
+  `rosenpass::ensure_daemon_running`/`apply_psks` from `shared` that the
+  client uses (factored there during M4, not just "in M3" as originally
+  planned, since PSK application landed in M4).
+- Differs from the client only in *how* it sources data, exactly as
+  design.md §5.9 anticipated: no HTTP round trip needed to register its own
+  key or fetch a peer's key — both are direct reads/writes against its own
+  database `Connection`, since the server already has every peer's row
+  (including its own) locally.
+- **Important scope narrowing found while implementing**: the server does
+  *not* apply strict/permissive peer-exclusion to its own device, even
+  without `--rosenpass-permissive`. Client-side strict mode excludes a peer
+  from *that client's* WireGuard interface, which only affects P2P
+  connectivity; doing the equivalent on the server would make a peer unable
+  to reach the coordination API at all (breaking redemption/fetch for a
+  reason unrelated to whether that link happens to have PQ protection) —
+  a much more severe, wrong consequence. The server's own Rosenpass sync
+  only ever adds PSK protection to server↔peer links; it never gates peer
+  visibility.
+- New `--enable-rosenpass`/`--rosenpass-permissive` flags on
+  `innernet-server serve` (the permissive flag is accepted for CLI
+  consistency but doesn't change server-side behavior, per the point above).
+- Covered by unit tests for the DB-sourced key-caching logic
+  (`server/src/rosenpass.rs`); the daemon-lifecycle/PSK-application code
+  itself is the same already-tested `shared::rosenpass` code M3/M4 covered.
+- **Not yet done**: same real-interface gap as M4/M5 — no live
+  `innernet-server` process with a real WireGuard interface has exercised
+  this end-to-end in this environment (no root/CAP_NET_ADMIN available).
 
-**Acceptance**: on a Rosenpass-enabled network, `wg show` on the server
-shows a non-empty, rotating PSK for enrolled peers, not just peer-to-peer.
+**Acceptance**: partially met — the server-side sync logic is implemented,
+reuses already-tested shared code, and is unit-tested where it doesn't
+require a live interface; confirming `wg show` on a real running server
+shows a non-empty, rotating PSK for enrolled peers remains open.
 
 ## M7 — Security review & hardening
 

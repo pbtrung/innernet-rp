@@ -811,6 +811,7 @@ name = "innernet-server"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "clap_complete",

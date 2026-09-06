@@ -36,6 +36,7 @@ mod api;
 mod db;
 mod error;
 pub mod initialize;
+mod rosenpass;
 #[cfg(test)]
 mod test;
 mod util;
@@ -468,6 +469,7 @@ pub async fn serve(
     conf: &ServerConfig,
     network: NetworkOpts,
     hosts_opts: HostsOpts,
+    rosenpass_opts: innernet_shared::RosenpassOpts,
 ) -> Result<(), Error> {
     let config = ConfigFile::from_file(conf.config_path(&interface))?;
     log::debug!("opening database connection...");
@@ -525,6 +527,16 @@ pub async fn serve(
     if !hosts_opts.no_write_hosts {
         spawn_hostfile_writer(db.clone(), interface, hosts_opts);
     }
+
+    crate::rosenpass::spawn(
+        db.clone(),
+        interface,
+        network.backend,
+        conf.data_dir.clone(),
+        public_key.to_base64(),
+        config.listen_port,
+        rosenpass_opts,
+    );
 
     let context = Context {
         db,
