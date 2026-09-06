@@ -5,8 +5,6 @@
 
 A private network system that uses [WireGuard](https://wireguard.com) under the hood. See the [announcement blog post](https://blog.tonari.no/introducing-innernet) for a longer-winded explanation.
 
-<img src="https://user-images.githubusercontent.com/373823/118917068-09ae7700-b96b-11eb-80f4-6860072d504d.gif" width="600" height="370">
-
 `innernet` is similar in its goals to Slack's [nebula](https://github.com/slackhq/nebula) or [Tailscale](https://tailscale.com/), but takes a bit of a different approach. It aims to take advantage of existing networking concepts like CIDRs and the security properties of WireGuard to turn your computer's basic IP networking into more powerful ACL primitives.
 
 `innernet` is not an official WireGuard project, and WireGuard is a registered trademark of Jason A. Donenfeld.
@@ -365,3 +363,21 @@ Please run the release script from a Linux machine: generated shell completions 
 1. Push the created tag to the repo using `git push origin v<version>`.
 1. Create a GitHub release from the tag, generate release notes and highlight important changes.
 1. Bump the [homebrew-innernet](https://github.com/tonarino/homebrew-innernet) formula version.
+
+### Building static amd64/arm64 binaries for deployment
+
+If you just want to build `innernet`/`innernet-server` binaries to copy onto your
+own nodes (not a full crates.io/GitHub release), run:
+
+```sh
+./build-multiarch.sh
+```
+
+This cross-compiles statically-linked binaries for both `x86_64` and `aarch64`
+Linux via Docker (no local Rust cross-toolchain or `rustup` needed — only
+Docker), writing them to `dist/x86_64-unknown-linux-musl/` and
+`dist/aarch64-unknown-linux-musl/`. The musl target is used specifically so the
+binaries have no runtime dependencies at all (verify with `ldd`, which reports
+"not a dynamic executable") — a plain glibc build would dynamically link
+whatever `libsqlite3` happens to be on the build machine, which your nodes
+would then also need installed at a compatible version.

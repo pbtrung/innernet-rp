@@ -1,4 +1,5 @@
 target/
+bin/dist/
 *.db
 *.conf
 arch/pkg
