@@ -36,6 +36,10 @@ OUT_DIR="${OUT_DIR:-bin/dist}"
 CARGO_CACHE_VOLUME="innernet-build-cargo-registry-cache"
 ROSENPASS_VERSION="${ROSENPASS_VERSION:-0.2.3}"
 SKIP_ROSENPASS="${SKIP_ROSENPASS:-}"
+# Set to your project version (e.g. `cargo pkgid -p innernet-shared | cut -d '@' -f2`) to also
+# produce per-architecture tar.gz archives in $OUT_DIR/release/, ready to attach to a GitHub
+# release. Leave unset to skip packaging and just leave the raw binaries in $OUT_DIR/<target>/.
+RELEASE_VERSION="${RELEASE_VERSION:-}"
 
 if [ -z "$SKIP_ROSENPASS" ]; then
     docker buildx version >/dev/null 2>&1 || die "docker buildx is required to build rosenpass (or set SKIP_ROSENPASS=1 to skip it)."
@@ -91,9 +95,23 @@ for target in "${!TARGETS[@]}"; do
     echo "==> ${target} binaries ready in ${arch_out_dir}/:"
     ls -la "$arch_out_dir"
     file "$arch_out_dir"/* 2>/dev/null || true
+
+    if [ -n "$RELEASE_VERSION" ]; then
+        release_dir="$OUT_DIR/release"
+        mkdir -p "$release_dir"
+        archive="$release_dir/innernet-${RELEASE_VERSION}-${target}.tar.gz"
+        tar -czf "$archive" -C "$arch_out_dir" $(ls "$arch_out_dir")
+        echo "==> packaged $archive"
+    fi
     echo
 done
 
 echo "Done. Copy the binaries for each node's architecture from ${OUT_DIR}/<target>/, e.g.:"
 echo "  scp ${OUT_DIR}/aarch64-unknown-linux-musl/{innernet-server,rosenpass} root@arm-node:/usr/local/bin/"
 echo "  scp ${OUT_DIR}/x86_64-unknown-linux-musl/{innernet-server,rosenpass} root@amd64-node:/usr/local/bin/"
+
+if [ -n "$RELEASE_VERSION" ]; then
+    echo
+    echo "To publish these to a GitHub release (requires the gh CLI, authenticated):"
+    echo "  gh release create v${RELEASE_VERSION} ${OUT_DIR}/release/*.tar.gz --title v${RELEASE_VERSION} --generate-notes"
+fi
