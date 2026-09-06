@@ -29,7 +29,7 @@
 FROM rust:1-slim-bookworm AS builder
 
 ARG ROSENPASS_VERSION=0.2.3
-ARG LIBSODIUM_VERSION=1.0.20
+ARG LIBSODIUM_VERSION=1.0.22
 
 # >= 0.2.1 fixes CVE-2023-53157 (remote DoS via unvalidated buffer size when decoding messages) -
 # see doc/design.md/milestones.md in the innernet-rp repo. Never build an older version.
