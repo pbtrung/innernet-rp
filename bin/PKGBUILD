@@ -29,7 +29,9 @@ depends=('systemd')
 optdepends=('wireguard-tools: wg/wg-quick CLI tools for manual interface inspection')
 provides=('innernet' 'innernet-server')
 conflicts=('innernet' 'innernet-server')
-options=('!strip') # bin/build-multiarch.sh already strips these binaries
+options=('!strip' '!debug') # bin/build-multiarch.sh already strips these binaries; there's no
+                             # source tree here for makepkg's debug-package splitting to use
+                             # (it was creating a bogus pkg/innernet-rp-bin/usr/src/debug/ tree)
 
 _target_x86_64='x86_64-unknown-linux-musl'
 _target_aarch64='aarch64-unknown-linux-musl'
