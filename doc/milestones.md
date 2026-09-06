@@ -214,24 +214,53 @@ reuses already-tested shared code, and is unit-tested where it doesn't
 require a live interface; confirming `wg show` on a real running server
 shows a non-empty, rotating PSK for enrolled peers remains open.
 
-## M7 — Security review & hardening
+## M7 — Security review & hardening — mostly DONE (subprocess privilege-dropping and docker-tests open)
 
-- Run this repo's `/security-review` skill against the full feature diff.
-- Subprocess hardening pass per design.md §6 (capability dropping, restricted
-  filesystem view for the Rosenpass child process, unprivileged user if
-  feasible per the M0-selected handoff mechanism).
-- Fuzz/property-test the new parsing paths (rosenpass key/address
-  deserialization) the way `Endpoint`'s `FromStr` would warrant.
-- Confirm the vendored version still resolves to ≥ 0.2.1
-  ([CVE-2023-53157](https://osv.dev/vulnerability/CVE-2023-53157)) and add a
-  regression test sending a truncated/malformed UDP packet at the Rosenpass
-  listener, asserting the process doesn't panic/crash.
-- Re-run `cargo clippy --workspace --locked --all-targets -- -D warnings` and
-  the full `docker-tests/` suite as a final gate.
+- Ran a security review against the full diff (946d53f..HEAD), using the
+  same methodology as this repo's `/security-review` skill (its own
+  git-diff auto-detection only looks at uncommitted changes, so the range
+  was reviewed directly). Two passes: identify candidates, then adversarially
+  verify each. **Zero reportable findings.** The one candidate worth
+  verifying — a peer can set its own `rosenpass_addr` to an arbitrary
+  host:port, causing other peers' local `rosenpass` processes to send it UDP
+  packets — was confirmed to be exactly equivalent to the pre-existing
+  WireGuard `endpoint`/`candidates` mechanism (`client-core/src/nat.rs`
+  already does this for the WireGuard protocol itself, with the same
+  peer-self-reports-its-address trust model), not a new attack surface.
+- Fuzz/property-tested the new parsing paths and, doing so, **found and
+  fixed a real validation gap**: `is_valid_rosenpass_public_key` checked the
+  base64 *string* length but not the *decoded byte* length, so a
+  correctly-sized string with trailing `=` padding could pass while decoding
+  to 1-2 bytes short of a real key. Fixed to check both. Also added a
+  battery of malformed/adversarial inputs to `parse_output_key_line`
+  (empty, truncated, wrong case, embedded nulls, unicode, ~2MB adversarial
+  lines) confirming it never panics — this parses output from a subprocess
+  that itself handles untrusted network input, so hostile-shaped log lines
+  are an expected input to defend against, not an edge case to shrug off.
+- Added a real version-pin enforcement: `check_rosenpass_version` (verified
+  against the actual installed 0.2.3 binary) now refuses to spawn `rosenpass`
+  if it's older than 0.2.1, closing the gap where an operator's old binary
+  would otherwise be used silently despite CVE-2023-53157 being documented
+  everywhere else.
+- Re-ran `cargo clippy --workspace --locked --all-targets -- -D warnings`
+  (clean) and the full `cargo test --workspace --locked` suite (all passing)
+  after every change in this milestone.
+- **Not done — subprocess privilege dropping**: investigated running the
+  `rosenpass` child as an unprivileged user, but the child needs read access
+  to the `0o600` secret key and write access to `key_out`/log/pid files in
+  the same directory the parent (often root) owns; doing this safely needs
+  a shared-ownership design for `rosenpass_dir` first, and couldn't be
+  validated here anyway (no root/CAP_NET_ADMIN in this environment).
+  Recorded as open in design.md §6 rather than shipped half-validated.
+- **Not done — `docker-tests/` suite**: same real-interface gap noted
+  throughout M4-M6; no docker-tests scenario has been written or run for
+  this feature yet.
 
-**Acceptance**: security review findings triaged (fixed or explicitly
-accepted with rationale recorded); no outstanding high-severity findings on
-the new endpoint, subprocess boundary, or key storage.
+**Acceptance**: partially met — security review complete with no open
+findings, fuzzing found and fixed a real bug, version pinning is now
+enforced in code (not just documented). Subprocess privilege-dropping and
+the `docker-tests/` scenarios remain open, tracked above rather than
+silently dropped.
 
 ## M8 — Docs & release
 

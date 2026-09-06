@@ -205,12 +205,17 @@ pub const ROSENPASS_PUBLIC_KEY_BASE64_LEN: usize = 698_880;
 /// Validates that a submitted string has the exact shape of a genuine Rosenpass static public
 /// key: the exact expected length for a Classic McEliece 460896 key, and valid base64. Unlike a
 /// generic "cap the size" check, an exact-length check also rejects undersized garbage.
+///
+/// Checks the *decoded* byte length, not just the base64 string length: a base64 string can
+/// carry 0, 1, or 2 trailing `=` padding characters while keeping the same text length, each
+/// decoding to a different byte count (a 1- or 2-byte-short key still round-trips through base64
+/// successfully). A text-length-only check would silently accept an off-by-one-or-two-byte key.
 pub fn is_valid_rosenpass_public_key(key: &str) -> bool {
     use base64::Engine;
     key.len() == ROSENPASS_PUBLIC_KEY_BASE64_LEN
         && base64::engine::general_purpose::STANDARD
             .decode(key)
-            .is_ok()
+            .is_ok_and(|bytes| bytes.len() == crate::rosenpass::ROSENPASS_PUBLIC_KEY_LEN)
 }
 
 /// Payload for registering (or clearing) a peer's own Rosenpass public key/address.
@@ -1052,6 +1057,59 @@ mod tests {
     use super::*;
     use std::net::IpAddr;
     use wireguard_control::{Key, PeerConfigBuilder, PeerStats};
+
+    #[test]
+    fn test_is_valid_rosenpass_public_key_edge_cases() {
+        // The one genuinely valid shape: exact length, valid base64.
+        assert!(is_valid_rosenpass_public_key(
+            &"A".repeat(ROSENPASS_PUBLIC_KEY_BASE64_LEN)
+        ));
+
+        // Empty and obviously-too-short inputs.
+        assert!(!is_valid_rosenpass_public_key(""));
+        assert!(!is_valid_rosenpass_public_key("A"));
+        assert!(!is_valid_rosenpass_public_key(&"A".repeat(44))); // a WireGuard-key-shaped input
+
+        // Off-by-one on both sides of the exact required length.
+        assert!(!is_valid_rosenpass_public_key(
+            &"A".repeat(ROSENPASS_PUBLIC_KEY_BASE64_LEN - 1)
+        ));
+        assert!(!is_valid_rosenpass_public_key(
+            &"A".repeat(ROSENPASS_PUBLIC_KEY_BASE64_LEN + 1)
+        ));
+
+        // Wildly too long input (a naive length-only check without an upper bound would still
+        // reject this, but confirms there's no early-return path that skips the length check).
+        assert!(!is_valid_rosenpass_public_key(
+            &"A".repeat(ROSENPASS_PUBLIC_KEY_BASE64_LEN * 10)
+        ));
+
+        // Right length, but every character is outside the base64 alphabet.
+        assert!(!is_valid_rosenpass_public_key(
+            &"!".repeat(ROSENPASS_PUBLIC_KEY_BASE64_LEN)
+        ));
+
+        // Right length, mostly valid, but with control characters / non-ASCII / null bytes
+        // mixed in - the kind of input a naive length check alone wouldn't catch.
+        let mut with_null = "A".repeat(ROSENPASS_PUBLIC_KEY_BASE64_LEN - 1);
+        with_null.push('\0');
+        assert!(!is_valid_rosenpass_public_key(&with_null));
+
+        let mut with_newline = "A".repeat(ROSENPASS_PUBLIC_KEY_BASE64_LEN - 1);
+        with_newline.push('\n');
+        assert!(!is_valid_rosenpass_public_key(&with_newline));
+
+        let mut with_unicode = "A".repeat(ROSENPASS_PUBLIC_KEY_BASE64_LEN - 1);
+        with_unicode.push('€'); // multi-byte UTF-8, also throws off any byte-vs-char confusion
+        assert!(!is_valid_rosenpass_public_key(&with_unicode));
+
+        // Padding ('=') is only valid at the very end, and only when needed - Classic McEliece
+        // 460896's length is an exact multiple of 3 raw bytes, so no padding should ever be
+        // valid at all for a real key; confirm a padded string of the right length is rejected.
+        let mut with_padding = "A".repeat(ROSENPASS_PUBLIC_KEY_BASE64_LEN - 1);
+        with_padding.push('=');
+        assert!(!is_valid_rosenpass_public_key(&with_padding));
+    }
 
     #[test]
     fn test_peer_no_diff() {

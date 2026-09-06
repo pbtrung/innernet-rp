@@ -524,12 +524,23 @@ client-side feature, not gated on any other milestone:
   `Endpoint`/`candidates` already work) — the server never itself connects to
   a peer-supplied address, so this doesn't expand the existing candidate
   system's trust boundary.
-- **Subprocess hardening**: the managed Rosenpass child process is a new
-  attack surface parsing untrusted network input; scope its permissions as
-  tightly as possible (drop capabilities beyond what setting a WireGuard PSK
-  requires, run as an unprivileged user if the PSK-application step can be
-  isolated per §5.6 option 1, restrict its filesystem view to its own key/PSK
-  files).
+- **Subprocess hardening — pinned version check implemented, privilege
+  dropping NOT done, genuinely open.** `shared::rosenpass::check_rosenpass_version`
+  now refuses to spawn a `rosenpass` binary older than 0.2.1 (verified
+  against the real installed 0.2.3 binary), closing the "operator has an old
+  binary" gap in CVE-2023-53157's mitigation. Running the child as an
+  unprivileged user was investigated and deliberately **not** implemented:
+  the child needs to read the secret key file (`0o600`, owned by whatever
+  user runs `innernet`/`innernet-server`, frequently root) and write
+  `key_out`/log/pid files back into the same directory, so naively dropping
+  its privileges would either break those reads/writes or require first
+  designing a shared-ownership model for the whole `rosenpass_dir` (e.g. a
+  dedicated system group) — a real design task, not a one-line fix, and one
+  that couldn't be validated in the environment this was implemented in (no
+  root/CAP_NET_ADMIN available to test a live privilege-dropped process).
+  Shipping an unvalidated privilege-drop risked silently breaking the
+  feature rather than hardening it, so this remains explicitly open rather
+  than half-implemented.
 - **Fail-open, not fail-secure, by design** in permissive mode — document this
   tradeoff explicitly for operators (mirrors NetBird's own documented
   limitation) so it's a conscious choice per network, not a silent gap.
