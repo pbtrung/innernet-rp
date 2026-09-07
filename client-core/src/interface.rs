@@ -494,6 +494,7 @@ mod tests {
         let opts = RosenpassOpts {
             enable_rosenpass: true,
             rosenpass_permissive: false,
+            rosenpass_group: None,
         };
 
         apply_rosenpass_visibility_policy(&mut peers, &opts, "self");
@@ -508,6 +509,7 @@ mod tests {
         let opts = RosenpassOpts {
             enable_rosenpass: true,
             rosenpass_permissive: true,
+            rosenpass_group: None,
         };
 
         apply_rosenpass_visibility_policy(&mut peers, &opts, "self");
@@ -521,6 +523,7 @@ mod tests {
         let opts = RosenpassOpts {
             enable_rosenpass: false,
             rosenpass_permissive: false,
+            rosenpass_group: None,
         };
 
         apply_rosenpass_visibility_policy(&mut peers, &opts, "self");
@@ -534,6 +537,7 @@ mod tests {
         let opts = RosenpassOpts {
             enable_rosenpass: true,
             rosenpass_permissive: false,
+            rosenpass_group: None,
         };
 
         apply_rosenpass_visibility_policy(&mut peers, &opts, "self");

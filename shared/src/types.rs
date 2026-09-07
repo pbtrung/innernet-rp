@@ -581,6 +581,17 @@ pub struct RosenpassOpts {
     /// always a client-side, per-operator choice; the server cannot enforce either mode.
     #[clap(long = "rosenpass-permissive", requires = "enable_rosenpass")]
     pub rosenpass_permissive: bool,
+
+    /// Run the Rosenpass exchange daemon (not the one-shot `gen-keys` step) as an unprivileged
+    /// user instead of whatever user started `innernet`/`innernet-server` (typically root) -
+    /// hardening against the daemon's exposure to untrusted network input (it's the process a
+    /// bug like CVE-2023-53157 would actually be reachable through). Requires this group to
+    /// already exist on the system (e.g. `groupadd --system rosenpass`); the shared Rosenpass
+    /// state directory is chgrp'd to it with just enough permissions for a group member to read
+    /// the secret key/config/cached peer keys and create/rewrite key-handoff files, while the
+    /// daemon itself runs as `nobody` with this group as its only group. See doc/design.md 6.
+    #[clap(long = "rosenpass-group", requires = "enable_rosenpass")]
+    pub rosenpass_group: Option<String>,
 }
 
 impl NatOpts {

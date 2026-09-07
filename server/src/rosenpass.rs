@@ -46,6 +46,7 @@ pub fn spawn(
                 &data_dir,
                 &our_wg_public_key,
                 wg_listen_port,
+                rosenpass_opts.rosenpass_group.as_deref(),
             ) {
                 log::error!("failed to sync server-side rosenpass state: {e}");
             }
@@ -53,6 +54,7 @@ pub fn spawn(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync(
     db: &Db,
     interface: &InterfaceName,
@@ -60,6 +62,7 @@ fn sync(
     data_dir: &std::path::Path,
     our_wg_public_key: &str,
     wg_listen_port: u16,
+    drop_privileges_group: Option<&str>,
 ) -> anyhow::Result<()> {
     let rosenpass_dir = rosenpass::interface_rosenpass_dir(data_dir, interface);
     let key_paths = RosenpassKeyPaths::new(&rosenpass_dir);
@@ -131,7 +134,13 @@ fn sync(
         })
         .collect();
 
-    rosenpass::ensure_daemon_running(&rosenpass_dir, &key_paths, rosenpass_port, &peer_configs)?;
+    rosenpass::ensure_daemon_running(
+        &rosenpass_dir,
+        &key_paths,
+        rosenpass_port,
+        &peer_configs,
+        drop_privileges_group,
+    )?;
 
     rosenpass::apply_psks(
         interface,

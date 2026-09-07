@@ -3,13 +3,15 @@
 //! rather than reimplementing or embedding its post-quantum crypto.
 
 use crate::{chmod, ensure_dirs_exist, Peer};
-use anyhow::{bail, Context as _, Error};
+use anyhow::{anyhow, bail, Context as _, Error};
 use base64::Engine;
+use nix::unistd::{Gid, Group, Uid, User};
 use serde::Serialize;
 use std::{
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    os::unix::{fs::PermissionsExt, process::CommandExt as _},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -274,11 +276,16 @@ fn render_config(
 /// stopping and restarting the whole exchange, which briefly drops PQ protection for every peer
 /// on that interface, not just the one that changed. Document this as a known limitation rather
 /// than something silently absorbed.
+///
+/// `drop_privileges_group`, if given, runs the daemon itself (not the one-shot `gen-keys` step)
+/// as an unprivileged user instead of whichever user called this (typically root) - see
+/// [`spawn_daemon`] for the mechanics and doc/design.md 6 for the rationale.
 pub fn ensure_daemon_running(
     rosenpass_dir: &Path,
     key_paths: &RosenpassKeyPaths,
     listen_port: u16,
     peers: &[RosenpassPeerConfig],
+    drop_privileges_group: Option<&str>,
 ) -> Result<(), Error> {
     ensure_dirs_exist(&[rosenpass_dir, &rosenpass_dir.join("peers")])?;
     let paths = DaemonPaths::new(rosenpass_dir);
@@ -302,7 +309,7 @@ pub fn ensure_daemon_running(
     std::fs::write(&paths.config, &new_config)
         .with_context(|| format!("failed to write rosenpass config to {:?}", paths.config))?;
 
-    spawn_daemon(&paths)
+    spawn_daemon(&paths, rosenpass_dir, drop_privileges_group)
 }
 
 /// The minimum acceptable `rosenpass` version. Versions before this did not validate buffer size
@@ -362,7 +369,140 @@ fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-fn spawn_daemon(paths: &DaemonPaths) -> Result<(), Error> {
+/// The fixed unprivileged user the exchange daemon runs as when privilege-dropping is enabled
+/// (see [`spawn_daemon`]) — `nobody` exists on essentially every Unix and has no privileges of
+/// its own beyond whatever the configured group grants, which is exactly the point: only the
+/// *group* is meant to vary by deployment, not the user.
+const UNPRIVILEGED_USER: &str = "nobody";
+
+/// Looks up the uid for [`UNPRIVILEGED_USER`] and the gid for `group_name`, failing loudly
+/// (rather than silently running as root) if either doesn't exist — `group_name` in particular
+/// must be created ahead of time by whoever deploys this (e.g. `groupadd --system rosenpass`),
+/// since this codebase has no install-time hook to create it automatically.
+fn resolve_privilege_drop_target(group_name: &str) -> Result<(Uid, Gid), Error> {
+    let user = User::from_name(UNPRIVILEGED_USER)
+        .with_context(|| format!("failed to look up user {UNPRIVILEGED_USER:?}"))?
+        .ok_or_else(|| anyhow!("user {UNPRIVILEGED_USER:?} does not exist on this system"))?;
+    let group = Group::from_name(group_name)
+        .with_context(|| format!("failed to look up group {group_name:?}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "group {group_name:?} does not exist - create it first (e.g. `groupadd --system \
+                 {group_name}`) before passing --rosenpass-group {group_name}"
+            )
+        })?;
+    Ok((user.uid, group.gid))
+}
+
+fn chown_group_and_chmod(path: &Path, gid: Gid, mode: u32) -> Result<(), Error> {
+    nix::unistd::chown(path, None, Some(gid))
+        .with_context(|| format!("failed to chgrp {path:?} to gid {gid}"))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("failed to chmod {path:?}"))?;
+    Ok(())
+}
+
+/// Chgrp's `rosenpass_dir` (and everything currently in it) to `gid`, and loosens permissions
+/// just enough for a member of that group to do what a privilege-dropped exchange daemon needs:
+/// traverse the directory, read the secret key/config/cached peer public keys, and
+/// create/rewrite key-handoff files under `peers/`. Ownership (uid) is left untouched — the
+/// directory and most files stay root-owned exactly as before; the group is the *only* thing
+/// granting the daemon access, which is the whole point of "shared ownership" here (design.md 6)
+/// rather than just chowning everything to the unprivileged user directly.
+///
+/// Run every time before spawning (not just on first use), so enabling this on an
+/// already-existing interface — with files that predate this feature, or a changed
+/// `--rosenpass-group` — still gets fixed up rather than silently failing partway through.
+fn prepare_shared_ownership(rosenpass_dir: &Path, gid: Gid) -> Result<(), Error> {
+    chown_group_and_chmod(rosenpass_dir, gid, 0o750)
+        .with_context(|| format!("failed to prepare {rosenpass_dir:?} for shared ownership"))?;
+
+    for entry in std::fs::read_dir(rosenpass_dir)
+        .with_context(|| format!("failed to list {rosenpass_dir:?}"))?
+    {
+        let path = entry
+            .with_context(|| format!("failed to read an entry in {rosenpass_dir:?}"))?
+            .path();
+        if path.is_dir() {
+            continue; // only `peers/` is a directory here, handled specially below.
+        }
+        // secret-key/public-key/rosenpass.toml/rosenpass.log/rosenpass.log.offset/rosenpass.pid:
+        // all need at least group-read for the daemon to do its job; none of the latter four are
+        // sensitive, so there's no reason to be stingier with them specifically.
+        chown_group_and_chmod(&path, gid, 0o640)?;
+    }
+
+    let peers_dir = rosenpass_dir.join("peers");
+    if peers_dir.is_dir() {
+        // Needs group *write*, unlike the directory above: the daemon creates new key-handoff
+        // files here itself.
+        chown_group_and_chmod(&peers_dir, gid, 0o770)
+            .with_context(|| format!("failed to prepare {peers_dir:?} for shared ownership"))?;
+
+        for entry in std::fs::read_dir(&peers_dir)
+            .with_context(|| format!("failed to list {peers_dir:?}"))?
+        {
+            let path = entry
+                .with_context(|| format!("failed to read an entry in {peers_dir:?}"))?
+                .path();
+            // peers/*.pub (cached public keys) are read-only for the daemon; peers/*.psk
+            // (key-handoff files) are ones it creates/rewrites itself, so need group-write too.
+            // A `.psk` file may already exist owned by root from before this feature was
+            // enabled on this interface, hence fixing it up here rather than assuming the
+            // daemon always created whatever's already there.
+            let mode = if path.extension().and_then(|e| e.to_str()) == Some("psk") {
+                0o660
+            } else {
+                0o640
+            };
+            chown_group_and_chmod(&path, gid, mode)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Ensures every *ancestor* directory of `path` (not `path` itself) grants at least execute
+/// ("traverse") permission to everyone, so an unprivileged process can still reach a file deep
+/// inside `data_dir` even though `data_dir` itself is deliberately locked to `0o700`
+/// (owner/root-only) by `ensure_dirs_exist` elsewhere in this codebase
+/// (`client_core::data_store::DataStore::open_or_create`) — `prepare_shared_ownership` above
+/// only fixes up `rosenpass_dir` and its own contents, not the directories above it. Found via a
+/// real docker-tests run: the daemon's own stderr said its config file "does not exist" even
+/// though the parent had just written it moments earlier as root — `stat` on the real container
+/// confirmed `data_dir` itself was `0700 root:root`, blocking traversal entirely regardless of
+/// how permissive `rosenpass_dir` was.
+///
+/// Deliberately grants only *traversal*, not read/write, and to `other` rather than chgrp'ing
+/// these directories to the Rosenpass group: `data_dir` also holds unrelated files (the
+/// `DataStore` cache, `InterfaceConfig`, etc.) that have nothing to do with Rosenpass, so
+/// widening its *group* would be a much bigger, less targeted change than this. Traverse-only
+/// for `other` doesn't let anyone list or read what's inside these directories, only pass
+/// through to a path they already know — the same tradeoff most systems already make for e.g.
+/// `/home` (`0o711`).
+fn ensure_ancestors_traversable(path: &Path) -> Result<(), Error> {
+    for dir in path.ancestors().skip(1) {
+        if !dir.is_dir() {
+            continue; // above the filesystem root, or some ancestor unexpectedly missing.
+        }
+        let mode = std::fs::metadata(dir)
+            .with_context(|| format!("failed to stat {dir:?}"))?
+            .permissions()
+            .mode();
+        if mode & 0o001 != 0 {
+            continue; // already traversable by everyone.
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o001))
+            .with_context(|| format!("failed to add traverse permission to {dir:?}"))?;
+    }
+    Ok(())
+}
+
+fn spawn_daemon(
+    paths: &DaemonPaths,
+    rosenpass_dir: &Path,
+    drop_privileges_group: Option<&str>,
+) -> Result<(), Error> {
     check_rosenpass_version()?;
 
     let log_file = File::create(&paths.log)
@@ -374,19 +514,45 @@ fn spawn_daemon(paths: &DaemonPaths) -> Result<(), Error> {
     std::fs::write(&paths.log_offset, b"0")
         .with_context(|| format!("failed to reset {:?}", paths.log_offset))?;
 
-    let child = Command::new(ROSENPASS_BIN)
+    let mut command = Command::new(ROSENPASS_BIN);
+    command
         .arg("exchange-config")
         .arg(&paths.config)
         .stdin(Stdio::null())
         .stdout(log_file)
-        .stderr(log_file_err)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to run `{ROSENPASS_BIN} exchange-config` - is rosenpass (>= 0.2.1) \
-                 installed and on PATH?"
-            )
-        })?;
+        .stderr(log_file_err);
+
+    if let Some(group_name) = drop_privileges_group {
+        let (uid, gid) = resolve_privilege_drop_target(group_name)?;
+        prepare_shared_ownership(rosenpass_dir, gid)?;
+        ensure_ancestors_traversable(rosenpass_dir)?;
+        log::info!(
+            "dropping privileges for the rosenpass exchange daemon to user {UNPRIVILEGED_USER} \
+             (uid {uid}), group {group_name} (gid {gid})"
+        );
+        // Safety: this closure runs in the forked child, before exec, and only makes the three
+        // syscalls below plus constructing an `io::Error` on failure - the same shape as the
+        // documented example in `CommandExt::pre_exec`'s own docs. Order matters and must not be
+        // reordered: supplementary groups first (dropping any inherited from the parent, e.g.
+        // root's own group memberships - CVE-class privilege leak if left in place), then gid,
+        // then uid last, since dropping uid away from root forfeits the capabilities
+        // (CAP_SETGID/CAP_SETUID) needed to still change the other two afterwards.
+        unsafe {
+            command.pre_exec(move || {
+                nix::unistd::setgroups(&[gid]).map_err(std::io::Error::from)?;
+                nix::unistd::setgid(gid).map_err(std::io::Error::from)?;
+                nix::unistd::setuid(uid).map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        }
+    }
+
+    let child = command.spawn().with_context(|| {
+        format!(
+            "failed to run `{ROSENPASS_BIN} exchange-config` - is rosenpass (>= 0.2.1) \
+             installed and on PATH?"
+        )
+    })?;
 
     // Deliberately not calling `.wait()`: dropping this `Child` handle does not terminate the
     // process (Rust's `Child` has no "kill on drop" behavior), which is exactly what we need —
@@ -676,6 +842,129 @@ mod tests {
         assert!((1, 0, 0) >= MIN_ROSENPASS_VERSION);
     }
 
+    #[test]
+    fn test_resolve_privilege_drop_target_rejects_nonexistent_group() {
+        let err = resolve_privilege_drop_target("definitely-not-a-real-group-xyz123")
+            .expect_err("a nonexistent group must be rejected, not silently ignored");
+        let message = format!("{err}");
+        assert!(
+            message.contains("does not exist"),
+            "expected a clear \"group doesn't exist\" error, got: {message}"
+        );
+    }
+
+    /// `root` (gid 0) and `nobody` exist on essentially every Unix, including CI runners - this
+    /// isn't `#[ignore]`d, unlike the real-rosenpass-binary tests elsewhere in this file, since
+    /// it only depends on the base OS, not on rosenpass being installed.
+    #[test]
+    fn test_resolve_privilege_drop_target_finds_real_accounts() {
+        let (_uid, gid) =
+            resolve_privilege_drop_target("root").expect("the `root` group must exist");
+        assert_eq!(gid.as_raw(), 0);
+    }
+
+    /// An unprivileged process can only `chown` a file's *group* to a group it's already a
+    /// member of (POSIX) - so this test chgrps to the test process's own current gid rather than
+    /// a dedicated one, which is all that's needed to exercise the traversal/mode-setting logic
+    /// itself without requiring root (unlike the actual privilege *drop*, which does - see the
+    /// docker-tests scenario for that).
+    #[test]
+    fn test_prepare_shared_ownership_sets_expected_modes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let rosenpass_dir = dir.path();
+        let our_gid = nix::unistd::getgid();
+
+        std::fs::write(rosenpass_dir.join("secret-key"), b"secret").unwrap();
+        std::fs::write(rosenpass_dir.join("public-key"), b"public").unwrap();
+        std::fs::write(rosenpass_dir.join("rosenpass.toml"), b"config").unwrap();
+        let peers_dir = rosenpass_dir.join("peers");
+        std::fs::create_dir(&peers_dir).unwrap();
+        std::fs::write(peers_dir.join("1.pub"), b"peer public key").unwrap();
+        // A pre-existing key_out file, as if left over from before this feature was enabled.
+        std::fs::write(peers_dir.join("1.psk"), b"stale psk").unwrap();
+
+        prepare_shared_ownership(rosenpass_dir, our_gid).unwrap();
+
+        let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(rosenpass_dir), 0o750, "rosenpass_dir itself");
+        assert_eq!(mode_of(&peers_dir), 0o770, "peers/ needs group-write");
+        assert_eq!(mode_of(&rosenpass_dir.join("secret-key")), 0o640);
+        assert_eq!(mode_of(&rosenpass_dir.join("public-key")), 0o640);
+        assert_eq!(mode_of(&rosenpass_dir.join("rosenpass.toml")), 0o640);
+        assert_eq!(
+            mode_of(&peers_dir.join("1.pub")),
+            0o640,
+            "cached peer public keys are read-only for the daemon"
+        );
+        assert_eq!(
+            mode_of(&peers_dir.join("1.psk")),
+            0o660,
+            "key_out files need group-write - the daemon rewrites them itself"
+        );
+
+        for path in [
+            rosenpass_dir.to_path_buf(),
+            peers_dir.clone(),
+            rosenpass_dir.join("secret-key"),
+            peers_dir.join("1.pub"),
+            peers_dir.join("1.psk"),
+        ] {
+            let gid = std::fs::metadata(&path).unwrap().gid();
+            assert_eq!(gid, our_gid.as_raw(), "{path:?} should be chgrp'd");
+        }
+    }
+
+    #[test]
+    fn test_prepare_shared_ownership_tolerates_missing_peers_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `peers/` subdirectory created at all - e.g. before the daemon has ever run.
+        prepare_shared_ownership(dir.path(), nix::unistd::getgid()).unwrap();
+    }
+
+    #[test]
+    fn test_ensure_ancestors_traversable_adds_missing_execute_bit() {
+        let root = tempfile::tempdir().unwrap();
+        // Mimics the real bug: a `data_dir`-like ancestor locked to owner-only (no `other`
+        // execute bit at all), with a rosenpass_dir-like leaf several levels below it.
+        let data_dir = root.path().join("data_dir");
+        let rosenpass_dir = data_dir.join("rosenpass").join("evilcorp");
+        std::fs::create_dir_all(&rosenpass_dir).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode_of(&data_dir),
+            0o700,
+            "sanity check: not yet traversable"
+        );
+
+        ensure_ancestors_traversable(&rosenpass_dir).unwrap();
+
+        assert_eq!(
+            mode_of(&data_dir) & 0o001,
+            0o001,
+            "data_dir must gain traverse permission"
+        );
+        // The rest of data_dir's permission bits must be untouched - only the execute bit for
+        // `other` was added, nothing loosened for read/write or for owner/group.
+        assert_eq!(mode_of(&data_dir), 0o701);
+    }
+
+    #[test]
+    fn test_ensure_ancestors_traversable_is_idempotent_and_handles_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&leaf).unwrap();
+
+        // Calling this twice (e.g. two consecutive daemon restarts) must not error, and must
+        // not keep changing an already-correct mode - also exercises walking all the way up to
+        // the real filesystem root without erroring.
+        ensure_ancestors_traversable(&leaf).unwrap();
+        ensure_ancestors_traversable(&leaf).unwrap();
+    }
+
     /// Confirms the version check accepts the real installed binary. Ignored by default
     /// (requires `rosenpass` on PATH); run with `cargo test -- --ignored`.
     #[test]
@@ -926,6 +1215,7 @@ mod tests {
             &listener_keys,
             listener_port,
             &listener_peers,
+            None,
         )
         .unwrap();
 
@@ -935,7 +1225,8 @@ mod tests {
             public_key_path: listener_keys.public_key.clone(),
             endpoint: Some(format!("127.0.0.1:{listener_port}").parse().unwrap()),
         }];
-        ensure_daemon_running(dialer_dir.path(), &dialer_keys, 31_302, &dialer_peers).unwrap();
+        ensure_daemon_running(dialer_dir.path(), &dialer_keys, 31_302, &dialer_peers, None)
+            .unwrap();
 
         let listener_psk_path = DaemonPaths::peer_key_out_path(listener_dir.path(), 1);
         let dialer_psk_path = DaemonPaths::peer_key_out_path(dialer_dir.path(), 2);

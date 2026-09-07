@@ -450,6 +450,80 @@ test_rosenpass_permissive_fallback() {
     fi
 }
 
+test_rosenpass_privilege_drop() {
+    info "Creating invitations for a privilege-dropped Rosenpass pair."
+    cmd docker exec "$PEER1_CONTAINER" innernet \
+        add-peer evilcorp \
+        --name "rosenpass-priv-a" \
+        --cidr "humans" \
+        --admin false \
+        --ip "10.66.1.210" \
+        --save-config "/app/rp_priv_a.toml" \
+        --invite-expires "30s" \
+        --yes
+    cmd docker cp "$PEER1_CONTAINER:/app/rp_priv_a.toml" "$tmp_dir"
+    cmd docker exec "$PEER1_CONTAINER" innernet \
+        add-peer evilcorp \
+        --name "rosenpass-priv-b" \
+        --cidr "humans" \
+        --admin false \
+        --ip "10.66.1.211" \
+        --save-config "/app/rp_priv_b.toml" \
+        --invite-expires "30s" \
+        --yes
+    cmd docker cp "$PEER1_CONTAINER:/app/rp_priv_b.toml" "$tmp_dir"
+
+    info "Starting both peers with --rosenpass-group rosenpass."
+    RP_PRIV_A_CONTAINER=$(create_peer_docker 172.18.1.11 "" "--enable-rosenpass --rosenpass-group rosenpass")
+    info "privilege-dropped peer A started as $RP_PRIV_A_CONTAINER"
+    cmd docker cp "$tmp_dir/rp_priv_a.toml" "$RP_PRIV_A_CONTAINER:/app/invite.toml"
+    cmd docker start -a "$RP_PRIV_A_CONTAINER" | sed -e 's/^/\x1B[0;35mrp-priv-a\x1B[0m: /' &
+
+    RP_PRIV_B_CONTAINER=$(create_peer_docker 172.18.1.12 "" "--enable-rosenpass --rosenpass-group rosenpass")
+    info "privilege-dropped peer B started as $RP_PRIV_B_CONTAINER"
+    cmd docker cp "$tmp_dir/rp_priv_b.toml" "$RP_PRIV_B_CONTAINER:/app/invite.toml"
+    cmd docker start -a "$RP_PRIV_B_CONTAINER" | sed -e 's/^/\x1B[0;36mrp-priv-b\x1B[0m: /' &
+
+    info "Waiting for plain WireGuard connectivity."
+    wait_until 60 docker exec "$RP_PRIV_A_CONTAINER" ping -c1 10.66.1.211 \
+        || { info "peer A never reached its privilege-dropped counterpart."; exit 1; }
+
+    info "Waiting for the rosenpass exchange daemon to start."
+    wait_until 30 docker exec "$RP_PRIV_A_CONTAINER" test -f /var/lib/innernet/rosenpass/evilcorp/rosenpass.pid \
+        || { info "rosenpass daemon never started on peer A."; exit 1; }
+
+    info "Confirming the daemon is actually running unprivileged, not as root."
+    local rp_pid rp_uid rp_gid
+    rp_pid=$(docker exec "$RP_PRIV_A_CONTAINER" cat /var/lib/innernet/rosenpass/evilcorp/rosenpass.pid)
+    # A freshly-started daemon can take a beat to actually be visible/still alive under its new
+    # uid, so retry a few times before concluding it crashed, dumping diagnostics if it really did.
+    if ! wait_until 10 docker exec "$RP_PRIV_A_CONTAINER" test -d "/proc/$rp_pid"; then
+        info "rosenpass daemon (pid $rp_pid) is gone shortly after starting - it likely crashed \
+right after the privilege drop. Dumping diagnostics:"
+        docker exec "$RP_PRIV_A_CONTAINER" ls -laR /var/lib/innernet/rosenpass/evilcorp/ 1>&2 || true
+        docker exec "$RP_PRIV_A_CONTAINER" cat /var/lib/innernet/rosenpass/evilcorp/rosenpass.log 1>&2 || true
+        exit 1
+    fi
+    rp_uid=$(docker exec "$RP_PRIV_A_CONTAINER" awk '/^Uid:/ {print $2}' "/proc/$rp_pid/status")
+    rp_gid=$(docker exec "$RP_PRIV_A_CONTAINER" awk '/^Gid:/ {print $2}' "/proc/$rp_pid/status")
+    if [[ "$rp_uid" == "0" ]]; then
+        info "expected the rosenpass daemon to run as an unprivileged uid, but it's still root (uid 0)"
+        exit 1
+    fi
+    info "rosenpass daemon confirmed running as uid $rp_uid, gid $rp_gid (not root)."
+
+    info "Confirming a real Rosenpass exchange still completes despite running unprivileged."
+    wait_until 30 _psk_is_set "$RP_PRIV_A_CONTAINER" 172.18.1.12 \
+        || { info "no preshared key ever appeared - privilege drop likely broke the daemon."; exit 1; }
+    local psk_a
+    psk_a=$(peer_psk "$RP_PRIV_A_CONTAINER" 172.18.1.12)
+    wait_until 150 _psk_changed_from "$RP_PRIV_A_CONTAINER" 172.18.1.12 "$psk_a" \
+        || { info "preshared key never rotated - the privilege-dropped daemon may not be completing real exchanges."; exit 1; }
+    info "Real Rosenpass exchange completed successfully with the daemon running unprivileged."
+
+    cmd docker exec "$RP_PRIV_A_CONTAINER" ping -c3 10.66.1.211
+}
+
 # Run tests (functions prefixed with test_) in alphabetical order.
 # Optional filter provided by positional arguments is applied.
 for func in $(declare -F | awk '{print $3}'); do

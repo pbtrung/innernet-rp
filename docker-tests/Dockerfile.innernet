@@ -27,6 +27,13 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends libsqlite3-dev iproute2 iputils-ping build-essential clang libclang-dev libselinux1-dev cmake pkg-config libsodium-dev wireguard-tools && \
     rm -rf /var/lib/apt/lists/*
 
+# For run-docker-tests.sh's --rosenpass-group scenario (shared::rosenpass's privilege-drop
+# support, doc/design.md 6): the group must already exist for --rosenpass-group to work at all -
+# this project has no install-time hook to create it, by design (see shared/src/rosenpass.rs
+# `resolve_privilege_drop_target`), so it's the deploying image/package's job. `nobody` (the
+# fixed unprivileged user the daemon actually runs as) already exists in this base image.
+RUN groupadd --system rosenpass
+
 WORKDIR /app
 
 COPY . .

@@ -110,7 +110,13 @@ pub fn sync(
         })
         .collect();
 
-    rosenpass::ensure_daemon_running(&rosenpass_dir, &key_paths, rosenpass_port, &peer_configs)?;
+    rosenpass::ensure_daemon_running(
+        &rosenpass_dir,
+        &key_paths,
+        rosenpass_port,
+        &peer_configs,
+        rosenpass_opts.rosenpass_group.as_deref(),
+    )?;
 
     rosenpass::apply_psks(
         interface,
