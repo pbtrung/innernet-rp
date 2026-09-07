@@ -6,14 +6,20 @@ Wants=network-online.target nss-lookup.target
 [Service]
 Type=simple
 Environment="RUST_LOG=info"
-# Optional per-interface file setting ROSENPASS_ARGS (e.g.
-# ROSENPASS_ARGS="--enable-rosenpass --rosenpass-group rosenpass") - see README.md's Post-Quantum
-# Key Exchange section and client/innernet@.service's equivalent comment for why this is needed:
-# `serve`'s rosenpass flags aren't persisted anywhere, so this service silently runs with
-# rosenpass disabled unless they're passed here too. The leading `-` makes a missing file a no-op
-# rather than a startup failure; an unset ROSENPASS_ARGS expands to nothing.
+# Rosenpass is enabled by default here - see README.md's Post-Quantum Key Exchange section and
+# client/innernet@.service's equivalent comment for why this is needed: `serve`'s rosenpass flags
+# aren't persisted anywhere, so without this, this service would silently run with rosenpass
+# disabled.
+#
+# To add `--rosenpass-permissive` and/or `--rosenpass-group <name>` (see README.md) without
+# editing this unit, set ROSENPASS_EXTRA_ARGS in the optional per-interface file below, e.g.
+# ROSENPASS_EXTRA_ARGS="--rosenpass-permissive --rosenpass-group rosenpass". The leading `-`
+# makes a missing file a no-op; an unset ROSENPASS_EXTRA_ARGS expands to nothing. To disable
+# rosenpass entirely for one interface instead, set ROSENPASS_ARGS="" there (it fully replaces
+# the default below, rather than appending).
+Environment="ROSENPASS_ARGS=--enable-rosenpass"
 EnvironmentFile=-/etc/innernet-server/%i-rosenpass.env
-ExecStart=/usr/bin/innernet-server serve %i $ROSENPASS_ARGS
+ExecStart=/usr/bin/innernet-server serve %i $ROSENPASS_ARGS $ROSENPASS_EXTRA_ARGS
 Restart=always
 # When the daemon exits, wait this amount of secs before restarting instead of default 100ms.
 RestartSec=1

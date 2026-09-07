@@ -228,25 +228,32 @@ sudo groupadd --system rosenpass
 sudo innernet up --enable-rosenpass --rosenpass-group rosenpass <interface>
 ```
 
-**Running under systemd:** these flags aren't persisted anywhere `up`/`serve`
-read back on their own, so the `systemctl enable --now innernet@<interface>` /
-`innernet-server@<interface>` services described above run with Rosenpass
-disabled unless told about it on every invocation, including the continuously
-running daemon loop — not just the one-off `install`/first `up`. Create the
-per-interface env file the unit already looks for (`EnvironmentFile=-`, so a
-missing file is a harmless no-op) instead of editing the unit itself:
+**Running under systemd:** `innernet@<interface>.service` and
+`innernet-server@<interface>.service` enable Rosenpass by default
+(`ROSENPASS_ARGS=--enable-rosenpass`, baked into the unit), since CLI flags
+otherwise aren't persisted anywhere `up`/`serve` read back on their own — the
+continuously running daemon loop needs them on every invocation, not just the
+one-off `install`/first `up`. To add `--rosenpass-permissive` and/or
+`--rosenpass-group <name>` on a given interface without editing either unit,
+set `ROSENPASS_EXTRA_ARGS` in the optional per-interface env file each unit
+already looks for (`EnvironmentFile=-`, so a missing file is a harmless
+no-op):
 
 ```sh
 # client, interface <interface>:
-echo 'ROSENPASS_ARGS="--enable-rosenpass --rosenpass-group rosenpass"' | \
+echo 'ROSENPASS_EXTRA_ARGS="--rosenpass-permissive --rosenpass-group rosenpass"' | \
   sudo tee /etc/innernet/<interface>-rosenpass.env
 sudo systemctl restart innernet@<interface>
 
 # server, interface <interface>:
-echo 'ROSENPASS_ARGS="--enable-rosenpass --rosenpass-group rosenpass"' | \
+echo 'ROSENPASS_EXTRA_ARGS="--rosenpass-permissive --rosenpass-group rosenpass"' | \
   sudo tee /etc/innernet-server/<interface>-rosenpass.env
 sudo systemctl restart innernet-server@<interface>
 ```
+
+To disable Rosenpass entirely for one interface instead, set
+`ROSENPASS_ARGS=""` in that same file — it fully replaces the unit's default
+rather than appending to it, unlike `ROSENPASS_EXTRA_ARGS`.
 
 ### Remove Network
 
