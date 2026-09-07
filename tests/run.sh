@@ -10,7 +10,10 @@ case "${1:-unit}" in
     cargo test -p innernet-pq --locked --test native_interop
     cargo test -p innernet-server --locked pq_
     ;;
-  docker-smoke|docker-faults|compatibility|load)
+  docker-smoke)
+    bash tests/docker/scenarios/m2_management.sh
+    ;;
+  docker-faults|compatibility|load)
     echo "Suite '$1' is not implemented yet; this is not a passing/skipped result." >&2
     exit 2
     ;;

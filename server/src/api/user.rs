@@ -127,7 +127,10 @@ mod handlers {
 
         if cfg!(not(test)) {
             let Context {
-                interface, backend, ..
+                interface,
+                backend,
+                management,
+                ..
             } = session.context;
 
             // If we were to modify the WireGuard interface immediately, the HTTP response wouldn't
@@ -149,9 +152,18 @@ mod handlers {
                     *selected_peer,
                     old_public_key.to_base64()
                 );
+                // A rebuilt peer entry must never silently drop its management
+                // PSK back to an unprotected link.
+                let mut peer_config = PeerConfigBuilder::from(&*selected_peer);
+                if let Some(psk) = management
+                    .as_ref()
+                    .and_then(|psks| psks.get(&selected_peer.id))
+                {
+                    peer_config = peer_config.set_preshared_key(wireguard_control::Key(*psk));
+                }
                 DeviceUpdate::new()
                     .remove_peer_by_key(&old_public_key)
-                    .add_peer(PeerConfigBuilder::from(&*selected_peer))
+                    .add_peer(peer_config)
                     .apply(&interface, backend)
                     .map_err(|e| log::error!("{:?}", e))
                     .ok();

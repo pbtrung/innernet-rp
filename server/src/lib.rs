@@ -60,6 +60,10 @@ pub struct Context {
     pub backend: Backend,
     pub public_key: Key,
     pub pq: Option<Arc<pq::Service>>,
+    /// Per-peer management PSKs, kept only for kernel-config rebuilds that
+    /// happen outside `serve()`'s own startup (e.g. redemption's delayed
+    /// key rotation). Never held alongside the private-state file lock.
+    pub management: Option<Arc<HashMap<i64, [u8; 32]>>>,
 }
 
 pub struct Session {
@@ -513,13 +517,31 @@ pub async fn serve(
 
     let mut peers = DatabasePeer::list(&conn)?;
     log::debug!("peers listed...");
+    // The server's own row (and, transiently, a disabled peer) never has a
+    // management link by construction; only apply one to actual link holders.
     let peer_configs = peers
         .iter()
         .map(|peer| match &manager {
-            Some(manager) => manager.peer_config(peer),
-            None => Ok(peer.deref().into()),
+            Some(manager)
+                if peer.id != manager.state.server_id.get() as i64 && !peer.is_disabled =>
+            {
+                manager.peer_config(peer)
+            },
+            _ => Ok(peer.deref().into()),
         })
         .collect::<Result<Vec<PeerConfigBuilder>, ServerError>>()?;
+    // Kept for later kernel-config rebuilds (e.g. redemption's key rotation);
+    // the exclusive private-state lock itself is released right after this.
+    let management_psks = manager.as_ref().map(|manager| {
+        Arc::new(
+            manager
+                .state
+                .links
+                .iter()
+                .map(|(id, link)| (id.get() as i64, *link.psk.0 .0))
+                .collect::<HashMap<i64, [u8; 32]>>(),
+        )
+    });
     drop(manager);
 
     log::info!("bringing up interface.");
@@ -581,6 +603,7 @@ pub async fn serve(
         public_key,
         backend: network.backend,
         pq: None,
+        management: management_psks,
     };
 
     spawn_pq_sweeper(&context);

@@ -1,0 +1,60 @@
+# M2 scenario: one server, two data peers. Scoped to what M2 claims (durable
+# identity/management-link provisioning); the full 5-peer/9-scenario fault
+# apparatus from docs/testing.md section 4 belongs to M4+.
+services:
+  server:
+    image: innernet-pq-runtime:m2
+    cap_add: [NET_ADMIN]
+    networks:
+      pq_m2:
+        ipv4_address: 10.88.0.2
+    volumes:
+      - server_config:/etc/innernet-server
+      - server_data:/var/lib/innernet-server
+      - invites:/invites
+      - ./scenarios/server-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  peer-a:
+    image: innernet-pq-runtime:m2
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m2:
+        ipv4_address: 10.88.0.3
+    volumes:
+      - peer_a_config:/etc/innernet
+      - peer_a_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-a"]
+
+  peer-b:
+    image: innernet-pq-runtime:m2
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m2:
+        ipv4_address: 10.88.0.4
+    volumes:
+      - peer_b_config:/etc/innernet
+      - peer_b_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-b"]
+
+networks:
+  pq_m2:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.88.0.0/24
+
+volumes:
+  server_config:
+  server_data:
+  peer_a_config:
+  peer_a_data:
+  peer_b_config:
+  peer_b_data:
+  invites:

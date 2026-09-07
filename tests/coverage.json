@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "stage": "M1",
+  "stage": "M2",
   "note": "Test IDs identify implemented checks, not completion of all design-case assertions. Kernel, process, load and architecture evidence are tracked separately.",
   "cases": [
     {
@@ -163,10 +163,24 @@
     },
     {
       "design_case": 16,
-      "unit": [],
-      "integration": [],
-      "docker": [],
-      "status": "planned"
+      "unit": [
+        "observe_remote_refreshes_cache_and_invalidates_pinned_pending_work",
+        "emergency_retirement_blocks_relationships_and_permits_a_fresh_identity",
+        "management_provisioning_is_per_peer_idempotent_and_preserves_adopted_keys",
+        "adopt_persists_and_load_restores_across_a_restart",
+        "adopt_rejects_an_invalid_enrollment_before_persisting_anything",
+        "load_refuses_a_tampered_private_file",
+        "ruleset_scopes_every_rule_to_the_named_interface_and_allows_only_the_api_port"
+      ],
+      "integration": [
+        "provisioning_every_enabled_peer_latches_readiness_and_yields_independent_psks",
+        "load_fails_closed_when_an_enabled_peer_has_no_provisioned_link",
+        "open_or_create_is_a_noop_when_management_was_never_required"
+      ],
+      "docker": [
+        "m2_management: fresh invitation-carried enrollment, ACL positive/negative reachability pair, server restart durability, lost-link fail-closed startup"
+      ],
+      "status": "m2-enrollment-and-server-link-acl-verified"
     },
     {
       "design_case": 17,

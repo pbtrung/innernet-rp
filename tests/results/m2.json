@@ -1,0 +1,37 @@
+{
+  "milestone": 2,
+  "revision": "the commit introducing this record",
+  "date": "2026-09-07",
+  "kernel": "Linux 7.2.2-1-cachyos x86_64",
+  "rust": "1.98.1",
+  "leancrypto": "1.8.0-1",
+  "openssl": "3.6.4-1",
+  "sqlite": "3.53.4-1",
+  "docker": "29.7.2",
+  "container_base": "archlinux@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a",
+  "package_snapshot": "2026/09/07",
+  "schema": 3,
+  "checks": [
+    {"command": "cargo fmt --all", "result": "passed; stable fallback because nightly is unavailable"},
+    {"command": "cargo clippy --workspace --locked --all-targets -- -D warnings", "result": "passed"},
+    {"command": "cargo test --workspace --locked", "result": "all suites passed (pq 4+7+1+12+2, server 53 passed/1 explicitly ignored, client-core 6, shared 5, wireguard-control 12 passed/1 explicitly ignored)"},
+    {"command": "bash tests/run.sh unit", "result": "passed"},
+    {"command": "bash tests/run.sh integration", "result": "passed"},
+    {"command": "bash tests/run.sh docker-smoke (tests/docker/scenarios/m2_management.sh)", "result": "passed: independent non-empty PSKs on both peers, ACL positive+negative reachability pair, server-restart durability, lost-link fail-closed startup"},
+    {"command": "server::gate::tests::apply_installs_a_real_ruleset_and_clear_removes_it (--ignored, run in a --cap-add NET_ADMIN container)", "result": "passed"}
+  ],
+  "docker_scenario": {
+    "topology": "1 server + peer-a + peer-b on an isolated internal bridge, static addresses, real kernel WireGuard interfaces",
+    "binaries": "real innernet-server/innernet, built from source in tests/docker/Dockerfile.runtime on the pinned M0 base image; no test-only entrypoint",
+    "bugs_found_and_fixed_by_this_scenario": [
+      "serve()'s startup peer-config loop called the per-link PSK lookup for the server's own database row, which by construction never has a link, turning ordinary startup into a hard failure",
+      "api::user::redeem's delayed post-redemption DeviceUpdate rebuilt the redeeming peer's kernel entry from a plain PSK-less builder, silently reverting a freshly protected link to a permanently mismatched one"
+    ]
+  },
+  "limitations": [
+    "Data-peer identity/bundle generation and the exchange/rotation loop remain gated behind --enable-pq-psk's existing production refusal, unchanged from M1",
+    "The admin HTTP peer-creation endpoint (api::admin::peer::handlers::create) does not provision a management link or preserve a PSK on its own kernel rebuild; only the CLI add-peer path does",
+    "The full 5-peer/9-scenario Docker fault apparatus from docs/testing.md section 4 (docker-faults) is M4+ work, not attempted here",
+    "No real-kernel data-traffic gate, data PSK installation, rotation/inactivity scheduling, mixed-fleet policy, old/new binary compatibility, aarch64 execution, or external audit claim"
+  ]
+}

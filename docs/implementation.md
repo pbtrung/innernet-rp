@@ -184,3 +184,93 @@ streamed body limits/deadlines, retirement, and recovery under exhausted
 record/worker budgets. The policy unit test separately checks inert defaults.
 The coverage manifest labels this API/storage evidence, not kernel protection,
 independent client-process convergence, or old/new binary compatibility.
+
+## M2 — Durable identity and management-link provisioning
+
+`pq/src/store.rs` implements owner-only private state: 0700 directories,
+0600 files, `O_NOFOLLOW`-traversed paths, an exclusive `flock` interface
+lock held only by the process actually using it, atomic `renameat` commits,
+and a generation/digest check that turns a concurrent writer into a durable
+`Conflict` rather than a silent overwrite. `pq/src/state.rs`'s `EndpointState`
+models identity generation, revision-CAS bundle replacement, management-link
+storage, and per-relationship exchange secrets on top of it; `observe_remote`
+refreshes a cached remote bundle on a strictly newer revision (invalidating
+any pending exchange pinned to the superseded bundle ID) and rejects a
+replayed/older one, and `emergency_retire` blocks every relationship and
+discards their secrets without rewinding sequence counters, for the lost-key/
+lost-replay-state recovery path.
+
+Management-link provisioning (design 5.10) now rides ordinary peer
+invitations instead of a separate enrollment step: `server::management::
+Manager::open_or_create` is the short-lived handle `add-peer`/`enable-peer`
+use to provision a new peer's link and durably latch `pq_network.
+management_ready` once every enabled peer has one; `Manager::load` is the
+strict handle `serve()` uses, failing closed if the persisted state doesn't
+match this network or any enabled peer's link is missing/corrupt. A separate
+`innernet-server require-management` command and `management::prepare` cover
+retrofitting an existing network (out-of-band `peer-N.management.json`
+artifacts for peers that redeemed before management was required).
+Client-side, `client-core::management` persists a redeemed enrollment before
+the interface ever comes up with its PSK, and restores it across a client
+restart before the interface is reconfigured.
+
+A new server-link traffic policy (`server/src/gate.rs`) is narrower than
+M4's future data-peer gate: once a network requires management, an
+idempotent nftables table scoped entirely to the server's own interface
+allows established/related traffic, PMTUD-relevant ICMP/ICMPv6, and the
+coordination API's TCP port, and drops everything else in/forwarded through
+that interface.
+
+Two real defects surfaced only once end-to-end Docker evidence existed,
+both silently dropping a peer's management PSK back to an unprotected
+link on a kernel peer-config rebuild that predates this feature:
+`serve()`'s startup peer-config loop called the per-link PSK lookup for
+every database peer, including the server's own row (which by construction
+never has a link), turning ordinary startup into a hard failure; and
+`api::user::redeem`'s delayed post-redemption `DeviceUpdate` (see the
+`REDEEM_TRANSITION_WAIT` comment there) rebuilt the redeeming peer's kernel
+entry from a plain, PSK-less builder, silently reverting a freshly
+protected link to a mismatched one that could never complete a handshake
+again. Both are fixed; `Context.management` now carries a lightweight
+`Arc<HashMap<peer_id, psk>>` snapshot, taken once at `serve()` startup
+after the private-state lock is released, specifically so handlers like
+`redeem` can preserve a PSK on a rebuild without holding that lock.
+
+`tests/docker/` gained a real scenario for this milestone: `Dockerfile.
+runtime` builds the actual workspace binaries on the pinned M0 base image;
+`docker-compose.m2.yml` runs one server and two data peers (`peer-a`,
+`peer-b`) on an isolated internal bridge with real kernel WireGuard
+interfaces (verified this host can create them under `--cap-add NET_ADMIN`)
+and static addresses (container-name DNS is not reliable on an `internal:
+true` network); `scenarios/m2_management.sh` drives it with the real
+`innernet-server`/`innernet` binaries exactly as an operator would — no
+test-only entrypoint exists, because management-link provisioning never
+depended on `--enable-pq-psk`, which stays gated. It asserts: fresh
+invitation-carried enrollment yields independent, non-empty PSKs on both
+peers; the coordination API stays reachable while an unrelated service
+bound on the server's overlay address is unreachable through the same link
+(a real positive/negative reachability pair, not a closed-port stand-in);
+a server restart preserves the durable link and API access; and deleting
+an enabled peer's link from the private store makes the next `serve()`
+refuse to start rather than silently reporting readiness. `bash tests/run.sh
+docker-smoke` now runs this scenario; `docker-faults`/`compatibility`/`load`
+remain unimplemented as before.
+
+Tested on Linux x86_64, Arch Linux, 2026-09-07, Docker 29.7.2, kernel
+WireGuard module 7.2.2-1-cachyos:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --workspace --locked` | all suites pass (pq: 4+7+1+12+2; server: 53 + 1 explicitly ignored; client-core: 6; shared: 5; wireguard-control: 12 + 1 explicitly ignored) |
+| `cargo clippy --workspace --locked --all-targets -- -D warnings` | passed |
+| `bash tests/run.sh unit` / `integration` | passed |
+| `bash tests/run.sh docker-smoke` (`scenarios/m2_management.sh`) | passed: enrollment/PSK independence, ACL positive+negative control, server-restart durability, lost-link fail-closed startup |
+| `server::gate::tests::apply_installs_a_real_ruleset_and_clear_removes_it` (`#[ignore]`, run in a `--cap-add NET_ADMIN` container; this sandbox has neither root nor that capability) | passed |
+
+Explicitly out of scope for M2: the admin HTTP peer-creation endpoint
+(`api::admin::peer::handlers::create`) does not yet provision a management
+link or preserve a PSK on its own kernel rebuild — only the CLI `add-peer`
+path does; data-peer identity/bundle generation and the exchange/rotation
+loop remain gated behind `--enable-pq-psk`'s existing production refusal,
+unchanged from M1; and the full 5-peer/9-scenario Docker fault apparatus
+from `docs/testing.md` section 4 is M4+ work, not attempted here.

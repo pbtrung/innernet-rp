@@ -1,0 +1,7 @@
+# Built once per Docker scenario run; not the release build/packaging
+# pipeline (that is M8's job). Reuses the pinned base/package snapshot from
+# Dockerfile.build so crypto/library versions match what M0 recorded.
+FROM innernet-pq-build:m0
+RUN pacman -Sy --noconfirm --needed curl
+COPY . /work
+RUN cargo build --workspace --locked
