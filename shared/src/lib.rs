@@ -37,17 +37,22 @@ pub fn ensure_dirs_exist(dirs: &[&Path]) -> Result<(), WrappedIoError> {
         // exist yet - only reproduces with a real, freshly-created data dir, not the tempdir
         // fixtures unit tests build directly on top of (verified via docker-tests: this failed a
         // real `innernet-server --enable-rosenpass` run before this fix).
-        match fs::create_dir_all(dir).with_path(dir) {
-            Ok(()) => {
-                log::debug!("created dir {}", dir.to_string_lossy());
-                std::fs::set_permissions(dir, Permissions::from_mode(0o700)).with_path(dir)?;
-            },
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                // Directory already exists, good.
-            },
-            Err(e) => {
-                return Err(e);
-            },
+        //
+        // Check existence *before* creating: unlike plain `create_dir`, `create_dir_all` returns
+        // `Ok(())` both when it creates the directory AND when it already existed - there's no
+        // `AlreadyExists` error to match on to tell the two apart after the fact. That distinction
+        // matters because `rosenpass::ensure_daemon_running` calls this unconditionally on every
+        // sync cycle (every ~10s), including when the directory already exists with permissions
+        // deliberately widened by `rosenpass::prepare_shared_ownership`/`ensure_ancestors_traversable`
+        // for the privilege-dropped exchange daemon - unconditionally forcing 0o700 here on every
+        // call clobbered that back to owner-only moments later, locking the unprivileged daemon
+        // out with EACCES shortly after each cycle (found via a real deployment: the daemon's
+        // very first exchange succeeded right after startup, then every subsequent access failed).
+        let already_existed = dir.exists();
+        fs::create_dir_all(dir).with_path(dir)?;
+        if !already_existed {
+            log::debug!("created dir {}", dir.to_string_lossy());
+            std::fs::set_permissions(dir, Permissions::from_mode(0o700)).with_path(dir)?;
         }
     }
     Ok(())
@@ -193,4 +198,38 @@ pub fn update_hosts_file(
     };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ensure_dirs_exist_creates_missing_dir_with_0700() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fresh");
+
+        ensure_dirs_exist(&[dir.as_path()]).unwrap();
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn test_ensure_dirs_exist_leaves_existing_dir_permissions_untouched() {
+        // Regression test: `rosenpass::ensure_daemon_running` calls this unconditionally on
+        // every sync cycle, including for directories `rosenpass::prepare_shared_ownership`
+        // deliberately widened beyond 0o700 for the privilege-dropped exchange daemon. This must
+        // never reset an already-existing directory back to 0o700, or the daemon gets locked
+        // out shortly after each cycle.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("shared");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o750)).unwrap();
+
+        ensure_dirs_exist(&[dir.as_path()]).unwrap();
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
+    }
 }
