@@ -1,6 +1,9 @@
 target/
 bin/dist/
 bin/*.tar.gz
+bin/*.pkg.tar.zst
+bin/pkg/
+bin/src/
 *.db
 *.conf
 arch/pkg
