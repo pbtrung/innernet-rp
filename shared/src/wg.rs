@@ -84,28 +84,41 @@ pub use super::netlink::set_addr;
 #[cfg(target_os = "linux")]
 pub use super::netlink::set_up;
 
+/// The server peer to configure alongside bringing up an interface.
+pub struct ServerPeer<'a> {
+    pub public_key: &'a str,
+    pub address: IpAddr,
+    pub endpoint: SocketAddr,
+    /// The management-link PSK, when this network requires one. Never a
+    /// data-peer PSK: those are rotated independently through the mailbox.
+    pub preshared_key: Option<[u8; 32]>,
+}
+
 pub fn up(
     interface: &InterfaceName,
     private_key: &str,
     address: IpNet,
     listen_port: Option<u16>,
-    peer: Option<(&str, IpAddr, SocketAddr)>,
+    peer: Option<ServerPeer<'_>>,
     network: &NetworkOpts,
 ) -> Result<(), io::Error> {
     let mut device = DeviceUpdate::new();
-    if let Some((public_key, address, endpoint)) = peer {
-        let prefix = if address.is_ipv4() { 32 } else { 128 };
-        let peer_config = PeerConfigBuilder::new(
-            &wireguard_control::Key::from_base64(public_key).map_err(|_| {
+    if let Some(server) = peer {
+        let prefix = if server.address.is_ipv4() { 32 } else { 128 };
+        let mut peer_config = PeerConfigBuilder::new(
+            &wireguard_control::Key::from_base64(server.public_key).map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "failed to parse base64 public key",
                 )
             })?,
         )
-        .add_allowed_ip(address, prefix)
+        .add_allowed_ip(server.address, prefix)
         .set_persistent_keepalive_interval(25)
-        .set_endpoint(endpoint);
+        .set_endpoint(server.endpoint);
+        if let Some(psk) = server.preshared_key {
+            peer_config = peer_config.set_preshared_key(Key(psk));
+        }
         device = device.add_peer(peer_config);
     }
     if let Some(listen_port) = listen_port {

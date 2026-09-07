@@ -26,6 +26,8 @@ pub enum RedeemInviteError {
     InterfaceConfigExists(InterfaceName),
     #[error("Error making a REST request: {0}")]
     RestRequest(#[from] RestError),
+    #[error("Could not persist the management enrollment: {0}")]
+    ManagementPersist(String),
     #[error("Could not resolve server address for endpoint {endpoint}: {error}")]
     ServerAddressResolve {
         endpoint: Endpoint,
@@ -49,6 +51,7 @@ pub enum RedeemInviteError {
 ///   brings the interface down if it was already up.
 pub fn redeem_invite(
     config_dir: &Path,
+    data_dir: &Path,
     network_opts: &NetworkOpts,
     interface: &InterfaceName,
     config: InterfaceConfig,
@@ -67,6 +70,18 @@ pub fn redeem_invite(
     {
         return Err(RedeemInviteError::WireguardInterfaceExists(*interface));
     }
+
+    // Persist a provisioned management PSK before the interface protects
+    // anything with it, matching design 5.10's "persist at both endpoints
+    // before enabling the link". A network that never requires management
+    // has no enrollment to adopt here.
+    let preshared_key = if let Some(enrollment) = &config.server.management {
+        crate::management::adopt(data_dir, interface, enrollment)
+            .map_err(|e| RedeemInviteError::ManagementPersist(e.to_string()))?;
+        Some(*enrollment.psk.bytes())
+    } else {
+        None
+    };
 
     log::info!(
         "bringing up interface {}.",
@@ -87,11 +102,12 @@ pub fn redeem_invite(
         &config.interface.private_key,
         config.interface.address,
         config.interface.listen_port,
-        Some((
-            &config.server.public_key,
-            config.server.internal_endpoint.ip(),
-            resolved_endpoint,
-        )),
+        Some(wg::ServerPeer {
+            public_key: &config.server.public_key,
+            address: config.server.internal_endpoint.ip(),
+            endpoint: resolved_endpoint,
+            preshared_key,
+        }),
         network_opts,
     )
     .map_err(|e| RedeemInviteError::WireguardOperation {
@@ -165,6 +181,10 @@ pub fn fetch(
     let config = InterfaceConfig::from_interface(config_dir, interface)?;
     let interface_up = interface_is_up(network_opts.backend, interface);
 
+    // Restores the management PSK across a restart, before the interface is
+    // (re)configured. Never a data-peer PSK: those are unrelated to this link.
+    let management_psk = crate::management::load(data_dir, interface)?.map(|e| *e.psk.bytes());
+
     if !interface_up {
         if !bring_up_interface {
             bail!(
@@ -187,11 +207,12 @@ pub fn fetch(
             &config.interface.private_key,
             config.interface.address,
             config.interface.listen_port,
-            Some((
-                &config.server.public_key,
-                config.server.internal_endpoint.ip(),
-                resolved_endpoint,
-            )),
+            Some(wg::ServerPeer {
+                public_key: &config.server.public_key,
+                address: config.server.internal_endpoint.ip(),
+                endpoint: resolved_endpoint,
+                preshared_key: management_psk,
+            }),
             network_opts,
         )
         .context(interface.to_string())?;
@@ -247,12 +268,27 @@ pub fn fetch(
     let device = Device::get(interface, network_opts.backend)?;
     let modifications = device.diff(&peers);
 
-    let updates = modifications
+    let server_key = wireguard_control::Key::from_base64(&config.server.public_key).ok();
+    let mut updates = modifications
         .iter()
         .inspect(|diff| print_peer_diff(&store, diff))
         .cloned()
         .map(PeerConfigBuilder::from)
         .collect::<Vec<_>>();
+    // A rebuilt server peer entry (from an ordinary allowed-IP/endpoint diff)
+    // must never silently drop its management PSK back to an unprotected link.
+    if let Some(psk) = management_psk {
+        for update in &mut updates {
+            if server_key
+                .as_ref()
+                .is_some_and(|key| update.public_key() == key)
+            {
+                *update = update
+                    .clone()
+                    .set_preshared_key(wireguard_control::Key(psk));
+            }
+        }
+    }
 
     if !updates.is_empty() || !interface_up {
         DeviceUpdate::new()
