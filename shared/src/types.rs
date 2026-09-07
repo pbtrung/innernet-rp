@@ -825,6 +825,8 @@ pub struct State {
 pub struct ServerCapabilities {
     #[serde(default)]
     pub unspecified_ip_in_override_endpoint: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pq_psk_versions: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

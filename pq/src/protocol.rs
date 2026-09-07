@@ -84,6 +84,7 @@ pub struct Bundle {
 impl Bundle {
     pub fn validate(&self) -> Result<()> {
         crypto::validate_kem(&self.pq_kem_public_key.0)?;
+        crypto::validate_x448(&self.pq_x448_public_key.0)?;
         crypto::validate_signing(&self.pq_sig_public_key.0)
     }
     pub fn encode(&self) -> Vec<u8> {
@@ -109,7 +110,8 @@ pub struct Transcript {
     pub sequence: Number,
     pub exchange_id: Binary<16>,
     pub operator_psk_id: Binary<16>,
-    pub ciphertext: Binary<1568>,
+    /// ML-KEM ciphertext followed by leancrypto's ephemeral X448 public key.
+    pub ciphertext: Binary<1624>,
 }
 impl Transcript {
     pub fn validate(&self) -> Result<()> {
@@ -117,7 +119,12 @@ impl Transcript {
             return Err(Error::Invalid);
         }
         self.initiator.validate()?;
-        self.responder.validate()
+        self.responder.validate()?;
+        crypto::validate_x448(
+            self.ciphertext.0[1568..]
+                .try_into()
+                .map_err(|_| Error::Invalid)?,
+        )
     }
     pub fn encode(&self) -> Vec<u8> {
         let mut out = b"innernet pq-psk v1 transcript".to_vec();
@@ -177,7 +184,7 @@ pub struct Message {
     pub tag: Binary<32>,
     pub signature: Binary<132>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ciphertext: Option<Binary<1568>>,
+    pub ciphertext: Option<Binary<1624>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_psk_id: Option<Binary<16>>,
 }
@@ -316,6 +323,7 @@ pub fn parse_message(body: &[u8]) -> Result<Message> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     Proposed,
     Ready,

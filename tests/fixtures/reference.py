@@ -102,7 +102,9 @@ def bundle(side):
 def vectors():
     first, b_i = bundle(1)
     second, b_r = bundle(2)
-    network, exchange, operator, ciphertext = bytes([3])*16, bytes([4])*16, bytes(16), bytes([5])*1568
+    # Hybrid ciphertext: ML-KEM component followed by ephemeral X448 public key.
+    network, exchange, operator = bytes([3])*16, bytes([4])*16, bytes(16)
+    ciphertext = bytes([5])*1568 + bytes([6])*56
     transcript = (b"innernet pq-psk v1 transcript" + b"\1" + network
                   + u64(2) + u64(3) + b_i + b_r + u64(1) + exchange + operator + ciphertext)
     hashed = hashlib.sha3_256(transcript).digest()

@@ -91,7 +91,13 @@ impl DatabaseAssociation {
     }
 
     pub fn delete(conn: &Connection, id: i64) -> Result<(), ServerError> {
-        conn.execute("DELETE FROM associations WHERE id = ?1", params![id])?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM associations WHERE id = ?1", params![id])?;
+        // Invalidate work in the same transaction as authorization removal;
+        // restoring an association later must not resurrect a prior decision.
+        super::pq::sweep_inner(&tx, 0)?;
+        tx.commit()?;
         Ok(())
     }
 

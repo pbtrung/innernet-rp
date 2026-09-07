@@ -1,0 +1,34 @@
+{
+  "milestone": 1,
+  "revision": "the commit introducing this record",
+  "date": "2026-09-07",
+  "kernel": "Linux 7.2.2-1-cachyos x86_64",
+  "rust": "1.98.1",
+  "leancrypto": "1.8.0-1",
+  "openssl": "3.6.4-1",
+  "sqlite": "3.53.4-1",
+  "container_base": "archlinux@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a",
+  "package_snapshot": "2026/09/07",
+  "schema": 3,
+  "crypto_api": "lc_kyber_x448_keypair/enc/dec with LC_KYBER_1024; raw components enter transcript-bound HKDF-SHA3-256",
+  "checks": [
+    {"command": "cargo fmt --all", "result": "passed; stable fallback because nightly is unavailable"},
+    {"command": "cargo clippy --workspace --locked --all-targets -- -D warnings", "result": "passed on host and in container"},
+    {"command": "cargo test --workspace --locked", "result": "94 passed, 2 explicitly ignored on host and in container"},
+    {"command": "cargo test --workspace --locked --features v6-test", "result": "94 passed, 2 explicitly ignored on host and in container"},
+    {"command": "python3 tests/fixtures/reference.py --check tests/fixtures/protocol-v1.json", "result": "all independent vectors match"},
+    {"command": "bash tests/run.sh integration", "result": "native hybrid interoperability and 15 SQLite/API checks passed"}
+  ],
+  "fault_schedule": "duplicate/lost replies and pages; concurrent commit/abort and commit/expiry with separate SQLite connections; prepare TTL at exactly 600 seconds; late rejected writes; authorization changes; body deadline with virtual Tokio time; record/worker quota exhaustion",
+  "excluded": [
+    "upstream public-IP external-service test",
+    "explicitly isolated userspace WireGuard interface integration test"
+  ],
+  "limitations": [
+    "Production PQ activation remains disabled; readiness is explicitly constructed only by tests",
+    "HTTP handler tests use authenticated request objects and real SQLite, not independent client processes",
+    "No endpoint secret persistence or management enrollment evidence yet",
+    "No real-kernel gate, data PSK installation, or traffic-protection claim",
+    "No old/new binary compatibility, aarch64 execution, or external audit claim"
+  ]
+}

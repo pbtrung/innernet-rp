@@ -121,7 +121,7 @@ impl DatabasePeer {
 
         conn.execute(
             &format!(
-                "INSERT INTO peers ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO peers (id, {}) VALUES ((SELECT max_peer_id + 1 FROM pq_network WHERE singleton = 1), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 COLUMNS[1..].join(", ")
             ),
             params![
@@ -167,7 +167,9 @@ impl DatabasePeer {
         };
 
         let new_candidates = serde_json::to_string(&new_contents.candidates)?;
-        conn.execute(
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE peers SET
                 name = ?2,
                 endpoint = ?3,
@@ -188,17 +190,28 @@ impl DatabasePeer {
             ],
         )?;
 
+        if new_contents.is_disabled {
+            super::pq::terminate_peer(&tx, self.id, "disabled")?;
+        }
+        tx.commit()?;
+
         self.contents = new_contents;
         Ok(())
     }
 
     pub fn disable(conn: &Connection, id: i64) -> Result<(), ServerError> {
-        match conn.execute(
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        match tx.execute(
             "UPDATE peers SET is_disabled = 1 WHERE id = ?1",
             params![id],
         )? {
             0 => Err(ServerError::NotFound),
-            _ => Ok(()),
+            _ => {
+                super::pq::terminate_peer(&tx, id, "disabled")?;
+                tx.commit()?;
+                Ok(())
+            },
         }
     }
 

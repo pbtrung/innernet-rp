@@ -1,4 +1,5 @@
 //! Protocol v1 primitives. This crate does not activate production interfaces.
+pub mod api;
 pub mod crypto;
 pub mod protocol;
 

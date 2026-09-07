@@ -8,6 +8,9 @@ fn coverage_manifest_has_all_cases_and_resolves_unit_test_names() {
         include_str!("protocol.rs"),
         include_str!("harness.rs"),
         include_str!("native_interop.rs"),
+        include_str!("../../server/src/api/pq_tests.rs"),
+        include_str!("../../server/src/db/pq_migration_tests.rs"),
+        include_str!("../../shared/src/pq.rs"),
     ]
     .concat();
     for (index, case) in cases.iter().enumerate() {

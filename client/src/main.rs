@@ -60,6 +60,9 @@ struct Opts {
 
     #[clap(flatten)]
     network: NetworkOpts,
+
+    #[command(flatten)]
+    pq: innernet_shared::pq::PqOptions,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -1143,6 +1146,7 @@ fn main() {
 }
 
 fn run(opts: &Opts) -> Result<(), Error> {
+    opts.pq.production_ready().map_err(|e| anyhow!(e))?;
     let command = opts.command.clone().unwrap_or(Command::Show {
         short: false,
         tree: false,

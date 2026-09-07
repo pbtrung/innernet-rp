@@ -4,6 +4,7 @@ use crate::Session;
 use innernet_shared::{Endpoint, Peer};
 
 pub mod admin;
+pub mod pq;
 pub mod user;
 
 /// Implements NAT traversal strategies.

@@ -43,6 +43,7 @@ http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 indoc = "2.0.7"
 innernet-publicip = { version = "2.0.0", path = "../publicip" }
+innernet-pq = { path = "../pq" }
 innernet-shared = { version = "2.0.0", path = "../shared" }
 ipnet = { version = "2.12.2", features = ["serde"] }
 libc = "0.2.189"
@@ -68,6 +69,7 @@ socket2 = { version = "0.6.5", features = ["all"] }
 [dev-dependencies]
 anyhow = "1.0.104"
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 [package.metadata.deb]
 assets = [

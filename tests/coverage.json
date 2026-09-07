@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "stage": "M0",
+  "stage": "M1",
   "note": "Test IDs identify implemented checks, not completion of all design-case assertions. Kernel, process, load and architecture evidence are tracked separately.",
   "cases": [
     {
@@ -14,7 +14,7 @@
         "independent_openssl_and_leancrypto_endpoints"
       ],
       "docker": [],
-      "status": "m0-crypto-verified"
+      "status": "m1-combined-api-crypto-verified"
     },
     {
       "design_case": 2,
@@ -37,18 +37,23 @@
       "unit": [
         "clocks_fault_boundaries_and_non_consuming_delivery"
       ],
-      "integration": [],
+      "integration": [
+        "pq_api_durable_duplicate_delivery_tombstones_and_stale_receipts",
+        "pq_api_pages_are_bounded_non_consuming_and_authorization_bound"
+      ],
       "docker": [],
-      "status": "model-only"
+      "status": "m1-api-storage-only"
     },
     {
       "design_case": 5,
       "unit": [
         "durable_receipts_and_replay_high_water_model"
       ],
-      "integration": [],
+      "integration": [
+        "pq_migrations_are_atomic_reopenable_and_reject_newer_without_writes"
+      ],
       "docker": [],
-      "status": "model-only"
+      "status": "m1-api-storage-only"
     },
     {
       "design_case": 6,
@@ -56,18 +61,23 @@
         "expiry_wins_before_commit_and_not_after",
         "state_model_requires_commit_and_responder_first"
       ],
-      "integration": [],
+      "integration": [
+        "pq_api_sqlite_concurrent_commit_abort_and_expiry_serialize",
+        "pq_api_expiry_persists_on_reads_failed_writes_and_sweeps"
+      ],
       "docker": [],
-      "status": "model-only"
+      "status": "m1-api-storage-only"
     },
     {
       "design_case": 7,
       "unit": [
         "durable_receipts_and_replay_high_water_model"
       ],
-      "integration": [],
+      "integration": [
+        "pq_api_durable_duplicate_delivery_tombstones_and_stale_receipts"
+      ],
       "docker": [],
-      "status": "model-only"
+      "status": "m1-api-storage-only"
     },
     {
       "design_case": 8,
@@ -77,9 +87,12 @@
         "x448_agreement_and_all_zero_rejection",
         "randomness_failure_never_returns_partial_identity"
       ],
-      "integration": [],
+      "integration": [
+        "pq_api_capability_readiness_and_atomic_registration",
+        "pq_api_raw_body_limits_and_recovery_admission"
+      ],
       "docker": [],
-      "status": "model-only"
+      "status": "m1-api-storage-only"
     },
     {
       "design_case": 9,
@@ -87,9 +100,11 @@
         "every_bound_field_is_authenticated",
         "each_combiner_input_changes_keys_and_confirmation"
       ],
-      "integration": [],
+      "integration": [
+        "pq_api_current_identity_roles_signatures_and_retirement"
+      ],
       "docker": [],
-      "status": "model-only"
+      "status": "m1-api-storage-only"
     },
     {
       "design_case": 10,
@@ -101,16 +116,25 @@
     {
       "design_case": 11,
       "unit": [],
-      "integration": [],
+      "integration": [
+        "pq_api_current_identity_roles_signatures_and_retirement",
+        "pq_api_pages_are_bounded_non_consuming_and_authorization_bound",
+        "pq_api_revocation_is_irrevocable_and_recovery_survives_record_budget",
+        "pq_api_body_deadline_releases_permits_and_rechecks_delayed_session"
+      ],
       "docker": [],
-      "status": "planned"
+      "status": "m1-api-storage-only"
     },
     {
       "design_case": 12,
       "unit": [],
-      "integration": [],
+      "integration": [
+        "pq_api_new_pair_quota_does_not_block_committed_recovery",
+        "pq_api_expiry_persists_on_reads_failed_writes_and_sweeps",
+        "pq_api_global_worker_reservation_and_invalid_configuration"
+      ],
       "docker": [],
-      "status": "planned"
+      "status": "m1-api-storage-only"
     },
     {
       "design_case": 13,
@@ -128,10 +152,14 @@
     },
     {
       "design_case": 15,
-      "unit": [],
-      "integration": [],
+      "unit": [
+        "enablement_is_opt_in_and_production_fails_closed_before_side_effects"
+      ],
+      "integration": [
+        "pq_api_capability_readiness_and_atomic_registration"
+      ],
       "docker": [],
-      "status": "planned"
+      "status": "m1-api-storage-only"
     },
     {
       "design_case": 16,
@@ -143,9 +171,14 @@
     {
       "design_case": 17,
       "unit": [],
-      "integration": [],
+      "integration": [
+        "pq_migrations_are_atomic_reopenable_and_reject_newer_without_writes",
+        "pq_migration_failure_rolls_back_columns_and_version",
+        "pq_stable_peer_ids_server_role_and_revision_overflow_fail_closed",
+        "pq_migrated_server_role_uses_identity_not_peer_number"
+      ],
       "docker": [],
-      "status": "planned"
+      "status": "m1-schema-only-not-binary-compatibility"
     },
     {
       "design_case": 18,

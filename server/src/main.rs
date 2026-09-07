@@ -34,6 +34,9 @@ struct Opts {
 
     #[clap(flatten)]
     network: NetworkOpts,
+
+    #[command(flatten)]
+    pq: innernet_shared::pq::PqOptions,
 }
 
 #[derive(Debug, Subcommand)]
@@ -137,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     pretty_env_logger::init();
     let opts = Opts::parse();
+    opts.pq.production_ready()?;
 
     if unsafe { libc::getuid() } != 0 && !matches!(opts.command, Command::Completions { .. }) {
         return Err("innernet-server must run as root.".into());

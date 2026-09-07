@@ -29,7 +29,7 @@ API. No milestone claims uninterrupted two-party PSK installation.
   from testing sections 1–2. Define the suite runner contracts before later
   milestones depend on them.
 - Select the P-521/SHA-512 signing library and integrate it alongside
-  leancrypto's standalone ML-KEM-1024, X448, SHA3, HMAC, and HKDF primitives.
+  leancrypto's combined ML-KEM-1024/X448 API plus SHA3, HMAC, and HKDF.
   Confirm API availability and failure behavior, including deterministic
   ECDSA, canonical signatures, and all required public-key checks.
 - Link both crypto libraries and SQLite against system-provided shared
@@ -46,7 +46,8 @@ API. No milestone claims uninterrupted two-party PSK installation.
   correctly sized ciphertexts that produce implicit rejection. No API may
   expose ML-KEM's internal implicit-reject flag.
 - Measure raw/base64/JSON fixtures, including all three public-key fields.
-  Confirm 2092 bytes for a base64 ML-KEM key/ciphertext and all
+  Confirm 2092 bytes for a base64 ML-KEM key/component ciphertext, 2168 bytes
+  for the full hybrid ciphertext including ephemeral X448, and all
   submitted message/registration fixtures fitting the 8 KiB request cap.
 - Model proposed/ready/committed/complete/aborted transitions, durable
   receipts, and replay high-water marks before writing production PSKs.

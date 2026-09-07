@@ -153,7 +153,7 @@ fn raw_and_base64_size_contracts() {
     );
     assert_eq!(
         serde_json::to_string(&t.ciphertext).unwrap().len() - 2,
-        2092
+        2168
     );
     let key_total = [
         serde_json::to_string(&t.initiator.pq_kem_public_key).unwrap(),
@@ -169,46 +169,62 @@ fn raw_and_base64_size_contracts() {
 
 #[test]
 fn randomized_kem_agreement_and_implicit_rejection() {
-    let (public, private) = crypto::kem_keypair(&mut SystemRandom).unwrap();
-    let (_, wrong_private) = crypto::kem_keypair(&mut SystemRandom).unwrap();
+    let (public, private) = crypto::hybrid_keypair(&mut SystemRandom).unwrap();
+    assert_eq!(public, crypto::hybrid_public(&private).unwrap());
+    let (_, wrong_private) = crypto::hybrid_keypair(&mut SystemRandom).unwrap();
     let (ct, shared) = crypto::encapsulate(&public).unwrap();
     let (next_ct, next_shared) = crypto::encapsulate(&public).unwrap();
     assert!(shared.same(&crypto::decapsulate(&ct, &private).unwrap()));
     assert!(!shared.same(&crypto::decapsulate(&ct, &wrong_private).unwrap()));
     assert!(ct != next_ct);
+    assert_ne!(
+        ct[1568..],
+        next_ct[1568..],
+        "each encapsulation has a fresh ephemeral X448 public key"
+    );
     assert!(!shared.same(&next_shared));
     // No internal reject flag is exposed; the directional tag rejects wrong keys.
-    let dh = Secret::from_bytes([7; 56]);
     let absent = Secret::from_bytes([0; 32]);
-    let correct = crypto::derive(&shared, &dh, &absent, b"implicit rejection test").unwrap();
-    let rejected = crypto::derive(
-        &crypto::decapsulate(&ct, &wrong_private).unwrap(),
-        &dh,
+    let correct = crypto::derive(
+        &shared.kem,
+        &shared.x448,
         &absent,
         b"implicit rejection test",
     )
     .unwrap();
+    let wrong = crypto::decapsulate(&ct, &wrong_private).unwrap();
+    let rejected =
+        crypto::derive(&wrong.kem, &wrong.x448, &absent, b"implicit rejection test").unwrap();
     assert_ne!(
         crypto::tag(&correct.initiator_confirmation, b"message").unwrap(),
         crypto::tag(&rejected.initiator_confirmation, b"message").unwrap()
     );
     let mut malformed = public;
-    malformed[..3].copy_from_slice(&[0xff; 3]);
+    malformed.kem[..3].copy_from_slice(&[0xff; 3]);
     assert!(crypto::encapsulate(&malformed).is_err());
 }
 
 #[test]
 fn x448_agreement_and_all_zero_rejection() {
-    let a = crypto::random(&mut SystemRandom).unwrap();
-    let b = crypto::random(&mut SystemRandom).unwrap();
-    let ap = crypto::x448_public(&a).unwrap();
-    let bp = crypto::x448_public(&b).unwrap();
-    assert!(
-        crypto::x448(&bp, &a)
-            .unwrap()
-            .same(&crypto::x448(&ap, &b).unwrap())
-    );
-    assert!(crypto::x448(&[0; 56], &a).is_err());
+    let (mut public, private) = crypto::hybrid_keypair(&mut SystemRandom).unwrap();
+    let (mut ciphertext, shared) = crypto::encapsulate(&public).unwrap();
+    assert!(shared.same(&crypto::decapsulate(&ciphertext, &private).unwrap()));
+    ciphertext[1568..].fill(0);
+    assert!(crypto::decapsulate(&ciphertext, &private).is_err());
+    public.x448.fill(0);
+    assert!(crypto::encapsulate(&public).is_err());
+    for point in [[0; 56], std::array::from_fn(|i| u8::from(i == 0))] {
+        assert!(crypto::validate_x448(&point).is_err());
+        let mut t = transcript();
+        t.responder.pq_x448_public_key = Binary(point);
+        assert!(t.validate().is_err());
+        let mut t = transcript();
+        t.ciphertext.0[1568..].copy_from_slice(&point);
+        assert!(t.validate().is_err());
+    }
+    let mut old_proposal = fixtures()["messages"][0]["message"].clone();
+    old_proposal["ciphertext"] = serde_json::to_value(Binary([5; 1568])).unwrap();
+    assert!(parse_message(&serde_json::to_vec(&old_proposal).unwrap()).is_err());
 }
 
 #[test]
@@ -273,7 +289,7 @@ fn randomness_failure_never_returns_partial_identity() {
             Err(Error::Random)
         }
     }
-    assert!(crypto::kem_keypair(&mut Fail).is_err());
+    assert!(crypto::hybrid_keypair(&mut Fail).is_err());
     assert!(crypto::signing_keypair(&mut Fail).is_err());
     assert!(crypto::random::<56>(&mut Fail).is_err());
 }

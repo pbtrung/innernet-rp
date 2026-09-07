@@ -79,6 +79,7 @@ pub struct Server {
     interface: InterfaceName,
     conf: ServerConfig,
     public_key: Key,
+    pub pq: Option<Arc<crate::pq::Service>>,
     // The directory will be removed during destruction.
     _test_dir: TempDir,
 }
@@ -163,6 +164,7 @@ impl Server {
             endpoints,
             interface,
             public_key,
+            pq: None,
             _test_dir: test_dir,
         })
     }
@@ -177,6 +179,7 @@ impl Server {
             interface: self.interface,
             endpoints: self.endpoints.clone(),
             public_key: self.public_key.clone(),
+            pq: self.pq.clone(),
             #[cfg(target_os = "linux")]
             backend: Backend::Kernel,
             #[cfg(not(target_os = "linux"))]
@@ -199,7 +202,7 @@ impl Server {
         .unwrap()
     }
 
-    fn base_request_builder(&self, verb: &str, path: &str) -> http::request::Builder {
+    pub fn base_request_builder(&self, verb: &str, path: &str) -> http::request::Builder {
         let path = if cfg!(feature = "v6-test") {
             format!("http://[{WG_MANAGE_PEER_IP}]{path}")
         } else {

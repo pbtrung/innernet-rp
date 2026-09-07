@@ -8,9 +8,10 @@ case "${1:-unit}" in
     ;;
   integration)
     cargo test -p innernet-pq --locked --test native_interop
+    cargo test -p innernet-server --locked pq_
     ;;
   docker-smoke|docker-faults|compatibility|load)
-    echo "Suite '$1' is not implemented at M0; this is not a passing/skipped result." >&2
+    echo "Suite '$1' is not implemented yet; this is not a passing/skipped result." >&2
     exit 2
     ;;
   *) echo "Usage: bash tests/run.sh {unit|integration|docker-smoke|docker-faults|compatibility|load}" >&2; exit 2 ;;

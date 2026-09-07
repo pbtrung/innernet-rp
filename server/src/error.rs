@@ -18,6 +18,19 @@ pub enum ServerError {
     #[error("endpoint gone")]
     Gone,
 
+    #[error("conflicting durable state")]
+    Conflict,
+    #[error("request exceeds the body limit")]
+    PayloadTooLarge,
+    #[error("unsupported content encoding or type")]
+    UnsupportedMedia,
+    #[error("PQ resource budget exhausted")]
+    RateLimited,
+    #[error("PQ service is not ready")]
+    Unavailable,
+    #[error("invalid PQ message")]
+    Pq(#[from] innernet_pq::Error),
+
     #[error("internal database error")]
     Database(#[from] rusqlite::Error),
 
@@ -44,7 +57,23 @@ impl From<&ServerError> for StatusCode {
             Unauthorized => StatusCode::UNAUTHORIZED,
             NotFound => StatusCode::NOT_FOUND,
             Gone => StatusCode::GONE,
+            Conflict | Pq(innernet_pq::Error::Conflict) => StatusCode::CONFLICT,
+            PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            UnsupportedMedia => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            Unavailable | Pq(innernet_pq::Error::Random) => StatusCode::SERVICE_UNAVAILABLE,
+            Pq(_) => StatusCode::BAD_REQUEST,
             InvalidQuery | Json(_) => StatusCode::BAD_REQUEST,
+            Database(rusqlite::Error::SqliteFailure(
+                libsqlite3_sys::Error {
+                    code:
+                        libsqlite3_sys::ErrorCode::DatabaseBusy
+                        | libsqlite3_sys::ErrorCode::DatabaseLocked
+                        | libsqlite3_sys::ErrorCode::DiskFull,
+                    ..
+                },
+                ..,
+            )) => StatusCode::SERVICE_UNAVAILABLE,
             // Special-case the constraint violation situation.
             Database(rusqlite::Error::SqliteFailure(libsqlite3_sys::Error { code, .. }, ..))
                 if *code == libsqlite3_sys::ErrorCode::ConstraintViolation =>
@@ -63,8 +92,13 @@ impl TryFrom<ServerError> for Response<Body> {
     type Error = http::Error;
 
     fn try_from(e: ServerError) -> Result<Self, Self::Error> {
-        Response::builder()
-            .status(StatusCode::from(&e))
-            .body(crate::body::empty())
+        let mut response = Response::builder().status(StatusCode::from(&e));
+        if matches!(
+            StatusCode::from(&e),
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            response = response.header("Retry-After", "1");
+        }
+        response.body(crate::body::empty())
     }
 }

@@ -39,6 +39,7 @@ mod body;
 mod db;
 mod error;
 pub mod initialize;
+pub mod pq;
 #[cfg(test)]
 mod test;
 mod util;
@@ -57,6 +58,7 @@ pub struct Context {
     pub interface: InterfaceName,
     pub backend: Backend,
     pub public_key: Key,
+    pub pq: Option<Arc<pq::Service>>,
 }
 
 pub struct Session {
@@ -214,7 +216,9 @@ pub fn add_peer(
         let interface_info = InterfaceInfo::new(interface, &keypair, address);
 
         let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
-        let server_peer = DatabasePeer::get(&conn, 1)?;
+        let server_key = Key::from_base64(&config.private_key)?.get_public();
+        let server_id = db::pq::identify_server(&conn, &server_key.to_base64(), config.address)?;
+        let server_peer = DatabasePeer::get(&conn, server_id)?;
         let server_info = ServerInfo::new(&server_peer, internal_endpoint);
 
         let invitation = PeerInvitation::new(interface_info, server_info);
@@ -476,6 +480,9 @@ pub async fn serve(
     log::debug!("opening database connection...");
     let conn = open_database_connection(&interface, conf)?;
 
+    let public_key = wireguard_control::Key::from_base64(&config.private_key)?.get_public();
+    db::pq::identify_server(&conn, &public_key.to_base64(), config.address)?;
+
     let mut peers = DatabasePeer::list(&conn)?;
     log::debug!("peers listed...");
     let peer_configs = peers
@@ -520,7 +527,6 @@ pub async fn serve(
         num_candidates
     );
 
-    let public_key = wireguard_control::Key::from_base64(&config.private_key)?.get_public();
     let db = Arc::new(Mutex::new(conn));
     let endpoints = spawn_endpoint_refresher(interface, network);
     spawn_expired_invite_sweeper(db.clone());
@@ -535,7 +541,10 @@ pub async fn serve(
         interface,
         public_key,
         backend: network.backend,
+        pq: None,
     };
+
+    spawn_pq_sweeper(&context);
 
     log::info!("innernet-server {} starting.", VERSION);
 
@@ -558,6 +567,28 @@ pub async fn serve(
             }
         });
     }
+}
+
+fn spawn_pq_sweeper(context: &Context) {
+    let Some(service) = context.pq.clone() else {
+        return;
+    };
+    let db = context.db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let service = service.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                db::pq::sweep(&db.lock(), service.clock.epoch_seconds())
+            })
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                log::error!("PQ expiry sweep failed");
+            }
+        }
+    });
 }
 
 /// This function differs per OS, because different operating systems have

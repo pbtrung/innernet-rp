@@ -39,8 +39,9 @@ proposal. The specification is implementation-language-independent.
   ciphertext are each 1568 bytes; the shared secret is 32 bytes. A single
   encapsulation is asynchronous, but reliable PSK activation requires the
   multi-message protocol in section 5.5.
-- **X448** uses dedicated interface keys and supplies a separate classical
-  shared secret. Public keys and shared secrets are 56 bytes; its roughly
+- **X448** uses a dedicated recipient interface key and a fresh encapsulator
+  ephemeral key through leancrypto's combined ML-KEM-1024/X448 API. Public
+  keys and shared secrets are 56 bytes; its roughly
   224-bit classical security margin is distinct from ML-KEM's category.
 - **HKDF-SHA3-256** combines secrets and authenticated context, deriving
   separate PSK and confirmation keys (section 5.7).
@@ -49,7 +50,9 @@ proposal. The specification is implementation-language-independent.
   Signing is mandatory in version 1, with no unsigned negotiation mode.
 
 A 1568-byte field becomes **2092 bytes in padded base64**, exceeding both
-2000 bytes and 2 KiB. Ciphertext plus signature alone is 2268 base64 bytes;
+2000 bytes and 2 KiB. The hybrid ciphertext is 1624 bytes (1568-byte ML-KEM
+ciphertext followed by a 56-byte ephemeral X448 public key), or 2168 bytes
+in base64. Hybrid ciphertext plus signature alone is 2344 base64 bytes;
 all three public keys total 2260 base64 bytes. Actual requests also carry
 identifiers, versions, confirmation tags, and JSON overhead (section 8).
 
@@ -60,11 +63,20 @@ Algorithm and validation references:
 
 ### 2.1 Libraries, storage, and packaging
 
-Use leancrypto for ML-KEM-1024, X448, SHA3, HMAC, and HKDF, with a separate
-P-521/SHA-512 implementation. M0 selects the signing library and verifies
-the required APIs and failure behavior of both implementations. Use the
-standalone primitives; do not silently substitute a library-specific hybrid
-encoding or KDF for section 5.7.
+Use leancrypto's `lc_kyber_x448_keypair`, `lc_kyber_x448_enc` and
+`lc_kyber_x448_dec` APIs with `LC_KYBER_1024`, together with their checked
+load/pointer/public-key recovery helpers. Export components explicitly; never
+serialize library structs, enum tags, or padding. The combined KEM supplies
+the 32-byte ML-KEM and 56-byte X448 shared secrets for section 5.7. Its optional
+`*_kdf` KMAC variant is not used: retain transcript-bound HKDF-SHA3-256,
+operator-PSK adoption, and directional confirmation keys. SHA3, HMAC, HKDF
+and the seeded identity DRBG also use system leancrypto; OpenSSL supplies
+P-521/SHA-512 signatures.
+
+This hybrid API choice explicitly revises the pre-release M0 fixture format.
+The full 1624-byte hybrid ciphertext is signed through the transcript hash;
+the original standalone 1568-byte proposal is rejected. No released/activated
+protocol is silently reinterpreted; M0 did not permit production activation.
 
 Both crypto libraries and SQLite link against system-provided shared
 libraries, with no vendored/bundled copies. Record exact tested package
@@ -159,9 +171,13 @@ exclusive lock; multiple sync processes must not compete.
 - `PUT /v1/user/pq-keys` atomically registers/retires the caller's bundle.
   The authenticated session determines the sender. Initial registration
   expects no bundle; updates require the current revision.
+  Retirement uses `?retire=1`; it must match the decoded lifecycle.
 - `PUT /v1/user/pq-handshake/{other_peer_id}` submits a signed phase message.
   Section 5.5 defines transitions; section 5.14 defines exact bytes. Success
   means the transition and its receipt are committed to durable storage.
+  Include `?phase=N` (the signed message type, 1–6) for pre-body admission;
+  omission means propose. The hint must match the authenticated body. New
+  proposals cannot consume capacity reserved for ready/commit/receipts/abort.
 - `GET /v1/user/state?pq_version=1` returns visible bundles and exchanges in
   a versioned, paginated response. In this mode paginate both peers and PQ
   records: at most 1 MiB overall, 32 PQ records, and 128 KiB of PQ content
@@ -252,7 +268,7 @@ the API. Directional HMAC tags confirm agreement on key material before
 installation (sections 5.7 and 5.14).
 
 1. **Propose — initiator.** Fetch and validate both current bundles. Generate
-   a fresh ML-KEM encapsulation, compute X448, and derive the PSK and two
+   a fresh combined ML-KEM-1024/X448 encapsulation and derive the PSK and two
    confirmation keys. Persist the candidate, transcript, sequence, and signed
    `propose` message, then upload it. Include the initiator confirmation
    tag; leave the current WireGuard PSK unchanged.
@@ -511,7 +527,7 @@ B = bundle_id[16] || bundle_revision[u64be] || wg_public_key[32]
 T = ASCII("innernet pq-psk v1 transcript") || version[u8 = 1]
     || network_id[16] || initiator_id[u64be] || responder_id[u64be]
     || B_initiator || B_responder || sequence[u64be] || exchange_id[16]
-    || operator_psk_id[16] || ciphertext[1568]
+    || operator_psk_id[16] || ciphertext[1624]
 E = ASCII("innernet pq-psk v1 message") || version[u8 = 1]
     || network_id[16] || initiator_id[u64be] || responder_id[u64be]
     || initiator_bundle_id[16] || responder_bundle_id[16]
@@ -522,6 +538,9 @@ signature = ECDSA-P521-SHA512(E || tag)[132]
 ```
 
 Bundles are the fixed-width B bytes, not JSON/base64 text. Literal labels
+and hybrid ciphertext components have no struct padding. The ciphertext is
+the 1568-byte ML-KEM component followed by the 56-byte ephemeral X448 public
+key, in that order. Both shared-secret components feed section 5.7. Labels
 have no trailing NUL/newline. Message codes are `propose=1`, `ready=2`,
 `commit=3`, `installed=4`, `confirmed=5`, and `abort=6`. Only the initiator
 sends propose/commit/abort, only the responder sends ready, and each sends
@@ -718,15 +737,16 @@ sequenceDiagram
 | Material | Raw bytes | Padded base64 bytes |
 | --- | ---: | ---: |
 | ML-KEM public key or ciphertext | 1568 | 2092 |
+| Hybrid ciphertext (ML-KEM ciphertext + ephemeral X448 public key) | 1624 | 2168 |
 | X448 public key | 56 | 76 |
 | Compressed P-521 public key | 67 | 92 |
 | Three PQ keys (encoded separately) | 1691 | 2260 |
 | P-521 signature | 132 | 176 |
 | Confirmation tag | 32 | 44 |
-| Ciphertext + signature + tag (encoded separately) | 1732 | 2312 |
+| Hybrid ciphertext + signature + tag (encoded separately) | 1788 | 2388 |
 
 Proposals add IDs, transcript hash, operator PSK ID, and JSON overhead to the
-2312 bytes above. Replies omit ciphertext. Each message/registration must
+2388 bytes above. Replies omit ciphertext. Each message/registration must
 fit the 8 KiB cap; M0 measures exact fixtures. GET follows section 5.2 page
 caps. These are not UDP/MTU bounds: HTTP handles segmentation.
 

@@ -2,8 +2,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
 #include <string.h>
-#include <leancrypto/lc_kyber_1024.h>
-#include <leancrypto/lc_x448.h>
+#include <leancrypto/lc_kyber.h>
+#include <leancrypto/lc_hash_drbg.h>
 #include <leancrypto/lc_sha3.h>
 #include <leancrypto/lc_hmac.h>
 #include <leancrypto/lc_hkdf.h>
@@ -17,60 +17,111 @@
 _Static_assert(sizeof(struct lc_kyber_1024_pk) == 1568, "ML-KEM public ABI");
 _Static_assert(sizeof(struct lc_kyber_1024_sk) == 3168, "ML-KEM private ABI");
 _Static_assert(sizeof(struct lc_kyber_1024_ct) == 1568, "ML-KEM ciphertext ABI");
+_Static_assert(sizeof(struct lc_kyber_1024_x448_pk) == 1624, "hybrid public ABI");
+_Static_assert(sizeof(struct lc_kyber_1024_x448_sk) == 3224, "hybrid private ABI");
+_Static_assert(sizeof(struct lc_kyber_1024_x448_ct) == 1624, "hybrid ciphertext ABI");
+_Static_assert(sizeof(struct lc_kyber_1024_x448_ss) == 88, "hybrid secret ABI");
 
 int pq_init(void) { return lc_init(LC_INIT_NON_PQC_ENABLED); }
 
-int pq_kem_keygen(uint8_t *pk, uint8_t *sk, const uint8_t *seed) {
-    struct lc_kyber_1024_pk p;
-    struct lc_kyber_1024_sk s;
-    int ret = lc_kyber_1024_keypair_from_seed(&p, &s, seed, 64);
-    if (!ret) { memcpy(pk, p.pk, sizeof(p)); memcpy(sk, s.sk, sizeof(s)); }
+/* Export algorithm components, never generic enum/union memory or padding. */
+static int export_public(uint8_t *kem, uint8_t *x448, struct lc_kyber_x448_pk *pk) {
+    uint8_t *k, *x; size_t kl, xl;
+    if (lc_kyber_x448_pk_type(pk) != LC_KYBER_1024 ||
+        lc_kyber_x448_pk_ptr(&k, &kl, &x, &xl, pk) || kl != 1568 || xl != 56) return -1;
+    memcpy(kem, k, kl); memcpy(x448, x, xl);
+    return 0;
+}
+static int export_shared(uint8_t *kem, uint8_t *x448, struct lc_kyber_x448_ss *ss) {
+    uint8_t *k, *x; size_t kl, xl;
+    const uint8_t zero[56] = {0};
+    if (lc_kyber_x448_ss_type(ss) != LC_KYBER_1024 ||
+        lc_kyber_x448_ss_ptr(&k, &kl, &x, &xl, ss) || kl != 32 || xl != 56 ||
+        !CRYPTO_memcmp(x, zero, sizeof(zero))) return -1;
+    memcpy(kem, k, kl); memcpy(x448, x, xl);
+    return 0;
+}
+
+int pq_hybrid_keygen(uint8_t *pk, uint8_t *xpk, uint8_t *sk, uint8_t *xsk,
+                     const uint8_t *seed) {
+    struct lc_kyber_x448_pk p = {0};
+    struct lc_kyber_x448_sk s = {0};
+    struct lc_rng_ctx *rng = NULL;
+    uint8_t *k, *x; size_t kl, xl;
+    /* A local library DRBG allows fallible OS entropy and test injection without
+     * replacing leancrypto's process-global RNG used by encapsulation. */
+    int ret = lc_drbg_hash_alloc(&rng);
+    if (ret) goto done;
+    ret = lc_rng_seed(rng, seed, 64, (const uint8_t *)"innernet hybrid identity", 24);
+    if (ret) goto done;
+    ret = lc_kyber_x448_keypair(&p, &s, rng, LC_KYBER_1024);
+    if (ret) goto done;
+    ret = export_public(pk, xpk, &p);
+    if (ret) goto done;
+    ret = lc_kyber_x448_sk_ptr(&k, &kl, &x, &xl, &s);
+    if (ret || kl != 3168 || xl != 56) { ret = -1; goto done; }
+    memcpy(sk, k, kl); memcpy(xsk, x, xl);
+done:
+    if (rng) lc_rng_zero_free(rng);
     OPENSSL_cleanse(&s, sizeof(s));
     return ret;
 }
 
-int pq_kem_enc(uint8_t *ct, uint8_t *ss, const uint8_t *pk) {
-    struct lc_kyber_1024_pk p;
-    struct lc_kyber_1024_ct c;
-    struct lc_kyber_1024_ss s;
-    memcpy(p.pk, pk, sizeof(p));
-    int ret = lc_kyber_1024_enc(&c, &s, &p);
-    if (!ret) { memcpy(ct, c.ct, sizeof(c)); memcpy(ss, s.ss, sizeof(s)); }
+int pq_hybrid_public(uint8_t *pk, uint8_t *xpk, const uint8_t *sk, const uint8_t *xsk) {
+    struct lc_kyber_x448_pk p = {0};
+    struct lc_kyber_x448_sk s = {0};
+    int ret = lc_kyber_x448_sk_load(&s, sk, 3168, xsk, 56);
+    if (!ret) ret = lc_kyber_x448_pk_from_sk(&p, &s);
+    if (!ret) ret = export_public(pk, xpk, &p);
     OPENSSL_cleanse(&s, sizeof(s));
     return ret;
 }
 
-int pq_kem_dec(uint8_t *ss, const uint8_t *ct, const uint8_t *sk) {
-    struct lc_kyber_1024_sk s;
-    struct lc_kyber_1024_ct c;
-    struct lc_kyber_1024_ss shared;
-    memcpy(s.sk, sk, sizeof(s)); memcpy(c.ct, ct, sizeof(c));
-    int ret = lc_kyber_1024_dec(&shared, &c, &s);
-    if (!ret) memcpy(ss, shared.ss, sizeof(shared));
+int pq_hybrid_enc(uint8_t *ct, uint8_t *ss, uint8_t *xss,
+                  const uint8_t *pk, const uint8_t *xpk) {
+    struct lc_kyber_x448_pk p = {0};
+    struct lc_kyber_x448_ct c = {0};
+    struct lc_kyber_x448_ss s = {0};
+    uint8_t *k, *x; size_t kl, xl;
+    int ret = lc_kyber_x448_pk_load(&p, pk, 1568, xpk, 56);
+    if (!ret) ret = lc_kyber_x448_enc(&c, &s, &p);
+    if (!ret) ret = export_shared(ss, xss, &s);
+    if (!ret) {
+        ret = lc_kyber_x448_ct_ptr(&k, &kl, &x, &xl, &c);
+        if (ret || kl != 1568 || xl != 56) ret = -1;
+        else { memcpy(ct, k, kl); memcpy(ct + 1568, x, xl); }
+    }
+    OPENSSL_cleanse(&s, sizeof(s));
+    return ret;
+}
+
+int pq_hybrid_dec(uint8_t *ss, uint8_t *xss, const uint8_t *ct,
+                  const uint8_t *sk, const uint8_t *xsk) {
+    struct lc_kyber_x448_sk s = {0};
+    struct lc_kyber_x448_ct c = {0};
+    struct lc_kyber_x448_ss shared = {0};
+    int ret = lc_kyber_x448_sk_load(&s, sk, 3168, xsk, 56);
+    if (!ret) ret = lc_kyber_x448_ct_load(&c, ct, 1568, ct + 1568, 56);
+    if (!ret) ret = lc_kyber_x448_dec(&shared, &c, &s);
+    if (!ret) ret = export_shared(ss, xss, &shared);
     OPENSSL_cleanse(&s, sizeof(s)); OPENSSL_cleanse(&shared, sizeof(shared));
     return ret;
 }
 
-int pq_x448_public(uint8_t *pk, const uint8_t *sk) {
-    struct lc_x448_sk s;
-    const struct lc_x448_pk base = { .pk = {5} }; /* RFC 7748 base point. */
-    struct lc_x448_ss p;
-    memcpy(s.sk, sk, sizeof(s));
-    int ret = lc_x448_ss(&p, &base, &s);
-    if (!ret) memcpy(pk, p.ss, sizeof(p));
-    OPENSSL_cleanse(&s, sizeof(s));
-    return ret;
-}
-
-int pq_x448(uint8_t *out, const uint8_t *pk, const uint8_t *sk) {
-    struct lc_x448_sk s;
-    struct lc_x448_pk p;
-    struct lc_x448_ss shared;
-    memcpy(s.sk, sk, sizeof(s)); memcpy(p.pk, pk, sizeof(p));
-    int ret = lc_x448_ss(&shared, &p, &s);
-    if (!ret) memcpy(out, shared.ss, sizeof(shared));
-    OPENSSL_cleanse(&s, sizeof(s)); OPENSSL_cleanse(&shared, sizeof(shared));
-    return ret;
+/* Reject low-order public points at registration, without consuming entropy.
+ * This public validation scalar is never an identity or exchange secret. */
+int pq_x448_validate(const uint8_t *pk) {
+    const uint8_t scalar[56] = {5}, zero[56] = {0};
+    uint8_t out[56]; size_t len = sizeof(out);
+    EVP_PKEY *private = EVP_PKEY_new_raw_private_key_ex(NULL, "X448", NULL, scalar, 56);
+    EVP_PKEY *public = EVP_PKEY_new_raw_public_key_ex(NULL, "X448", NULL, pk, 56);
+    EVP_PKEY_CTX *ctx = private ? EVP_PKEY_CTX_new_from_pkey(NULL, private, NULL) : NULL;
+    int ok = ctx && public && EVP_PKEY_derive_init(ctx) > 0 &&
+        EVP_PKEY_derive_set_peer(ctx, public) > 0 && EVP_PKEY_derive(ctx, out, &len) > 0 &&
+        len == 56 && CRYPTO_memcmp(out, zero, 56);
+    OPENSSL_cleanse(out, sizeof(out));
+    EVP_PKEY_CTX_free(ctx); EVP_PKEY_free(private); EVP_PKEY_free(public);
+    return ok ? 0 : -1;
 }
 
 int pq_hash(uint8_t *out, const uint8_t *data, size_t len) {

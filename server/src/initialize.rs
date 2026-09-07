@@ -12,7 +12,7 @@ use innernet_shared::{
     prompts, CidrContents, Endpoint, IpNetExt, PeerContents, PERSISTENT_KEEPALIVE_INTERVAL_SECS,
 };
 use ipnet::IpNet;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use std::net::{IpAddr, SocketAddr};
 use wireguard_control::KeyPair;
 
@@ -22,10 +22,7 @@ fn create_database<P: AsRef<Path>>(
     let conn = Connection::open(&database_path)?;
     conn.pragma_update(None, "foreign_keys", 1)?;
     // TODO(strohel): set stricter permissions on the db file?
-    conn.execute(db::peer::CREATE_TABLE_SQL, params![])?;
-    conn.execute(db::association::CREATE_TABLE_SQL, params![])?;
-    conn.execute(db::cidr::CREATE_TABLE_SQL, params![])?;
-    conn.pragma_update(None, "user_version", db::CURRENT_VERSION)?;
+    db::create(&conn)?;
     log::debug!("set database version to db::CURRENT_VERSION");
 
     Ok(conn)
@@ -86,7 +83,7 @@ fn populate_database(conn: &Connection, db_init_data: DbInitData) -> Result<(), 
     )
     .map_err(|_| anyhow!("failed to create innernet-server CIDR"))?;
 
-    let _me = DatabasePeer::create(
+    let me = DatabasePeer::create(
         conn,
         PeerContents {
             name: SERVER_NAME.parse().map_err(|e: &str| anyhow!(e))?,
@@ -103,6 +100,8 @@ fn populate_database(conn: &Connection, db_init_data: DbInitData) -> Result<(), 
         },
     )
     .map_err(|_| anyhow!("failed to create innernet peer."))?;
+
+    conn.execute("UPDATE peers SET is_server = 1 WHERE id = ?1", [me.id])?;
 
     Ok(())
 }

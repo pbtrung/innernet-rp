@@ -21,12 +21,27 @@ pub async fn routes(
 ) -> Result<Response<Body>, ServerError> {
     match (req.method(), components.pop_front().as_deref()) {
         (&Method::GET, Some("state")) => {
+            if !components.is_empty() {
+                return Err(ServerError::NotFound);
+            }
             if !session.user_capable() {
                 return Err(ServerError::Unauthorized);
             }
-            handlers::state(session).await
+            if req.uri().query().is_some() {
+                super::pq::state(req, session).await
+            } else {
+                handlers::state(session).await
+            }
         },
-        (&Method::GET, Some("capabilities")) => handlers::capabilities().await,
+        (&Method::GET, Some("capabilities")) if components.is_empty() => {
+            handlers::capabilities(session).await
+        },
+        (&Method::PUT, Some("pq-keys")) if components.is_empty() => {
+            super::pq::register(req, session).await
+        },
+        (&Method::PUT, Some("pq-handshake")) if components.len() == 1 => {
+            super::pq::handshake(req, session, &components[0]).await
+        },
         (&Method::POST, Some("redeem")) => {
             if !session.redeemable() {
                 return Err(ServerError::Unauthorized);
@@ -75,9 +90,16 @@ mod handlers {
         json_response(State { peers, cidrs })
     }
 
-    pub async fn capabilities() -> Result<Response<Body>, ServerError> {
+    pub async fn capabilities(session: Session) -> Result<Response<Body>, ServerError> {
         let capabilities = ServerCapabilities {
             unspecified_ip_in_override_endpoint: true,
+            pq_psk_versions: if session.context.pq.is_some()
+                && crate::db::pq::ready(&session.context.db.lock())?
+            {
+                vec![1]
+            } else {
+                vec![]
+            },
         };
 
         json_response(capabilities)

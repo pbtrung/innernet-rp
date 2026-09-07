@@ -63,13 +63,22 @@ The native interop executable must run on the target (native/VM, or explicitly
 configured userspace emulation); it is not a host-side proof. aarch64 execution
 and non-Linux packaging remain M8 acceptance work.
 
-## M0 crypto and fixture evidence
+## Crypto and fixture evidence
 
-leancrypto provides standalone ML-KEM-1024, X448, SHA3-256, HMAC and HKDF.
-Initialize with `LC_INIT_NON_PQC_ENABLED` to permit classical X448; without
-it the library returns unsupported. The installed library does not export
-the header-declared X448 public-key convenience function, so public keys
-are derived using X448 and RFC 7748's base point 5.
+M0 (`c2fe868`) originally tested standalone primitives. The requested follow-up
+adopts `lc_kyber_x448_keypair/enc/dec` with `LC_KYBER_1024` and checked
+load/pointer/public-key recovery APIs. Initialize with `LC_INIT_NON_PQC_ENABLED`
+for classical X448. Key generation seeds a local library Hash-DRBG from 64
+bytes of fallible OS entropy; encapsulation uses leancrypto's seeded RNG and
+fresh ephemeral X448 key. No process-global test RNG override is installed.
+
+The combined API returns raw ML-KEM/X448 shared-secret components, which retain
+the protocol's HKDF-SHA3-256 combiner, operator input, and confirmation labels.
+The optional KMAC `*_kdf` APIs are not selected. See the
+[leancrypto 1.8.0 hybrid implementation](https://github.com/smuellerDD/leancrypto/blob/v1.8.0/ml-kem/src/kyber_x448_kem.c).
+This explicit pre-release wire revision appends ephemeral X448 to ciphertext
+and updates all transcript/signature vectors; old 1568-byte proposals fail
+length validation. The historical M0 result record remains scoped to M0.
 
 OpenSSL provides P-521/SHA-512 with explicit RFC 6979 nonce mode, compressed
 point validation, checked scalars, raw 66-byte r/s, and low-S normalization/
@@ -84,7 +93,9 @@ tests compare every message type and both receipt directions with this oracle.
 
 `tests/fixtures/interop.c` tests both OpenSSL-to-leancrypto and leancrypto-to-
 OpenSSL ML-KEM encapsulation/decapsulation, compares seeded public/private
-encodings, and compares X448 public/shared outputs. It is compiled only by a
+encodings, and compares X448 public/shared outputs. It also constructs hybrid
+encapsulation/decapsulation independently in OpenSSL and compares both raw
+secret components with leancrypto's combined API in both directions. It is compiled only by a
 test, never into either production binary.
 
 Measured compact JSON fixtures (not HTTP framing):
@@ -92,12 +103,13 @@ Measured compact JSON fixtures (not HTTP framing):
 | Fixture | Bytes |
 | --- | ---: |
 | B, raw | 1747 |
-| T, raw | 5164 |
+| T, raw | 5220 |
 | E, raw | 156 |
 | Bundle JSON, three keys and metadata | 2455 |
-| Propose JSON | 2740 |
+| Propose JSON | 2816 |
 | Each ready/commit/installed/confirmed/abort JSON | 587 |
 | ML-KEM public key or ciphertext, base64 | 2092 |
+| Full hybrid ciphertext, base64 | 2168 |
 | Three public keys, separately base64 encoded | 2260 |
 
 M1 registration wrappers must also fit the 8192-byte cap. Tests cover cap/cap+1,
@@ -129,3 +141,46 @@ tests from future real-kernel/load assertions. Later milestones update it.
 M0 does not touch production interfaces. Its tests do not establish protected
 data traffic, management enrollment, kernel recovery, broad compatibility, or
 an external audit.
+
+## M1 — Policy, schema, and public mailbox
+
+The CLI now validates opt-in/dependent permissive options before side effects.
+Production activation still refuses until M4's management recovery and traffic
+gate are present. Tests explicitly construct a ready service; schema v3 alone
+does not advertise `pq_psk_versions: [1]`. Public server capabilities omit the
+new field when not ready, and legacy state requests retain their old shape.
+
+Schema v3 atomically migrates versions 0/1/2, persists the network ID, records
+the server role by its configured key/address, and makes peer IDs immutable
+and non-reusable. Complete public bundles register by revision CAS with a
+permanent bundle-ID registry. Partial/invalid keys fail before registration;
+retirement is explicit, with emergency retirement invalidating affected work.
+The public API stores no endpoint secrets or candidate PSKs.
+
+Signed phase writes use immediate SQLite transactions, durable duplicate
+receipts, one active exchange per pair, and compact terminal high-water rows.
+Expired preparation is committed even when the triggering late write fails.
+Committed exchanges do not expire. Peer disabling/association removal
+invalidates work transactionally; re-enabling does not resurrect that work.
+The sweep snapshots small primary keys, not all transcript bodies, and indexes
+prepare expiry separately from committed recovery.
+
+Requests are limited to 8192 streamed bytes and a five-second body deadline,
+with bounded blocking workers, caller/global token buckets, and reserved
+recovery slots/tokens. Database growth admission keeps a recovery reserve.
+`?phase=N` and `?retire=1` select admission classes before decoding and must
+match the body. Limit errors include `Retry-After`. PQ reads use a separate
+eight-worker pool. Opt-in pages contain at most 32 objects (a stricter cap than
+32 PQ records), 128 KiB of PQ content, and 1 MiB total. HMAC keyset cursors bind
+requester and visibility revision; changing authorization invalidates them.
+They expire on server restart because the signing key is process-local.
+
+`bash tests/run.sh integration` now runs native hybrid interoperability and
+15 real SQLite/API tests. They cover schema backups/reopening, rollback on
+failed migration, byte-for-byte newer-schema refusal, ID/revision overflow,
+registration CAS, phase/expiry races over separate database connections,
+lost/duplicate pages and replies, replay tombstones, invalidated sessions,
+streamed body limits/deadlines, retirement, and recovery under exhausted
+record/worker budgets. The policy unit test separately checks inert defaults.
+The coverage manifest labels this API/storage evidence, not kernel protection,
+independent client-process convergence, or old/new binary compatibility.
