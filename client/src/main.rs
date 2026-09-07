@@ -428,7 +428,7 @@ fn up(
         };
 
         for interface in interfaces {
-            fetch(
+            let result = fetch(
                 &opts.config_dir,
                 &opts.data_dir,
                 &opts.network,
@@ -437,7 +437,19 @@ fn up(
                 &interface,
                 true,
                 rosenpass_opts,
-            )?;
+            );
+            match (result, loop_interval) {
+                // In daemon mode, one interface's fetch failing for a cycle (e.g. the
+                // coordinating server being transiently unreachable - see
+                // client_core::interface::fetch's own transport-error/cache-fallback
+                // handling, which this covers the remaining gap for) shouldn't kill the
+                // whole long-running process. Log it and try again next interval instead -
+                // systemd's Restart=always (client/innernet@.service) is still there for an
+                // actual crash, but a transient hiccup shouldn't need a full process restart.
+                (Err(e), Some(_)) => log::error!("failed to fetch state for {interface}: {e}"),
+                (Err(e), None) => return Err(e),
+                (Ok(()), _) => {},
+            }
         }
 
         match loop_interval {
