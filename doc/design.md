@@ -478,11 +478,34 @@ feature:
     `Endpoint` when known (omitted, not defaulted to anything, when a peer
     has none yet). Disabled and not-yet-redeemed peers, and the exported
     peer's own entry, are excluded.
-  - Never includes a Rosenpass field or PSK — an exported peer is, by
-    construction, permissive-only (§5.8). The `require_rosenpass`
-    "advisory policy bit" floated below was never actually built in this
-    implementation (M1–M8's code has no such field), so there's no check to
-    add here; the README documents the operational guidance instead.
+  - Never includes a Rosenpass field — an exported peer is, by construction,
+    permissive-only (§5.8) for every *other* peer's link to it. The
+    `require_rosenpass` "advisory policy bit" floated below was never
+    actually built in this implementation (M1–M8's code has no such field),
+    so there's no check to add here; the README documents the operational
+    guidance instead.
+  - **Does include a static preshared key, but only for one link.** A
+    freshly generated PSK (`wireguard_control::Key::generate_preshared`) is
+    always attached to the exported peer's `[Peer]` block for the admin
+    peer that ran the export command — the same protocol-level PSK field
+    Rosenpass itself uses, just manually provisioned instead of
+    continuously re-derived. This is deliberately *not* mesh-wide: the PSK
+    is generated and applied entirely locally (persisted at
+    `<data_dir>/exported-psks/<interface>.toml`, keyed by the exported
+    peer's public key, via `shared::wg_export::save_exported_psk`/
+    `get_exported_psk`/`apply_exported_psks`) and never sent to or read from
+    the coordination server — a PSK is exactly as sensitive as a private
+    key, so the same "never touches the server" property this design
+    already relies on for the exported private key applies here too. That
+    means it can only ever protect the *one* link this peer's own device
+    has to the exported peer; every other peer's link to it remains plain
+    WireGuard with no PSK at all, since there's no channel here to
+    distribute this secret anywhere else. Applied on every `fetch()` as its
+    own follow-up `DeviceUpdate` (`client_core::interface::fetch`), the same
+    non-disruptive pattern `rosenpass::apply_psks` uses, and independent of
+    whether Rosenpass is enabled at all — this is a plain WireGuard feature.
+    `export-peer-config` re-embeds the same stored PSK unchanged on refresh
+    (never regenerated, for the same reason the private key isn't).
 - **Staleness is a first-class limitation, stated plainly, not an edge
   case.** Both the CLI's log output (at export and at refresh time) and the
   exported file's own header comment say this is a point-in-time snapshot
@@ -555,7 +578,19 @@ feature:
   generated it by design (handed to a phone) — it should get the same
   `0o600`/owner-only file handling as `InterfaceConfig`, a loud CLI warning
   about the exposure, and no QR-to-image-file path by default (terminal
-  rendering only) to reduce the chance of an accidental durable copy.
+  rendering only) to reduce the chance of an accidental durable copy. The
+  same is true of the static preshared key that link now gets (§5.10): it's
+  a plaintext secret both in the exported `.conf` and in this peer's own
+  local `<data_dir>/exported-psks/<interface>.toml`, and both are `0o600`.
+- **Even a static PSK is worth having, despite never rotating.** Unlike a
+  live Rosenpass link (re-exchanged continuously, so a single compromised
+  exchange doesn't compromise future sessions), this one is fixed for the
+  life of the exported config. That's a real limitation, not a rotation
+  bug: if it's ever compromised, the fix is the same as for the private key
+  it sits next to — regenerate and redistribute the whole exported file.
+  It's still worth doing, since it protects against harvest-now/decrypt-later
+  on that one link exactly as well as Rosenpass's own interim PSK does,
+  for as long as the file itself stays uncompromised.
 - **Testing plan** (detailed per-milestone in milestones.md):
   server-side unit tests for schema/serialization back-compat and
   CIDR-scoped visibility of the new fields (extending

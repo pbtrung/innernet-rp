@@ -12,7 +12,7 @@ use colored::{ColoredString, Colorize};
 use innernet_shared::{
     get_local_addrs, update_hosts_file,
     wg::{self, DeviceExt as _},
-    Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, RosenpassOpts, State,
+    wg_export, Endpoint, Peer, PeerChange, PeerDiff, RedeemContents, RosenpassOpts, State,
     REDEEM_TRANSITION_WAIT,
 };
 use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
@@ -275,6 +275,16 @@ pub fn fetch(
     } else {
         log::info!("{}", "peers are already up to date".green());
     }
+
+    // Independent of Rosenpass entirely (a plain WireGuard PSK feature) - reapplies whatever
+    // manual preshared keys `add-peer --export-wg-conf`/`export-peer-config` have saved locally
+    // for this interface, since the main diff/update above has no notion of them at all.
+    if let Err(e) =
+        wg_export::apply_exported_psks(interface, network_opts.backend, data_dir, &peers)
+    {
+        log::warn!("failed to apply exported peer preshared keys: {e}");
+    }
+
     let interface_updated_time = Instant::now();
 
     store

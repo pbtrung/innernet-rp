@@ -7,10 +7,17 @@
 //! [`render_wg_quick_conf`]'s output header and [`parse_exported_interface`] (used to refresh an
 //! already-exported file without rotating its keys) for how that limitation is surfaced.
 
-use crate::{chmod, Error, Peer, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
+use crate::{chmod, ensure_dirs_exist, Error, Peer, PERSISTENT_KEEPALIVE_INTERVAL_SECS};
 use anyhow::{anyhow, Context as _};
 use ipnet::IpNet;
-use std::{fmt::Write as _, fs::OpenOptions, io::Write as _, path::Path};
+use std::{
+    collections::HashMap,
+    fmt::Write as _,
+    fs::OpenOptions,
+    io::Write as _,
+    path::{Path, PathBuf},
+};
+use wireguard_control::{Backend, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
 
 /// Renders a `wg-quick` config for a peer identified by `private_key_base64`/`address`, with one
 /// `[Peer]` block per entry in `peers` (skipping disabled/not-yet-redeemed peers and the peer
@@ -18,10 +25,17 @@ use std::{fmt::Write as _, fs::OpenOptions, io::Write as _, path::Path};
 ///
 /// `peers` is expected to be the same already-fetched peer list a normal `add-peer`/
 /// `export-peer-config` invocation already has in hand — no separate server round trip.
+///
+/// `link_psk`, if given, is `(the exporting admin peer's own public key, a preshared key)`: the
+/// `[Peer]` block matching that public key (i.e. the admin peer, from this exported peer's point
+/// of view) gets a `PresharedKey` line. This is the *only* link this mechanism protects — see
+/// [`apply_exported_psks`] for why, and doc/design.md 5.10 for the full rationale. Every other
+/// `[Peer]` block is unaffected, exactly as before.
 pub fn render_wg_quick_conf(
     private_key_base64: &str,
     address: IpNet,
     peers: &[Peer],
+    link_psk: Option<(&str, &Key)>,
 ) -> Result<String, Error> {
     let our_public_key = wireguard_control::Key::from_base64(private_key_base64)
         .map_err(|e| anyhow!("invalid private key: {e}"))?
@@ -62,6 +76,11 @@ pub fn render_wg_quick_conf(
         writeln!(out, "PublicKey = {}", peer.public_key)?;
         let prefix = if peer.ip.is_ipv4() { 32 } else { 128 };
         writeln!(out, "AllowedIPs = {}/{prefix}", peer.ip)?;
+        if let Some((admin_public_key, psk)) = link_psk {
+            if peer.public_key == admin_public_key {
+                writeln!(out, "PresharedKey = {}", psk.to_base64())?;
+            }
+        }
         if let Some(endpoint) = &peer.endpoint {
             writeln!(out, "Endpoint = {endpoint}")?;
         }
@@ -129,6 +148,136 @@ pub fn write_exported_conf(path: &Path, contents: &str) -> Result<(), Error> {
     chmod(&file, 0o600).with_context(|| format!("failed to set permissions on {path:?}"))?;
     file.write_all(contents.as_bytes())
         .with_context(|| format!("failed to write exported config to {path:?}"))?;
+    Ok(())
+}
+
+/// Local-only, per-interface record of manually-generated WireGuard preshared keys protecting
+/// the link between this peer and one or more statically-exported, non-innernet peers (a phone
+/// can never run Rosenpass, so it can never get a PSK from that mechanism at all — see
+/// doc/design.md 5.10). Keyed by the *exported* peer's WireGuard public key.
+///
+/// Deliberately never sent to or read from the coordination server: a PSK is exactly as
+/// sensitive as a private key, and this codebase's rule that a private key never touches the
+/// server (the whole reason `export-peer-config` re-derives from a locally-held file rather than
+/// a server-side lookup) applies just as much here.
+fn exported_psks_path(data_dir: &Path, interface: &InterfaceName) -> PathBuf {
+    data_dir
+        .join("exported-psks")
+        .join(format!("{interface}.toml"))
+}
+
+fn read_exported_psks(
+    data_dir: &Path,
+    interface: &InterfaceName,
+) -> Result<HashMap<String, String>, Error> {
+    let path = exported_psks_path(data_dir, interface);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            toml::from_str(&contents).with_context(|| format!("failed to parse {path:?}"))
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(e).with_context(|| format!("failed to read {path:?}")),
+    }
+}
+
+fn write_exported_psks(
+    data_dir: &Path,
+    interface: &InterfaceName,
+    psks: &HashMap<String, String>,
+) -> Result<(), Error> {
+    let path = exported_psks_path(data_dir, interface);
+    if let Some(dir) = path.parent() {
+        ensure_dirs_exist(&[dir])?;
+    }
+    let contents = toml::to_string(psks).context("failed to serialize exported peer PSKs")?;
+    write_exported_conf(&path, &contents)
+}
+
+/// Looks up a previously-saved preshared key protecting the link to `exported_peer_public_key`
+/// (a peer created via `add-peer --export-wg-conf`), if any — `None` for a config exported
+/// before this existed, or one that was never linked this way.
+pub fn get_exported_psk(
+    data_dir: &Path,
+    interface: &InterfaceName,
+    exported_peer_public_key: &str,
+) -> Result<Option<Key>, Error> {
+    let psks = read_exported_psks(data_dir, interface)?;
+    match psks.get(exported_peer_public_key) {
+        Some(b64) => Ok(Some(Key::from_base64(b64).map_err(|e| {
+            anyhow!("stored preshared key for exported peer isn't valid: {e}")
+        })?)),
+        None => Ok(None),
+    }
+}
+
+/// Persists a preshared key protecting the link between this peer and
+/// `exported_peer_public_key` (see [`get_exported_psk`]), so it survives across `innernet`
+/// invocations: reapplied on every `fetch()` (see [`apply_exported_psks`]) and re-embedded,
+/// unchanged, on every `export-peer-config` refresh (never regenerated — a fresh PSK on refresh
+/// would silently break the already-deployed exported peer's tunnel, exactly like rotating its
+/// private key would).
+pub fn save_exported_psk(
+    data_dir: &Path,
+    interface: &InterfaceName,
+    exported_peer_public_key: &str,
+    psk: &Key,
+) -> Result<(), Error> {
+    let mut psks = read_exported_psks(data_dir, interface)?;
+    psks.insert(exported_peer_public_key.to_string(), psk.to_base64());
+    write_exported_psks(data_dir, interface, &psks)
+}
+
+/// Applies every locally-saved exported-peer preshared key (see [`save_exported_psk`]) to the
+/// live WireGuard interface, as its own follow-up `DeviceUpdate` after the main peer diff — same
+/// non-disruptive pattern as `rosenpass::apply_psks` (wireguard-control merges peer settings onto
+/// the existing peer rather than replacing it). A no-op if no exported peer has ever been linked
+/// this way. Independent of Rosenpass entirely — a plain WireGuard PSK feature, so this runs
+/// regardless of whether `--enable-rosenpass` is set.
+///
+/// This only ever protects the link between *this* peer (the one that ran
+/// `add-peer --export-wg-conf`) and the exported peer — every other peer's link to that exported
+/// peer remains plain WireGuard, since there's no mechanism here to distribute this secret PSK
+/// to any peer other than the one that generated it (matching the same "never touches the
+/// server" constraint noted above). For a network with Rosenpass enabled, this means an exported
+/// peer still needs `--rosenpass-permissive` for connectivity from *other* peers exactly as
+/// documented in the README already — this mechanism only ever improves the one link it applies
+/// to, from "no PSK at all" to a real (if static, non-rotating) preshared key.
+pub fn apply_exported_psks(
+    interface: &InterfaceName,
+    backend: Backend,
+    data_dir: &Path,
+    peers: &[Peer],
+) -> Result<(), Error> {
+    let psks = read_exported_psks(data_dir, interface)?;
+    if psks.is_empty() {
+        return Ok(());
+    }
+
+    let mut builders = Vec::new();
+    for peer in peers {
+        let Some(psk_b64) = psks.get(&peer.public_key) else {
+            continue;
+        };
+        let Ok(psk) = Key::from_base64(psk_b64) else {
+            log::warn!(
+                "stored preshared key for exported peer {} isn't valid, skipping",
+                peer.id
+            );
+            continue;
+        };
+        let Ok(wg_pubkey) = Key::from_base64(&peer.public_key) else {
+            continue;
+        };
+        builders.push(PeerConfigBuilder::new(&wg_pubkey).set_preshared_key(psk));
+    }
+
+    if !builders.is_empty() {
+        DeviceUpdate::new()
+            .add_peers(&builders)
+            .apply(interface, backend)
+            .with_context(|| interface.to_string())?;
+    }
+
     Ok(())
 }
 
@@ -206,7 +355,8 @@ mod tests {
             ),
         ];
 
-        let rendered = render_wg_quick_conf(&keypair.private.to_base64(), address, &peers).unwrap();
+        let rendered =
+            render_wg_quick_conf(&keypair.private.to_base64(), address, &peers, None).unwrap();
 
         assert!(rendered.contains("[Interface]"));
         assert!(rendered.contains(&format!("PrivateKey = {}", keypair.private.to_base64())));
@@ -237,7 +387,8 @@ mod tests {
             true,
         )];
 
-        let rendered = render_wg_quick_conf(&keypair.private.to_base64(), address, &peers).unwrap();
+        let rendered =
+            render_wg_quick_conf(&keypair.private.to_base64(), address, &peers, None).unwrap();
         assert!(rendered.contains("[Peer]"));
         assert!(!rendered.contains("Endpoint ="));
     }
@@ -246,7 +397,8 @@ mod tests {
     fn test_parse_exported_interface_roundtrip() {
         let keypair = KeyPair::generate();
         let address: IpNet = "10.80.0.5/32".parse().unwrap();
-        let rendered = render_wg_quick_conf(&keypair.private.to_base64(), address, &[]).unwrap();
+        let rendered =
+            render_wg_quick_conf(&keypair.private.to_base64(), address, &[], None).unwrap();
 
         let (parsed_key, parsed_addr) = parse_exported_interface(&rendered).unwrap();
         assert_eq!(parsed_key, keypair.private.to_base64());
@@ -276,5 +428,142 @@ mod tests {
              file in this codebase holding a WireGuard private key"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "test contents");
+    }
+
+    #[test]
+    fn test_render_attaches_psk_only_to_matching_peer() {
+        let keypair = KeyPair::generate();
+        let address: IpNet = "10.80.0.5/32".parse().unwrap();
+        let admin_keypair = KeyPair::generate();
+        let admin_public_key = admin_keypair.public.to_base64();
+        let psk = Key::generate_preshared();
+
+        let peers = vec![
+            test_peer(
+                2,
+                "admin",
+                "10.80.0.6",
+                &admin_public_key,
+                Some("1.2.3.4:51820"),
+                false,
+                true,
+            ),
+            test_peer(
+                3,
+                "other-peer",
+                "10.80.0.7",
+                "peer3key",
+                Some("5.6.7.8:51820"),
+                false,
+                true,
+            ),
+        ];
+
+        let rendered = render_wg_quick_conf(
+            &keypair.private.to_base64(),
+            address,
+            &peers,
+            Some((&admin_public_key, &psk)),
+        )
+        .unwrap();
+
+        assert_eq!(rendered.matches("PresharedKey").count(), 1);
+        // The PresharedKey line must land in the admin's own [Peer] block, not anywhere else -
+        // check it appears between "admin"'s PublicKey line and the next [Peer] section.
+        let admin_block_start = rendered.find(&admin_public_key).unwrap();
+        let psk_pos = rendered.find("PresharedKey").unwrap();
+        let other_peer_block_start = rendered.find("peer3key").unwrap();
+        assert!(admin_block_start < psk_pos && psk_pos < other_peer_block_start);
+        assert!(rendered.contains(&format!("PresharedKey = {}", psk.to_base64())));
+    }
+
+    #[test]
+    fn test_exported_psk_roundtrip_and_default_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let interface: InterfaceName = "evilcorp".parse().unwrap();
+        let public_key = KeyPair::generate().public.to_base64();
+
+        assert!(get_exported_psk(dir.path(), &interface, &public_key)
+            .unwrap()
+            .is_none());
+
+        let psk = Key::generate_preshared();
+        save_exported_psk(dir.path(), &interface, &public_key, &psk).unwrap();
+
+        let read_back = get_exported_psk(dir.path(), &interface, &public_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_back.to_base64(), psk.to_base64());
+
+        // A different peer's public key must not see this one's PSK.
+        let other_public_key = KeyPair::generate().public.to_base64();
+        assert!(get_exported_psk(dir.path(), &interface, &other_public_key)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_exported_psks_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let interface: InterfaceName = "evilcorp".parse().unwrap();
+        let public_key = KeyPair::generate().public.to_base64();
+
+        save_exported_psk(
+            dir.path(),
+            &interface,
+            &public_key,
+            &Key::generate_preshared(),
+        )
+        .unwrap();
+
+        let path = exported_psks_path(dir.path(), &interface);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "exported-peer PSK store holds secret preshared keys and must be owner-only"
+        );
+    }
+
+    #[test]
+    fn test_save_exported_psk_overwrites_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let interface: InterfaceName = "evilcorp".parse().unwrap();
+        let public_key = KeyPair::generate().public.to_base64();
+
+        save_exported_psk(
+            dir.path(),
+            &interface,
+            &public_key,
+            &Key::generate_preshared(),
+        )
+        .unwrap();
+        let second = Key::generate_preshared();
+        save_exported_psk(dir.path(), &interface, &public_key, &second).unwrap();
+
+        let read_back = get_exported_psk(dir.path(), &interface, &public_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read_back.to_base64(), second.to_base64());
+    }
+
+    #[test]
+    fn test_apply_exported_psks_is_noop_with_no_saved_psks() {
+        let dir = tempfile::tempdir().unwrap();
+        let interface: InterfaceName = "evilcorp".parse().unwrap();
+
+        // No rosenpass/wireguard interface exists in this test environment - if this weren't a
+        // no-op, it would fail trying to reach a real device. Confirms the empty-map fast path.
+        let peers = vec![test_peer(
+            1,
+            "peer",
+            "10.80.0.6",
+            "peer1key",
+            None,
+            false,
+            true,
+        )];
+        apply_exported_psks(&interface, Backend::Userspace, dir.path(), &peers).unwrap();
     }
 }

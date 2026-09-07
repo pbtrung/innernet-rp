@@ -372,14 +372,42 @@ otherwise (design.md §5.10).
   field to check, so no refusal logic was added here either. The README
   documents the operational guidance instead (a network with any exported
   peers needs `--rosenpass-permissive` if Rosenpass is enabled).
+- **Static preshared key for the admin's own link, added after the initial
+  implementation above** (design.md §5.10): since a phone can never run
+  Rosenpass and so can never get a PSK from that mechanism, `add-peer
+  --export-wg-conf` now also generates a random PSK
+  (`wireguard_control::Key::generate_preshared`) and attaches it to the
+  exported peer's `[Peer]` block for the admin peer specifically — the same
+  WireGuard PSK field Rosenpass itself uses, just manually provisioned. This
+  is deliberately scoped to *one* link, not the whole mesh: the PSK is
+  generated and persisted entirely locally
+  (`shared::wg_export::save_exported_psk`/`get_exported_psk`, at
+  `<data_dir>/exported-psks/<interface>.toml`, `0o600`) and never touches
+  the coordination server — same "a PSK is exactly as sensitive as a
+  private key, and private keys never touch the server" reasoning already
+  used elsewhere in this design — so there's no channel to distribute it to
+  any *other* peer. `client_core::interface::fetch` applies it as its own
+  follow-up `DeviceUpdate` via the new `wg_export::apply_exported_psks`
+  (same non-disruptive pattern as `rosenpass::apply_psks`), independent of
+  whether Rosenpass is enabled at all. `export-peer-config` re-embeds the
+  same stored PSK unchanged on refresh, never regenerating it — exactly
+  like the private key it sits next to.
+  Covered by unit tests in `shared/src/wg_export.rs`: the `PresharedKey`
+  line lands only in the correct peer's block, the local store round-trips
+  and defaults to `None` for pre-existing exports, overwrites cleanly on
+  re-save, is `0o600`, and `apply_exported_psks` is a no-op when nothing's
+  been saved.
 - **Not done**: `--export-wg-conf-qr` (rendering a scannable QR code to the
   terminal) was not implemented - out of scope for this pass, left as a
   clearly separate follow-up rather than attempted half-done. Round-tripping
-  the exported `.conf` through a real `wg-quick`/stock WireGuard client in
-  `docker-tests/` (or an actual phone) was not done - same real-interface
-  gap noted throughout M4-M7.
+  the exported `.conf` (private key *and* now the static PSK) through a
+  real `wg-quick`/stock WireGuard client in `docker-tests/` (or an actual
+  phone) was not done - same real-interface gap noted throughout M4-M7,
+  though M4-M6's equivalent gap for the Rosenpass-derived PSK mechanism has
+  since been closed there.
 
 **Acceptance**: partially met — an exported config renders correctly (unit-
-tested and manually verified) and refreshes in place without rotating keys;
-actually joining a real mesh with it (docker-tests or a real device) has not
-been verified.
+tested and manually verified), refreshes in place without rotating keys or
+the newly-added static PSK, and now gives the admin's own link to the
+exported peer real PSK protection instead of none at all; actually joining
+a real mesh with it (docker-tests or a real device) has not been verified.

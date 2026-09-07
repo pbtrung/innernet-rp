@@ -95,6 +95,16 @@ Because such a peer can never run [Rosenpass](#post-quantum-key-exchange-with-ro
 (there's no such client for mobile), a network with any exported peers needs
 `--rosenpass-permissive` if Rosenpass is enabled at all.
 
+As a partial substitute, `--export-wg-conf` automatically generates a static
+preshared key and attaches it to the exported peer's link back to *this*
+admin peer specifically — giving that one link real (if non-rotating)
+preshared-key protection instead of none at all. It's necessarily one-sided:
+every *other* peer's link to the exported device still has no PSK, since
+there's no mechanism to hand this secret to any peer other than the one that
+generated it. The key is stored locally at
+`<data-dir>/exported-psks/<interface>.toml` (`0600`, never sent to the
+server) and is preserved unchanged across `export-peer-config` refreshes.
+
 ### Adding Associations between CIDRs
 
 In order for peers from one CIDR to be able to contact peers in another CIDR, those two CIDRs must be "associated" with each other.

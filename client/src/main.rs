@@ -587,8 +587,11 @@ fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), 
 }
 
 fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let InterfaceConfig {
+        server,
+        interface: admin_interface_info,
+        ..
+    } = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     let rest_client = RestClient::new(&server);
 
     log::info!("Fetching CIDRs");
@@ -606,12 +609,25 @@ fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Re
 
         if sub_opts.export_wg_conf {
             let interface_info = &invitation.interface_config().interface;
+            // A phone can never run Rosenpass, so it can never get a PSK that way (see
+            // doc/design.md 5.10) - give it a static one instead, protecting at least its link
+            // back to this admin peer. See wg_export::apply_exported_psks for why this is the
+            // only link it protects, and why that's still worthwhile.
+            let psk = wireguard_control::Key::generate_preshared();
+            let admin_public_key = admin_interface_info.public_key()?;
+            let exported_public_key =
+                wireguard_control::Key::from_base64(&interface_info.private_key)
+                    .map_err(|e| anyhow::anyhow!("invalid generated private key: {e}"))?
+                    .get_public()
+                    .to_base64();
             let rendered = wg_export::render_wg_quick_conf(
                 &interface_info.private_key,
                 interface_info.address,
                 &peers,
+                Some((&admin_public_key, &psk)),
             )?;
             wg_export::write_exported_conf(std::path::Path::new(&target_path), &rendered)?;
+            wg_export::save_exported_psk(&opts.data_dir, interface, &exported_public_key, &psk)?;
             log::info!(
                 "Exported a standalone wg-quick config to {} for a non-innernet WireGuard \
                  client. {}",
@@ -635,17 +651,34 @@ fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Re
 /// from the current peer list, without generating a new keypair or touching the `[Interface]`
 /// section — the exported device keeps using the same identity/keys. See doc/design.md 5.10.
 fn export_peer_config(interface: &InterfaceName, opts: &Opts, path: &Path) -> Result<(), Error> {
-    let InterfaceConfig { server, .. } =
-        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let InterfaceConfig {
+        server,
+        interface: admin_interface_info,
+        ..
+    } = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     let rest_client = RestClient::new(&server);
 
     let existing = std::fs::read_to_string(path).with_path(path)?;
     let (private_key, address) = wg_export::parse_exported_interface(&existing)?;
+    let exported_public_key = wireguard_control::Key::from_base64(&private_key)
+        .map_err(|e| anyhow::anyhow!("invalid PrivateKey in exported config: {e}"))?
+        .get_public()
+        .to_base64();
 
     log::info!("Fetching peers");
     let peers = rest_client.get_peers()?;
 
-    let rendered = wg_export::render_wg_quick_conf(&private_key, address, &peers)?;
+    // Re-embed whatever PSK this exported peer was originally given (if any - configs exported
+    // before this existed have none), unchanged: refreshing must never rotate it, exactly like
+    // it never rotates the private key.
+    let admin_public_key = admin_interface_info.public_key()?;
+    let psk = wg_export::get_exported_psk(&opts.data_dir, interface, &exported_public_key)?;
+    let rendered = wg_export::render_wg_quick_conf(
+        &private_key,
+        address,
+        &peers,
+        psk.as_ref().map(|psk| (admin_public_key.as_str(), psk)),
+    )?;
     wg_export::write_exported_conf(path, &rendered)?;
 
     log::info!(
