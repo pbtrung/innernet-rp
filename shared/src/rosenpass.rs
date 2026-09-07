@@ -192,6 +192,29 @@ impl DaemonPaths {
     }
 }
 
+/// Decides, for a pair of peers, whether "our" side (`our_peer_id`) should dial the other
+/// (`peer_id`) in the Rosenpass exchange, vs. only ever listening for it.
+///
+/// The coordinating server is always peer id 1 (the very first peer any network has), and is
+/// special-cased to always be the listener, never the dialer: it's the one side of the network
+/// an operator can reliably keep online 24/7 with an easily opened, stable inbound port, while
+/// any other peer may be a NAT'd/roaming client with no stable inbound address at all — making it
+/// the far better default dialer/dialed split than the reverse. For every other pair (neither
+/// side is the server), there's no such asymmetry to exploit, so this falls back to an arbitrary
+/// but deterministic, symmetric tie-break: the lower peer ID dials the higher one. Both sides of
+/// a pair must independently reach the *same* dial/listen assignment without coordinating —
+/// configuring both sides to dial each other silently derives mismatched PSKs (verified against
+/// the real `rosenpass` binary), breaking that WireGuard link with no visible error.
+pub fn we_dial(our_peer_id: i64, peer_id: i64) -> bool {
+    if our_peer_id == 1 {
+        false
+    } else if peer_id == 1 {
+        true
+    } else {
+        our_peer_id < peer_id
+    }
+}
+
 /// One peer to include in the Rosenpass exchange daemon's config.
 #[derive(Debug, Clone)]
 pub struct RosenpassPeerConfig {
@@ -840,6 +863,26 @@ mod tests {
         assert!((0, 2, 1) >= MIN_ROSENPASS_VERSION);
         assert!((0, 3, 0) >= MIN_ROSENPASS_VERSION);
         assert!((1, 0, 0) >= MIN_ROSENPASS_VERSION);
+    }
+
+    #[test]
+    fn test_we_dial_server_is_always_listener_never_dialer() {
+        // The server (id 1) never dials, regardless of the other peer's id being higher or lower.
+        assert!(!we_dial(1, 2));
+        assert!(!we_dial(1, 50));
+    }
+
+    #[test]
+    fn test_we_dial_clients_always_dial_the_server() {
+        // Any client always dials peer id 1, regardless of its own id being higher or lower.
+        assert!(we_dial(2, 1));
+        assert!(we_dial(50, 1));
+    }
+
+    #[test]
+    fn test_we_dial_falls_back_to_lower_id_tie_break_between_two_clients() {
+        assert!(we_dial(2, 3));
+        assert!(!we_dial(3, 2));
     }
 
     #[test]

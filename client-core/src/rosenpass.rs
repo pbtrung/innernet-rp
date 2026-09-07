@@ -77,10 +77,8 @@ pub fn sync(
     // other is not merely redundant - verified against the real `rosenpass` binary, it makes
     // each side independently complete its own handshake, and the two sides derive *different*
     // (silently mismatched) preshared keys, breaking that WireGuard tunnel with no visible
-    // error. Both peers must independently reach the same dial/listen assignment without
-    // coordinating, so it's derived from something both already know: peer ID. The lower ID
-    // always dials the higher one - an arbitrary but deterministic, symmetric tie-break, in the
-    // same spirit as sorting both sides' keys for the interim PSK below.
+    // error. See `rosenpass::we_dial` for the assignment rule (server always listens, clients
+    // always dial the server, arbitrary lower-id-dials tie-break otherwise).
     let our_peer_id = self_peer.map(|p| p.id);
 
     let rest_client = RestClient::new(server);
@@ -91,7 +89,8 @@ pub fn sync(
             let hash = p.rosenpass_public_key_hash.as_deref()?;
             match ensure_cached_peer_key(&rest_client, &rosenpass_dir, p.id, hash) {
                 Ok(public_key_path) => {
-                    let we_dial = our_peer_id.is_some_and(|our_id| our_id < p.id);
+                    let we_dial =
+                        our_peer_id.is_some_and(|our_id| rosenpass::we_dial(our_id, p.id));
                     let endpoint = we_dial
                         .then(|| p.rosenpass_addr.as_ref())
                         .flatten()

@@ -106,8 +106,10 @@ fn sync(
         (peers, our_peer_id)
     };
 
-    // Same dial/listen tie-break as the client (see client_core::rosenpass::sync) - exactly one
-    // side of each pair must dial, or the two sides derive different, silently mismatched PSKs.
+    // Same dial/listen tie-break as the client (see client_core::rosenpass::sync and
+    // rosenpass::we_dial) - exactly one side of each pair must dial, or the two sides derive
+    // different, silently mismatched PSKs. As the server (always peer id 1), `we_dial` always
+    // evaluates to false here: the server never dials, only ever listens.
     let peer_configs: Vec<RosenpassPeerConfig> = peers
         .iter()
         .filter(|p| !p.is_disabled && p.public_key != our_wg_public_key)
@@ -115,7 +117,8 @@ fn sync(
             let raw_key = p.rosenpass_public_key.as_deref()?;
             match cache_peer_key(&rosenpass_dir, p.id, raw_key) {
                 Ok(public_key_path) => {
-                    let we_dial = our_peer_id.is_some_and(|our_id| our_id < p.id);
+                    let we_dial =
+                        our_peer_id.is_some_and(|our_id| rosenpass::we_dial(our_id, p.id));
                     let endpoint = we_dial
                         .then(|| p.rosenpass_addr.as_ref())
                         .flatten()

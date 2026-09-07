@@ -294,13 +294,20 @@ own `tests/integration_test.rs`, which uses exactly this asymmetric shape.
 
 The fix: for every peer pair, exactly one side must dial. Since both sides
 must independently reach the same assignment without coordinating, it's
-derived from something both already know — the lower peer ID always dials
-the higher one (an arbitrary but deterministic, symmetric tie-break, the same
-"sort, don't pick a side" principle already used for the interim PSK below).
-Implemented in `client_core::rosenpass::sync`. A regression test
-(`#[ignore]`d, requires the real binary —
-`test_two_real_peers_converge_on_identical_psk_when_only_one_dials` in
-`shared/src/rosenpass.rs`) runs two real processes end-to-end and asserts
+derived from something both already know — peer ID, via `rosenpass::we_dial`
+(`shared/src/rosenpass.rs`). The coordinating server is always peer id 1 (the
+first peer any network has) and is special-cased to always be the listener,
+never the dialer: it's the side an operator can reliably keep online 24/7
+with a stable, easily-opened inbound port, while any other peer may be a
+NAT'd/roaming client with no stable inbound address at all — so every client
+always dials the server, not the other way around. For pairs where neither
+side is the server, there's no such asymmetry to exploit, so it falls back to
+an arbitrary but deterministic, symmetric tie-break: the lower peer ID dials
+the higher one (the same "sort, don't pick a side" principle already used for
+the interim PSK below). Used from both `client_core::rosenpass::sync` and
+`server::rosenpass::sync`. A regression test (`#[ignore]`d, requires the real
+binary — `test_two_real_peers_converge_on_identical_psk_when_only_one_dials`
+in `shared/src/rosenpass.rs`) runs two real processes end-to-end and asserts
 their derived keys match, specifically to catch anyone "fixing" this back to
 a symmetric configuration because it looks more natural.
 
