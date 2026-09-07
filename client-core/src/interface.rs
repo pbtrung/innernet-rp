@@ -17,7 +17,7 @@ use innernet_shared::{
 };
 use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
 use thiserror::Error;
-use wireguard_control::{Backend, Device, DeviceUpdate, PeerConfigBuilder};
+use wireguard_control::{Backend, Device, DeviceUpdate, Key, PeerConfigBuilder};
 
 #[derive(Debug, Error)]
 pub enum RedeemInviteError {
@@ -198,6 +198,31 @@ pub fn fetch(
             network_opts,
         )
         .context(interface.to_string())?;
+
+        // The interface just came up with the coordinating server as its only peer entry, and
+        // wg::up never sets a preshared key on it - if we have one cached locally for this link
+        // (peer id 1, by this codebase's own convention - see server/src/lib.rs's
+        // DatabasePeer::get(&conn, 1)), apply it right now, before the very first `/user/state`
+        // request below, which needs this exact link to already work. Same bootstrap problem
+        // `install()` (client/src/main.rs) already works around for a brand new peer's very
+        // first connection - this covers every *later* cold start too (e.g. `down` then `up`,
+        // or a reboot): the server's own side of this PSK is never cleared by our interface
+        // going down, so a mismatch (our side reset to none, server's side still set) would
+        // otherwise silently break the handshake this very request depends on, exactly like a
+        // wrong key would - found from a real user report of `down` then `up` breaking
+        // connectivity that a fresh `install` hadn't.
+        if let Ok(Some(psk)) = wg_export::get_exported_psk(data_dir, interface, 1) {
+            if let Ok(server_key) = Key::from_base64(&config.server.public_key) {
+                if let Err(e) = DeviceUpdate::new()
+                    .add_peer(PeerConfigBuilder::new(&server_key).set_preshared_key(psk))
+                    .apply(interface, network_opts.backend)
+                {
+                    log::warn!(
+                        "failed to apply cached preshared key for the coordinating server link: {e}"
+                    );
+                }
+            }
+        }
     }
 
     log::info!(

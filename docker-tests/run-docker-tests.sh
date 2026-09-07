@@ -258,6 +258,14 @@ test_invite_baseline_psk() {
     info "Confirming connectivity still works with these preshared keys applied."
     cmd docker exec "$PEER1_CONTAINER" ping -c3 10.66.0.1
     cmd docker exec "$PEER2_CONTAINER" ping -c3 10.66.1.1
+
+    info "Confirming connectivity survives a down/up cycle (a fresh interface has no PSK on"
+    info "its coordinating-server peer entry until fetch() applies the cached one - relies on"
+    info "start-client.sh's own retry loop to bring it back up, same as a real user's daemon)."
+    cmd docker exec "$PEER1_CONTAINER" bash -c 'innernet $INNERNET_ARGS down "$INTERFACE"'
+    wait_until 30 docker exec "$PEER1_CONTAINER" ping -c1 10.66.0.1 \
+        || { info "peer1 never regained connectivity to the server after going down - the cold-start PSK bug is back."; exit 1; }
+    cmd docker exec "$PEER1_CONTAINER" ping -c3 10.66.0.1
 }
 
 test_simultaneous_redemption() {
