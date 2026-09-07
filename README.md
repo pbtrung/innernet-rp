@@ -229,31 +229,38 @@ sudo innernet up --enable-rosenpass --rosenpass-group rosenpass <interface>
 ```
 
 **Running under systemd:** `innernet@<interface>.service` and
-`innernet-server@<interface>.service` enable Rosenpass by default
-(`ROSENPASS_ARGS=--enable-rosenpass`, baked into the unit), since CLI flags
-otherwise aren't persisted anywhere `up`/`serve` read back on their own — the
-continuously running daemon loop needs them on every invocation, not just the
-one-off `install`/first `up`. To add `--rosenpass-permissive` and/or
-`--rosenpass-group <name>` on a given interface without editing either unit,
-set `ROSENPASS_EXTRA_ARGS` in the optional per-interface env file each unit
-already looks for (`EnvironmentFile=-`, so a missing file is a harmless
+`innernet-server@<interface>.service` enable Rosenpass by default, hardened
+via privilege-dropping to a `rosenpass` system group
+(`ROSENPASS_ARGS=--enable-rosenpass --rosenpass-group rosenpass`, baked into
+the unit), since CLI flags otherwise aren't persisted anywhere `up`/`serve`
+read back on their own — the continuously running daemon loop needs them on
+every invocation, not just the one-off `install`/first `up`. This requires
+the `rosenpass` group to already exist (`sudo groupadd --system rosenpass`;
+already done for you if installed via `bin/PKGBUILD`, which ships a
+`sysusers.d` config for it) — without it, the exchange daemon just fails to
+start each cycle, logged but non-fatal to the service itself.
+
+To add `--rosenpass-permissive` on a given interface without editing either
+unit, set `ROSENPASS_EXTRA_ARGS` in the optional per-interface env file each
+unit already looks for (`EnvironmentFile=-`, so a missing file is a harmless
 no-op):
 
 ```sh
 # client, interface <interface>:
-echo 'ROSENPASS_EXTRA_ARGS="--rosenpass-permissive --rosenpass-group rosenpass"' | \
+echo 'ROSENPASS_EXTRA_ARGS="--rosenpass-permissive"' | \
   sudo tee /etc/innernet/<interface>-rosenpass.env
 sudo systemctl restart innernet@<interface>
 
 # server, interface <interface>:
-echo 'ROSENPASS_EXTRA_ARGS="--rosenpass-permissive --rosenpass-group rosenpass"' | \
+echo 'ROSENPASS_EXTRA_ARGS="--rosenpass-permissive"' | \
   sudo tee /etc/innernet-server/<interface>-rosenpass.env
 sudo systemctl restart innernet-server@<interface>
 ```
 
-To disable Rosenpass entirely for one interface instead, set
-`ROSENPASS_ARGS=""` in that same file — it fully replaces the unit's default
-rather than appending to it, unlike `ROSENPASS_EXTRA_ARGS`.
+To disable Rosenpass, or use a different (or no) privilege-drop group, for
+one interface instead, set `ROSENPASS_ARGS="..."` in that same file — it
+fully replaces the unit's default rather than appending to it, unlike
+`ROSENPASS_EXTRA_ARGS`.
 
 ### Remove Network
 
