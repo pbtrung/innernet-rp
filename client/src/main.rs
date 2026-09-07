@@ -1,0 +1,1261 @@
+use crate::util::all_installed;
+use anyhow::{anyhow, bail, Error};
+use clap::{ArgAction, Parser, Subcommand};
+use colored::*;
+use dialoguer::{Confirm, Input};
+use indoc::eprintdoc;
+use innernet_client_core::{
+    data_store::DataStore,
+    interface::{fetch, redeem_invite},
+    peer::create_peer,
+    rest_client::{RestClient, RestError},
+    DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
+};
+use innernet_shared::{
+    interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, AddCidrOpts,
+    AddDeleteAssociationOpts, AddPeerOpts, Association, AssociationContents, Cidr, CidrTree,
+    DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts,
+    Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
+    OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts, ServerCapabilities,
+    WrappedIoError,
+};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
+use util::{human_duration, human_size};
+use wireguard_control::{Device, InterfaceName, PeerInfo};
+
+mod util;
+
+struct PeerState<'a> {
+    peer: &'a Peer,
+    info: Option<&'a PeerInfo>,
+}
+
+macro_rules! println_pad {
+    ($pad:expr, $($arg:tt)*) => {
+        print!("{:pad$}", "", pad = $pad);
+        println!($($arg)*);
+    }
+}
+
+#[derive(Clone, Debug, Parser)]
+#[command(name = "innernet", author, version, about)]
+struct Opts {
+    #[clap(subcommand)]
+    command: Option<Command>,
+
+    /// Verbose output, use -vv for even higher verbositude
+    #[clap(short, long, action = ArgAction::Count)]
+    verbose: u8,
+
+    #[clap(short, long, default_value = DEFAULT_CONFIG_DIR)]
+    config_dir: PathBuf,
+
+    #[clap(short, long, default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
+
+    #[clap(flatten)]
+    network: NetworkOpts,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum Command {
+    /// Install a new innernet config
+    #[clap(alias = "redeem")]
+    Install {
+        /// Path to the invitation file
+        invite: PathBuf,
+
+        /// The local WireGuard listen port
+        #[clap(long)]
+        listen_port: Option<u16>,
+
+        #[clap(flatten)]
+        hosts: HostsOpts,
+
+        #[clap(flatten)]
+        install_opts: InstallOpts,
+
+        #[clap(flatten)]
+        nat: NatOpts,
+    },
+
+    /// Enumerate all innernet connections
+    #[clap(alias = "list")]
+    Show {
+        /// One-line peer list
+        #[clap(short, long)]
+        short: bool,
+
+        /// Display peers in a tree based on the CIDRs
+        #[clap(short, long)]
+        tree: bool,
+
+        interface: Option<Interface>,
+    },
+
+    /// Bring up your local interface, and update it with latest peer list
+    Up {
+        /// Enable daemon mode i.e. keep the process running, while fetching
+        /// the latest peer list periodically
+        #[clap(short, long)]
+        daemon: bool,
+
+        /// Keep fetching the latest peer list at the specified interval in
+        /// seconds. Valid only in daemon mode
+        #[clap(long, default_value = "60")]
+        interval: u64,
+
+        #[clap(flatten)]
+        hosts: HostsOpts,
+
+        #[clap(flatten)]
+        nat: NatOpts,
+
+        interface: Option<Interface>,
+    },
+
+    /// Fetch and update your local interface with the latest peer list
+    Fetch {
+        interface: Interface,
+
+        #[clap(flatten)]
+        hosts: HostsOpts,
+
+        #[clap(flatten)]
+        nat: NatOpts,
+    },
+
+    /// Uninstall an innernet network.
+    Uninstall {
+        interface: Interface,
+
+        /// Bypass confirmation
+        #[clap(long)]
+        yes: bool,
+    },
+
+    /// Bring down the interface (equivalent to 'wg-quick down INTERFACE')
+    Down { interface: Interface },
+
+    /// Add a new peer
+    ///
+    /// By default, you'll be prompted interactively to create a peer, but you can
+    /// also specify all the options in the command, eg:
+    ///
+    /// --name 'person' --cidr 'humans' --admin false --auto-ip --save-config 'person.toml' --yes
+    AddPeer {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: AddPeerOpts,
+    },
+
+    /// Rename a peer
+    ///
+    /// By default, you'll be prompted interactively to select a peer, but you can
+    /// also specify all the options in the command, eg:
+    ///
+    /// --name 'person' --new-name 'human'
+    RenamePeer {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: RenamePeerOpts,
+    },
+
+    /// Add a new CIDR
+    AddCidr {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: AddCidrOpts,
+    },
+
+    /// Rename a CIDR
+    ///
+    /// By default, you'll be prompted interactively to select a CIDR, but you can
+    /// also specify all the options in the command, eg:
+    ///
+    /// --name 'group' --new-name 'family'
+    RenameCidr {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: RenameCidrOpts,
+    },
+
+    /// Delete a CIDR
+    DeleteCidr {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: DeleteCidrOpts,
+    },
+
+    /// List CIDRs
+    ListCidrs {
+        interface: Interface,
+
+        /// Display CIDRs in tree format
+        #[clap(short, long)]
+        tree: bool,
+    },
+
+    /// Disable an enabled peer
+    DisablePeer {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: EnableDisablePeerOpts,
+    },
+
+    /// Enable a disabled peer
+    EnablePeer {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: EnableDisablePeerOpts,
+    },
+
+    /// Add an association between CIDRs
+    AddAssociation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: AddDeleteAssociationOpts,
+    },
+
+    /// Delete an association between CIDRs
+    DeleteAssociation {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: AddDeleteAssociationOpts,
+    },
+
+    /// List existing assocations between CIDRs
+    ListAssociations { interface: Interface },
+
+    /// Set the local listen port.
+    SetListenPort {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: ListenPortOpts,
+    },
+
+    /// Override your external endpoint that the server sends to other peers
+    OverrideEndpoint {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: OverrideEndpointOpts,
+    },
+
+    /// Override the endpoint you use to connect to a particular peer
+    OverridePeerEndpoint {
+        interface: Interface,
+
+        #[clap(flatten)]
+        sub_opts: OverridePeerEndpointOpts,
+    },
+
+    /// Generate shell completion scripts
+    Completions {
+        #[clap(value_enum)]
+        shell: clap_complete::Shell,
+    },
+}
+
+fn install(
+    opts: &Opts,
+    hosts_opts: &HostsOpts,
+    install_opts: &InstallOpts,
+    nat_opts: &NatOpts,
+    invite: &Path,
+    listen_port: Option<u16>,
+) -> Result<(), Error> {
+    let mut config = InterfaceConfig::from_file(invite)?;
+    if let Some(listen_port) = listen_port {
+        config.interface.listen_port = Some(listen_port);
+    }
+
+    let interface_name = if install_opts.default_name {
+        config.interface.network_name.clone()
+    } else if let Some(ref iface) = install_opts.name {
+        iface.clone()
+    } else {
+        Input::with_theme(&*prompts::THEME)
+            .with_prompt("Interface name")
+            .default(config.interface.network_name.clone())
+            .interact()?
+    };
+
+    let interface_name = interface_name.parse()?;
+    redeem_invite(&opts.config_dir, &opts.network, &interface_name, config)?;
+
+    let mut fetch_success = false;
+    for _ in 0..3 {
+        if fetch(
+            &opts.config_dir,
+            &opts.data_dir,
+            &opts.network,
+            hosts_opts,
+            nat_opts,
+            &interface_name,
+            true,
+        )
+        .is_ok()
+        {
+            fetch_success = true;
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    if !fetch_success {
+        log::warn!(
+            "Failed to fetch peers from server, you will need to manually run the 'up' command.",
+        );
+    }
+
+    if install_opts.delete_invite
+        || Confirm::with_theme(&*prompts::THEME)
+            .wait_for_newline(true)
+            .with_prompt(format!(
+                "Delete invitation file \"{}\" now? (It's no longer needed)",
+                invite.to_string_lossy().yellow()
+            ))
+            .default(true)
+            .interact()?
+    {
+        std::fs::remove_file(invite).with_path(invite)?;
+    }
+
+    eprintdoc!(
+        "
+        {star} Done!
+
+            {interface} has been {installed}.
+
+            By default, innernet will write to your /etc/hosts file for peer name
+            resolution. To disable this behavior, use the --no-write-hosts or --write-hosts [PATH]
+            options.
+
+            See the manpage or innernet GitHub repo for more detailed instruction on managing your
+            interface and network. Have fun!
+
+    ",
+        star = "[*]".dimmed(),
+        interface = interface_name.to_string().yellow(),
+        installed = "installed".green(),
+    );
+    if cfg!(target_os = "linux") {
+        eprintdoc!(
+            "
+                It's recommended to now keep the interface automatically refreshing via systemd:
+
+                    {systemctl_enable}{interface}
+        ",
+            interface = interface_name.to_string().yellow(),
+            systemctl_enable = "systemctl enable --now innernet@".yellow(),
+        );
+    } else if cfg!(target_os = "macos") {
+        eprintdoc!("
+            It's recommended to now keep the interface automatically refreshing, which you can
+            do via a launchd script (easier macOS helpers to be added to innernet in a later version).
+
+            Ex. to run innernet in a 60s update loop:
+
+                {daemon_mode} {interface}
+        ",
+            interface = interface_name.to_string().yellow(),
+            daemon_mode = "innernet up -d --interval 60".yellow());
+    } else {
+        eprintdoc!(
+            "
+            It's recommended to now keep the interface automatically refreshing via whatever service
+            system your distribution provides.
+
+            Ex. to run innernet in a 60s update loop:
+
+                {daemon_mode} {interface}
+        ",
+            interface = interface_name.to_string().yellow(),
+            daemon_mode = "innernet up -d --interval 60".yellow()
+        );
+    }
+    Ok(())
+}
+
+fn up(
+    specific_interface: Option<Interface>,
+    opts: &Opts,
+    loop_interval: Option<Duration>,
+    hosts_opts: HostsOpts,
+    nat_opts: &NatOpts,
+) -> Result<(), Error> {
+    loop {
+        let interfaces = match &specific_interface {
+            Some(iface) => vec![iface.clone()],
+            None => all_installed(&opts.config_dir)?,
+        };
+
+        for interface in interfaces {
+            fetch(
+                &opts.config_dir,
+                &opts.data_dir,
+                &opts.network,
+                &hosts_opts,
+                nat_opts,
+                &interface,
+                true,
+            )?;
+        }
+
+        match loop_interval {
+            Some(interval) => thread::sleep(interval),
+            None => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn uninstall(interface: &InterfaceName, opts: &Opts, yes: bool) -> Result<(), Error> {
+    let config = InterfaceConfig::get_path(&opts.config_dir, interface);
+    let data = DataStore::get_path(&opts.data_dir, interface);
+
+    if !config.exists() && !data.exists() {
+        bail!(
+            "No network named \"{}\" exists.",
+            interface.as_str_lossy().yellow()
+        );
+    }
+
+    if yes
+        || Confirm::with_theme(&*prompts::THEME)
+            .with_prompt(format!(
+                "Permanently delete network \"{}\"?",
+                interface.as_str_lossy().yellow()
+            ))
+            .default(false)
+            .wait_for_newline(true)
+            .interact()?
+    {
+        log::info!("bringing down interface (if up).");
+        wg::down(interface, opts.network.backend).ok();
+        std::fs::remove_file(&config)
+            .with_path(&config)
+            .map_err(|e| log::warn!("{}", e.to_string().yellow()))
+            .ok();
+        std::fs::remove_file(&data)
+            .with_path(&data)
+            .map_err(|e| log::warn!("{}", e.to_string().yellow()))
+            .ok();
+        log::info!(
+            "network {} is uninstalled.",
+            interface.as_str_lossy().yellow()
+        );
+    }
+    Ok(())
+}
+
+fn add_cidr(interface: &InterfaceName, opts: &Opts, sub_opts: AddCidrOpts) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    log::info!("Fetching CIDRs");
+    let rest_client = RestClient::new(&server);
+    let cidrs: Vec<Cidr> = rest_client.get_cidrs()?;
+
+    if let Some(cidr_request) = prompts::add_cidr(&cidrs, &sub_opts)? {
+        log::info!("Creating CIDR...");
+        let cidr: Cidr = rest_client.create_cidr(&cidr_request)?;
+
+        eprintdoc!(
+            "
+            CIDR \"{cidr_name}\" added.
+
+            Right now, peers within {cidr_name} can only see peers in the same CIDR
+            , and in the special \"infra\" CIDR that includes the innernet server peer.
+
+            You'll need to add more associations for peers in diffent CIDRs to communicate.
+            ",
+            cidr_name = cidr.name.bold()
+        );
+    } else {
+        log::info!("exited without creating CIDR.");
+    }
+
+    Ok(())
+}
+
+fn rename_cidr(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: RenameCidrOpts,
+) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&server);
+
+    log::info!("Fetching CIDRs");
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
+
+    if let Some((cidr_request, old_name)) = prompts::rename_cidr(&cidrs, &sub_opts)? {
+        log::info!("Renaming CIDR...");
+
+        let id = cidrs
+            .iter()
+            .find(|c| c.name == old_name)
+            .ok_or_else(|| anyhow!("CIDR not found."))?
+            .id;
+
+        rest_client.http_form::<_, ()>("PUT", &format!("/admin/cidrs/{id}"), cidr_request)?;
+        log::info!("CIDR renamed.");
+    } else {
+        log::info!("Exited without renaming CIDR.");
+    }
+
+    Ok(())
+}
+
+fn delete_cidr(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: DeleteCidrOpts,
+) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    println!("Fetching eligible CIDRs");
+    let rest_client = RestClient::new(&server);
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
+    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
+
+    let cidr_id = prompts::delete_cidr(&cidrs, &peers, &sub_opts)?;
+
+    println!("Deleting CIDR...");
+    rest_client.http::<()>("DELETE", &format!("/admin/cidrs/{cidr_id}"))?;
+
+    println!("CIDR deleted.");
+
+    Ok(())
+}
+
+fn list_cidrs(interface: &InterfaceName, opts: &Opts, tree: bool) -> Result<(), Error> {
+    let data_store = DataStore::open(&opts.data_dir, interface)?;
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+
+    if tree {
+        let cidr_tree = CidrTree::new(data_store.cidrs());
+        colored::control::set_override(false);
+        print_tree(&cidr_tree, &[], 0, false, &config);
+        colored::control::unset_override();
+    } else {
+        for cidr in data_store.cidrs() {
+            println!("{} {}", cidr.cidr, cidr.name);
+        }
+    }
+    Ok(())
+}
+
+fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&server);
+
+    log::info!("Fetching CIDRs");
+    let cidrs = rest_client.get_cidrs()?;
+    log::info!("Fetching peers");
+    let peers = rest_client.get_peers()?;
+    let cidr_tree = CidrTree::new(&cidrs[..]);
+
+    if let Some((new_peer_info, target_path)) =
+        prompts::gather_new_peer_info(&peers, &cidr_tree, &sub_opts)?
+    {
+        log::info!("Creating peer...");
+        let (peer, invitation) =
+            create_peer(&opts.config_dir, interface, &cidrs, &peers, new_peer_info)?;
+
+        invitation.save_new(&target_path)?;
+        prompts::print_invitation_info(&peer, &target_path);
+    } else {
+        log::info!("Exited without creating peer.");
+    }
+
+    Ok(())
+}
+
+fn rename_peer(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: RenamePeerOpts,
+) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&server);
+
+    log::info!("Fetching peers");
+    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
+
+    if let Some((peer_request, old_name)) = prompts::rename_peer(&peers, &sub_opts)? {
+        log::info!("Renaming peer...");
+
+        let id = peers
+            .iter()
+            .filter(|p| p.name == old_name)
+            .map(|p| p.id)
+            .next()
+            .ok_or_else(|| anyhow!("Peer not found."))?;
+
+        rest_client.http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), peer_request)?;
+        log::info!("Peer renamed.");
+    } else {
+        log::info!("exited without renaming peer.");
+    }
+
+    Ok(())
+}
+
+fn enable_or_disable_peer(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: EnableDisablePeerOpts,
+    enable: bool,
+) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&server);
+
+    log::info!("Fetching peers.");
+    let peers: Vec<Peer> = rest_client.http("GET", "/admin/peers")?;
+
+    if let Some(peer) = prompts::enable_or_disable_peer(&peers[..], &sub_opts, enable)? {
+        let Peer { id, mut contents } = peer;
+        contents.is_disabled = !enable;
+        rest_client.http_form::<_, ()>("PUT", &format!("/admin/peers/{id}"), contents)?;
+    } else {
+        log::info!("exiting without enabling or disabling peer.");
+    }
+
+    Ok(())
+}
+
+fn add_association(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: AddDeleteAssociationOpts,
+) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&server);
+
+    log::info!("Fetching CIDRs");
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
+
+    let association = if let (Some(ref cidr1), Some(ref cidr2)) = (&sub_opts.cidr1, &sub_opts.cidr2)
+    {
+        let cidr1 = cidrs
+            .iter()
+            .find(|c| &c.name == cidr1)
+            .ok_or_else(|| anyhow!("can't find cidr '{}'", cidr1))?;
+        let cidr2 = cidrs
+            .iter()
+            .find(|c| &c.name == cidr2)
+            .ok_or_else(|| anyhow!("can't find cidr '{}'", cidr2))?;
+        (cidr1, cidr2)
+    } else if let Some((cidr1, cidr2)) = prompts::add_association(&cidrs[..], &sub_opts)? {
+        (cidr1, cidr2)
+    } else {
+        log::info!("exiting without adding association.");
+        return Ok(());
+    };
+
+    rest_client.http_form::<_, ()>(
+        "POST",
+        "/admin/associations",
+        AssociationContents {
+            cidr_id_1: association.0.id,
+            cidr_id_2: association.1.id,
+        },
+    )?;
+
+    Ok(())
+}
+
+fn delete_association(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: AddDeleteAssociationOpts,
+) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&server);
+
+    log::info!("Fetching CIDRs");
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
+    log::info!("Fetching associations");
+    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations")?;
+
+    if let Some(association) =
+        prompts::delete_association(&associations[..], &cidrs[..], &sub_opts)?
+    {
+        rest_client.http::<()>("DELETE", &format!("/admin/associations/{}", association.id))?;
+    } else {
+        log::info!("exiting without adding association.");
+    }
+
+    Ok(())
+}
+
+fn list_associations(interface: &InterfaceName, opts: &Opts) -> Result<(), Error> {
+    let InterfaceConfig { server, .. } =
+        InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&server);
+
+    log::info!("Fetching CIDRs");
+    let cidrs: Vec<Cidr> = rest_client.http("GET", "/admin/cidrs")?;
+    log::info!("Fetching associations");
+    let associations: Vec<Association> = rest_client.http("GET", "/admin/associations")?;
+
+    for association in associations {
+        println!(
+            "{}: {} <=> {}",
+            association.id,
+            cidrs
+                .iter()
+                .find(|c| c.id == association.cidr_id_1)
+                .unwrap()
+                .name
+                .yellow(),
+            cidrs
+                .iter()
+                .find(|c| c.id == association.cidr_id_2)
+                .unwrap()
+                .name
+                .yellow()
+        );
+    }
+
+    Ok(())
+}
+
+fn set_listen_port(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: ListenPortOpts,
+) -> Result<(), Error> {
+    let mut config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+
+    let listen_port = prompts::set_listen_port(&config.interface, sub_opts)?;
+    if let Some(listen_port) = listen_port {
+        innernet_client_core::set_listen_port(
+            opts.network.backend,
+            &opts.config_dir,
+            interface,
+            &mut config,
+            listen_port,
+        )?;
+    } else {
+        log::info!("exiting without updating the listen port.");
+    }
+
+    Ok(())
+}
+
+fn override_endpoint(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: OverrideEndpointOpts,
+) -> Result<(), Error> {
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+
+    let endpoint_contents = if sub_opts.unset {
+        prompt_unset_override_endpoint(&sub_opts)?.then_some(EndpointContents::Unset)
+    } else {
+        let server_capabilities = get_server_capabilities(&config)?;
+        let port = match config.interface.listen_port {
+            Some(port) => port,
+            None => bail!("you need to set a listen port with set-listen-port before overriding the endpoint (otherwise port randomization on the interface would make it useless).")
+        };
+        let endpoint = prompt_override_endpoint(&server_capabilities, &sub_opts, port)?;
+        endpoint.map(EndpointContents::Set)
+    };
+
+    if let Some(contents) = endpoint_contents {
+        log::info!("requesting endpoint update...");
+        RestClient::new(&config.server).http_form::<_, ()>("PUT", "/user/endpoint", contents)?;
+        log::info!(
+            "endpoint override {}",
+            if sub_opts.unset { "unset" } else { "set" }
+        );
+    } else {
+        log::info!("exiting without overriding endpoint");
+    }
+
+    Ok(())
+}
+
+fn override_peer_endpoint(
+    interface: &InterfaceName,
+    opts: &Opts,
+    sub_opts: OverridePeerEndpointOpts,
+) -> Result<(), Error> {
+    let mut config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let data_store = DataStore::open(&opts.data_dir, interface)?;
+
+    if let Some((peer, endpoint_opt)) = prompts::override_peer_endpoint_prompt(
+        data_store.peers(),
+        config.peer_endpoint_overrides(),
+        &sub_opts,
+    )? {
+        if let Some(endpoint) = endpoint_opt {
+            log::info!(
+                "overriding endpoint for peer IP {} with endpoint {}",
+                peer.ip,
+                endpoint
+            );
+
+            innernet_client_core::set_endpoint_override_for_peer(
+                opts.network.backend,
+                &opts.config_dir,
+                interface,
+                &mut config,
+                &peer,
+                endpoint,
+            )?;
+        } else {
+            log::info!("unsetting endpoint override for peer IP {}", peer.ip);
+
+            innernet_client_core::unset_endpoint_override_for_peer(
+                &opts.config_dir,
+                interface,
+                &mut config,
+                &peer,
+            )?;
+
+            log::info!("normal peer endpoint/NAT traversal will be restored on the next call to 'innernet fetch'");
+        }
+    } else {
+        log::info!("exiting without overriding peer endpoint");
+    }
+
+    Ok(())
+}
+
+fn prompt_override_endpoint(
+    server_capabilities: &ServerCapabilities,
+    args: &OverrideEndpointOpts,
+    listen_port: u16,
+) -> Result<Option<Endpoint>, Error> {
+    let unspecified_ip_supported = server_capabilities.unspecified_ip_in_override_endpoint;
+
+    let endpoint = match &args.endpoint {
+        Some(endpoint) => endpoint.clone(),
+        None => {
+            let external_ip = if unspecified_ip_supported {
+                prompts::unspecified_ip_and_auto_detection_flow()?
+            } else {
+                prompts::ip_auto_detection_flow()?
+            };
+
+            prompts::input_external_endpoint(external_ip, listen_port)?
+        },
+    };
+
+    if endpoint.is_host_unspecified() && !unspecified_ip_supported {
+        bail!(
+            "Attempted to use an unspecified IP (all zeros) but the innernet server does
+    not have the capability to resolve it, likely because its version is older."
+        )
+    }
+
+    if args.yes || prompts::confirm(&format!("Set external endpoint to {endpoint}?"))? {
+        Ok(Some(endpoint))
+    } else {
+        Ok(None)
+    }
+}
+
+fn prompt_unset_override_endpoint(args: &OverrideEndpointOpts) -> Result<bool, Error> {
+    Ok(args.yes
+        || prompts::confirm("Unset external endpoint to enable automatic endpoint discovery?")?)
+}
+
+fn get_server_capabilities(config: &InterfaceConfig) -> Result<ServerCapabilities, Error> {
+    let rest_client = RestClient::new(&config.server);
+    let maybe_info: Result<ServerCapabilities, RestError> =
+        rest_client.http("GET", "/user/capabilities");
+    match maybe_info {
+        Ok(info) => Ok(info),
+        Err(e) => {
+            if e.has_status_of(404) {
+                log::debug!(
+                "innernet server endpoint capabilities not found, assuming default capabilities"
+            );
+                Ok(Default::default())
+            } else {
+                bail!(e)
+            }
+        },
+    }
+}
+
+fn show(opts: &Opts, short: bool, tree: bool, interface: Option<Interface>) -> Result<(), Error> {
+    let interfaces = interface.map_or_else(
+        || Device::list(opts.network.backend),
+        |interface| Ok(vec![*interface]),
+    )?;
+
+    let devices = interfaces
+        .into_iter()
+        .map(|name| -> Result<Option<_>, Error> {
+            match DataStore::open(&opts.data_dir, &name) {
+                Ok(store) => {
+                    let device =
+                        Device::get(&name, opts.network.backend).with_str(name.as_str_lossy())?;
+                    let config = InterfaceConfig::from_interface(&opts.config_dir, &name)?;
+
+                    Ok(Some((device, store, config)))
+                },
+                // Skip WireGuard interfaces that aren't managed by innernet.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                // Error on interfaces that *are* managed by innernet but are not readable.
+                Err(e) => Err(e.into()),
+            }
+        })
+        // Filter out Ok(None).
+        .filter_map(Result::transpose)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if devices.is_empty() {
+        log::info!("No innernet networks currently running.");
+        return Ok(());
+    }
+
+    for (device_info, store, interface_config) in devices {
+        let public_key = match &device_info.public_key {
+            Some(key) => key.to_base64(),
+            None => {
+                log::warn!(
+                    "network {} is missing public key.",
+                    device_info.name.to_string().yellow()
+                );
+                continue;
+            },
+        };
+
+        let peers = store.peers();
+        let cidrs = store.cidrs();
+        let me = peers
+            .iter()
+            .find(|p| p.public_key == public_key)
+            .ok_or_else(|| anyhow!("missing peer info"))?;
+
+        let mut peer_states = device_info
+            .peers
+            .iter()
+            .map(|info| {
+                let public_key = info.config.public_key.to_base64();
+                match peers.iter().find(|p| p.public_key == public_key) {
+                    Some(peer) => Ok(PeerState {
+                        peer,
+                        info: Some(info),
+                    }),
+                    None => Err(anyhow!("peer {} isn't an innernet peer.", public_key)),
+                }
+            })
+            .collect::<Result<Vec<PeerState>, _>>()?;
+        peer_states.push(PeerState {
+            peer: me,
+            info: None,
+        });
+
+        print_interface(&device_info, short || tree)?;
+        peer_states.sort_by_key(|peer| peer.peer.ip);
+        let verbose = opts.verbose > 0;
+
+        if tree {
+            let cidr_tree = CidrTree::new(cidrs);
+            print_tree(&cidr_tree, &peer_states, 1, verbose, &interface_config);
+        } else {
+            for peer_state in peer_states {
+                let endpoint_has_local_override = interface_config
+                    .peer_endpoint_overrides()
+                    .contains_key(&peer_state.peer.contents.ip);
+                print_peer(&peer_state, short, 1, verbose, endpoint_has_local_override);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_tree(
+    cidr: &CidrTree,
+    peers: &[PeerState],
+    level: usize,
+    verbose: bool,
+    interface_config: &InterfaceConfig,
+) {
+    println_pad!(
+        level * 2,
+        "{} {}",
+        cidr.cidr.to_string().bold().blue(),
+        cidr.name.blue(),
+    );
+
+    let mut children: Vec<_> = cidr.children().collect();
+    children.sort();
+    children
+        .iter()
+        .for_each(|child| print_tree(child, peers, level + 1, verbose, interface_config));
+
+    for peer in peers.iter().filter(|p| p.peer.cidr_id == cidr.id) {
+        let endpoint_has_local_override = interface_config
+            .peer_endpoint_overrides()
+            .contains_key(&peer.peer.contents.ip);
+        print_peer(peer, true, level, verbose, endpoint_has_local_override);
+    }
+}
+
+fn print_interface(device_info: &Device, short: bool) -> Result<(), Error> {
+    if short {
+        let listen_port_str = device_info
+            .listen_port
+            .map(|p| format!("(:{p}) "))
+            .unwrap_or_default();
+        println!(
+            "{} {}",
+            device_info.name.to_string().green().bold(),
+            listen_port_str.dimmed(),
+        );
+    } else {
+        println!(
+            "{}: {}",
+            "network".green().bold(),
+            device_info.name.to_string().green(),
+        );
+        if let Some(listen_port) = device_info.listen_port {
+            println!("  {}: {}", "listening port".bold(), listen_port);
+        }
+    }
+    Ok(())
+}
+
+fn print_peer(
+    peer: &PeerState,
+    short: bool,
+    level: usize,
+    verbose: bool,
+    endpoint_has_local_override: bool,
+) {
+    let pad = level * 2;
+    let PeerState { peer, info } = peer;
+    let public_key = if verbose {
+        &peer.public_key
+    } else {
+        &format!("{}…", &peer.public_key[..10])
+    };
+
+    let endpoint_override_msg = if endpoint_has_local_override {
+        " (endpoint overridden locally)"
+    } else {
+        ""
+    };
+
+    if short {
+        let connected = info
+            .map(|info| info.is_recently_connected())
+            .unwrap_or_default();
+        let is_you = info.is_none();
+
+        println_pad!(
+            pad,
+            "| {} {}: {} ({}{}){endpoint_override_msg}",
+            if connected || is_you {
+                "◉".bold()
+            } else {
+                "◯".dimmed()
+            },
+            peer.ip.to_string().yellow().bold(),
+            peer.name.yellow(),
+            if is_you { "you, " } else { "" },
+            public_key.dimmed(),
+        );
+    } else {
+        println_pad!(
+            pad,
+            "{}: {} ({})",
+            "peer".yellow().bold(),
+            peer.name.yellow(),
+            public_key.yellow(),
+        );
+        println_pad!(pad, "  {}: {}", "ip".bold(), peer.ip);
+        if let Some(info) = info {
+            if let Some(endpoint) = info.config.endpoint {
+                println_pad!(
+                    pad,
+                    "  {}: {endpoint}{endpoint_override_msg}",
+                    "endpoint".bold(),
+                );
+            }
+            if let Some(last_handshake) = info.stats.last_handshake_time {
+                let duration = last_handshake.elapsed().expect("horrible clock problem");
+                println_pad!(
+                    pad,
+                    "  {}: {}",
+                    "last handshake".bold(),
+                    human_duration(duration),
+                );
+            }
+            if info.stats.tx_bytes > 0 || info.stats.rx_bytes > 0 {
+                println_pad!(
+                    pad,
+                    "  {}: {} received, {} sent",
+                    "transfer".bold(),
+                    human_size(info.stats.rx_bytes),
+                    human_size(info.stats.tx_bytes),
+                );
+            }
+        }
+    }
+}
+
+fn main() {
+    let opts = Opts::parse();
+    util::init_logger(opts.verbose);
+
+    if let Err(e) = run(&opts) {
+        println!();
+        log::error!("{}\n", e);
+        if let Some(e) = e.downcast_ref::<WrappedIoError>() {
+            util::permissions_helptext(&opts.config_dir, &opts.data_dir, e);
+        }
+        if let Some(e) = e.downcast_ref::<io::Error>() {
+            util::permissions_helptext(&opts.config_dir, &opts.data_dir, e);
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run(opts: &Opts) -> Result<(), Error> {
+    let command = opts.command.clone().unwrap_or(Command::Show {
+        short: false,
+        tree: false,
+        interface: None,
+    });
+
+    match command {
+        Command::Install {
+            invite,
+            listen_port,
+            hosts,
+            install_opts,
+            nat,
+        } => install(opts, &hosts, &install_opts, &nat, &invite, listen_port)?,
+        Command::Show {
+            short,
+            tree,
+            interface,
+        } => show(opts, short, tree, interface)?,
+        Command::Fetch {
+            interface,
+            hosts,
+            nat,
+        } => {
+            fetch(
+                &opts.config_dir,
+                &opts.data_dir,
+                &opts.network,
+                &hosts,
+                &nat,
+                &interface,
+                false,
+            )?;
+        },
+        Command::Up {
+            interface,
+            daemon,
+            hosts,
+            nat,
+            interval,
+        } => up(
+            interface,
+            opts,
+            daemon.then(|| Duration::from_secs(interval)),
+            hosts,
+            &nat,
+        )?,
+        Command::Down { interface } => wg::down(&interface, opts.network.backend)?,
+        Command::Uninstall { interface, yes } => uninstall(&interface, opts, yes)?,
+        Command::AddPeer {
+            interface,
+            sub_opts,
+        } => add_peer(&interface, opts, sub_opts)?,
+        Command::RenamePeer {
+            interface,
+            sub_opts,
+        } => rename_peer(&interface, opts, sub_opts)?,
+        Command::AddCidr {
+            interface,
+            sub_opts,
+        } => add_cidr(&interface, opts, sub_opts)?,
+        Command::RenameCidr {
+            interface,
+            sub_opts,
+        } => rename_cidr(&interface, opts, sub_opts)?,
+        Command::DeleteCidr {
+            interface,
+            sub_opts,
+        } => delete_cidr(&interface, opts, sub_opts)?,
+        Command::ListCidrs { interface, tree } => list_cidrs(&interface, opts, tree)?,
+        Command::DisablePeer {
+            interface,
+            sub_opts,
+        } => enable_or_disable_peer(&interface, opts, sub_opts, false)?,
+        Command::EnablePeer {
+            interface,
+            sub_opts,
+        } => enable_or_disable_peer(&interface, opts, sub_opts, true)?,
+        Command::AddAssociation {
+            interface,
+            sub_opts,
+        } => add_association(&interface, opts, sub_opts)?,
+        Command::DeleteAssociation {
+            interface,
+            sub_opts,
+        } => delete_association(&interface, opts, sub_opts)?,
+        Command::ListAssociations { interface } => list_associations(&interface, opts)?,
+        Command::SetListenPort {
+            interface,
+            sub_opts,
+        } => {
+            set_listen_port(&interface, opts, sub_opts)?;
+        },
+        Command::OverrideEndpoint {
+            interface,
+            sub_opts,
+        } => {
+            override_endpoint(&interface, opts, sub_opts)?;
+        },
+        Command::OverridePeerEndpoint {
+            interface,
+            sub_opts,
+        } => {
+            override_peer_endpoint(&interface, opts, sub_opts)?;
+        },
+        Command::Completions { shell } => {
+            use clap::CommandFactory;
+            let mut app = Opts::command();
+            let app_name = app.get_name().to_string();
+            clap_complete::generate(shell, &mut app, app_name, &mut std::io::stdout());
+            std::process::exit(0);
+        },
+    }
+
+    Ok(())
+}

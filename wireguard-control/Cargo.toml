@@ -1,0 +1,33 @@
+[package]
+authors = ["K900 <me@0upti.me>", "Jake McGinty <me@jakebot.org>"]
+categories = ["os::unix-apis"]
+description = "High level bindings to the WireGuard embeddable C library"
+edition = "2021"
+homepage = "https://github.com/tonarino/innernet"
+keywords.workspace = true
+license = "LGPL-2.1-or-later"
+name = "wireguard-control"
+publish = true
+readme = "README.md"
+repository = "https://github.com/tonarino/innernet"
+version = "2.0.0"
+
+[dependencies]
+base64 = "0.23.1"
+hex = "0.4.3"
+libc = "0.2.189"
+log = "0.4.34"
+getrandom = "0.4.3"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = "0.9.0"
+netlink-packet-generic = "0.5.0"
+netlink-packet-route = "0.33.0"
+netlink-packet-utils = "0.6.0"
+netlink-packet-wireguard = "0.5.0"
+netlink-request = { version = "2.0.0", path = "../netlink-request" }
+netlink-sys = "0.9.0"
+
+[target.'cfg(target_os = "openbsd")'.dependencies]
+nix = { version = "0.31.3", features = ["net"] }

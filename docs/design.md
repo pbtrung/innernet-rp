@@ -29,9 +29,9 @@ or provide post-quantum identity authentication. Static ML-KEM/X448 keys do
 not give the PSK layer forward secrecy after long-term key compromise.
 Rotation requires explicit durable protocol state beyond WireGuard itself.
 
-This checkout contains design documents only. Existing innernet behavior
-is an integration baseline, not an implementation of this proposal. The
-specification is implementation-language-independent.
+Implementation proceeds by milestone; see [implementation.md](implementation.md)
+for actual evidence. Existing innernet behavior alone does not implement this
+proposal. The specification is implementation-language-independent.
 
 ## 2. Cryptographic building blocks and transport sizes
 
@@ -765,9 +765,8 @@ inactivity threshold, 600-second prepare TTL, and service/load budgets.
 These are validation tasks, not undecided signing policy or a vendoring option.
 
 Select and record the supported innernet baseline commit and legacy binary
-versions before implementation. This checkout has no current build/CI
-infrastructure to reuse; milestones must establish it rather than assume
-pre-reset code is present.
+versions before implementation. M0 establishes build/test infrastructure
+explicitly and records restored baseline code and its adaptations.
 
 Migrations must be atomic/versioned with tested backup/restore and an explicit
 compatibility matrix. New code rejects unknown newer schemas before any

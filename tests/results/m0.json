@@ -1,0 +1,33 @@
+{
+  "milestone": 0,
+  "revision": "the commit introducing this record",
+  "date": "2026-09-07",
+  "kernel": "Linux 7.2.2-1-cachyos x86_64",
+  "rust": "1.98.1",
+  "leancrypto": "1.8.0-1",
+  "openssl": "3.6.4-1",
+  "sqlite": "3.53.4-1",
+  "container_base": "archlinux@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a",
+  "package_snapshot": "2026/09/07",
+  "checks": [
+    {"command": "cargo fmt --all", "result": "passed; nightly unavailable, stable fallback"},
+    {"command": "cargo clippy --workspace --locked --all-targets -- -D warnings", "result": "passed on host and in container"},
+    {"command": "cargo test --workspace --locked", "result": "passed on host and in container"},
+    {"command": "cargo test --workspace --locked --features v6-test", "result": "passed on host and in container"},
+    {"command": "python3 tests/fixtures/reference.py --check tests/fixtures/protocol-v1.json", "result": "passed"},
+    {"command": "bash tests/run.sh integration", "result": "independent native crypto interoperability passed"},
+    {"command": "ldd protocol and server test executables", "result": "system libleancrypto.so.1, libcrypto.so.3, libsqlite3.so.0 confirmed"}
+  ],
+  "fault_schedule": "fixed canonical/negative vectors; storage before/after write; lost response; old handshake generation; expiry before/after commit",
+  "randomness": "system RNG for agreement/difference tests; published fixed vectors use test scalars 1 and 2",
+  "excluded": [
+    "upstream public-IP external-service test",
+    "explicitly isolated userspace WireGuard interface integration test"
+  ],
+  "limitations": [
+    "No production PQ enablement or PSK installation",
+    "No real-kernel gate or peer convergence evidence yet",
+    "No aarch64 execution or broad legacy compatibility claim",
+    "No external cryptographic audit"
+  ]
+}

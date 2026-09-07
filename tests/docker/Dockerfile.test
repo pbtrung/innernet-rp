@@ -1,0 +1,7 @@
+# Build Dockerfile.build first; it pins the base digest and package snapshot.
+FROM innernet-pq-build:m0
+COPY . /work
+RUN cargo fetch --locked
+RUN cargo clippy --workspace --locked --all-targets -- -D warnings
+RUN bash tests/run.sh unit && bash tests/run.sh integration
+RUN cargo test --workspace --locked --features v6-test

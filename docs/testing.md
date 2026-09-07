@@ -1,6 +1,6 @@
 # Test plan: unit tests and simulated Docker peers
 
-Status: planned; the implementation and test harness do not exist yet
+Status: implementation in progress; see [implementation.md](implementation.md)
 Related: [design.md](design.md), [milestones.md](milestones.md)
 
 The numbered requirements in design section 7.2 remain the acceptance
@@ -25,8 +25,9 @@ baseline tests may keep their native locations; the manifest indexes them.
 `tests/docker/` will contain the Compose definition, pinned image/build
 recipes, enrollment fixtures, fault controls, and scenario driver. Provide
 a documented runner with selectable `unit`, `integration`, `docker-smoke`,
-`docker-faults`, `compatibility`, and `load` suites. These are required future
-interfaces, not commands that can be run in this documents-only checkout.
+`docker-faults`, `compatibility`, and `load` suites. M0 provides
+`bash tests/run.sh SUITE`; unimplemented suites fail explicitly until their
+milestone supplies the required assertions.
 
 Each test has explicit preconditions, an action/fault schedule, expected
 state and traffic assertions, a bounded deadline, and cleanup. Reuse protocol

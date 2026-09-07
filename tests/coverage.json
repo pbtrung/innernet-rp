@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "stage": "M0",
+  "note": "Test IDs identify implemented checks, not completion of all design-case assertions. Kernel, process, load and architecture evidence are tracked separately.",
+  "cases": [
+    {
+      "design_case": 1,
+      "unit": [
+        "independently_encoded_bundles_transcript_and_combiner",
+        "every_message_matches_independent_rfc6979_signature_and_envelope",
+        "randomized_kem_agreement_and_implicit_rejection"
+      ],
+      "integration": [
+        "independent_openssl_and_leancrypto_endpoints"
+      ],
+      "docker": [],
+      "status": "m0-crypto-verified"
+    },
+    {
+      "design_case": 2,
+      "unit": [
+        "stale_handshake_never_opens_recreated_peer"
+      ],
+      "integration": [],
+      "docker": [],
+      "status": "model-only"
+    },
+    {
+      "design_case": 3,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    },
+    {
+      "design_case": 4,
+      "unit": [
+        "clocks_fault_boundaries_and_non_consuming_delivery"
+      ],
+      "integration": [],
+      "docker": [],
+      "status": "model-only"
+    },
+    {
+      "design_case": 5,
+      "unit": [
+        "durable_receipts_and_replay_high_water_model"
+      ],
+      "integration": [],
+      "docker": [],
+      "status": "model-only"
+    },
+    {
+      "design_case": 6,
+      "unit": [
+        "expiry_wins_before_commit_and_not_after",
+        "state_model_requires_commit_and_responder_first"
+      ],
+      "integration": [],
+      "docker": [],
+      "status": "model-only"
+    },
+    {
+      "design_case": 7,
+      "unit": [
+        "durable_receipts_and_replay_high_water_model"
+      ],
+      "integration": [],
+      "docker": [],
+      "status": "model-only"
+    },
+    {
+      "design_case": 8,
+      "unit": [
+        "canonical_json_and_exact_body_boundaries",
+        "signing_checks_points_scalars_low_s_and_message_binding",
+        "x448_agreement_and_all_zero_rejection",
+        "randomness_failure_never_returns_partial_identity"
+      ],
+      "integration": [],
+      "docker": [],
+      "status": "model-only"
+    },
+    {
+      "design_case": 9,
+      "unit": [
+        "every_bound_field_is_authenticated",
+        "each_combiner_input_changes_keys_and_confirmation"
+      ],
+      "integration": [],
+      "docker": [],
+      "status": "model-only"
+    },
+    {
+      "design_case": 10,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    },
+    {
+      "design_case": 11,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    },
+    {
+      "design_case": 12,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    },
+    {
+      "design_case": 13,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    },
+    {
+      "design_case": 14,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    },
+    {
+      "design_case": 15,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    },
+    {
+      "design_case": 16,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    },
+    {
+      "design_case": 17,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    },
+    {
+      "design_case": 18,
+      "unit": [],
+      "integration": [],
+      "docker": [],
+      "status": "planned"
+    }
+  ]
+}

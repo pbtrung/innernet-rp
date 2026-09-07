@@ -1,0 +1,126 @@
+[package]
+authors = [
+  "Jake McGinty <me@jakebot.org>",
+  "Brian Schwind <brian@tonari.no>",
+  "Ryo Kawaguchi <ryo@tonari.no>",
+  "Matěj Laitl <matej@tonari.no>",
+]
+categories = ["command-line-utilities", "network-programming"]
+description = "A server to coordinate innernet networks."
+edition = "2021"
+homepage = "https://github.com/tonarino/innernet"
+keywords.workspace = true
+license = "MIT"
+name = "innernet-server"
+publish = true
+readme = "../README.md"
+repository = "https://github.com/tonarino/innernet"
+version = "2.0.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "innernet-server"
+path = "src/main.rs"
+
+[features]
+v6-test = []
+selinux = ["innernet-shared/selinux"]
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
+clap_complete = "4.6.9"
+colored.workspace = true
+dialoguer.workspace = true
+hyper = { version = "1.11.1", default-features = false, features = [
+  "http1",
+  "server",
+] }
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+indoc = "2.0.7"
+innernet-publicip = { version = "2.0.0", path = "../publicip" }
+innernet-shared = { version = "2.0.0", path = "../shared" }
+ipnet = { version = "2.12.2", features = ["serde"] }
+libc = "0.2.189"
+libsqlite3-sys = "0.38.2"
+log = "0.4.34"
+once_cell = "1.21.4"
+parking_lot = "0.12.5"
+pretty_env_logger = "0.5.0"
+regex = { version = "1.13.1", default-features = false, features = ["std"] }
+rusqlite = "0.40.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+subtle = "2.6.1"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time", "net", "sync"] }
+toml = "1.1.5"
+url = "2.5.8"
+wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6.5", features = ["all"] }
+
+[dev-dependencies]
+anyhow = "1.0.104"
+tempfile = "3.27.0"
+
+[package.metadata.deb]
+assets = [
+  [
+    "target/release/innernet-server",
+    "usr/bin/",
+    "755",
+  ],
+  [
+    "innernet-server@.service",
+    "usr/lib/systemd/system/",
+    "644",
+  ],
+  [
+    "../doc/innernet-server.8.gz",
+    "usr/share/man/man8/",
+    "644",
+  ],
+  [
+    "../doc/innernet-server.completions.zsh",
+    "usr/share/zsh/site-functions/_innernet-server",
+    "644",
+  ],
+  [
+    "../doc/innernet-server.completions.bash",
+    "etc/bash_completion.d/innernet-server",
+    "644",
+  ],
+  [
+    "../doc/innernet-server.completions.fish",
+    "usr/share/fish/vendor_completions.d/innernet-server.fish",
+    "644",
+  ],
+]
+depends = "libc6, libgcc1, libsqlite3-0, zlib1g, systemd"
+maintainer = "tonari <hey@tonari.no>"
+name = "innernet-server"
+priority = "optional"
+recommends = "wireguard"
+section = "net"
+
+[package.metadata.rpm]
+package = "innernet-server"
+
+[package.metadata.rpm.cargo]
+buildflags = ["--release"]
+
+[package.metadata.rpm.files]
+"../../doc/innernet-server.8.gz" = { path = "/usr/share/man/man8/innernet-server.8.gz" }
+"../../doc/innernet-server.completions.bash" = { path = "/etc/bash_completion.d/innernet-server" }
+"../../doc/innernet-server.completions.fish" = { path = "/usr/share/fish/vendor_completions.d/innernet-server.fish" }
+"../../doc/innernet-server.completions.zsh" = { path = "/usr/share/zsh/site-functions/_innernet-server" }
+"../innernet-server@.service" = { path = "/usr/lib/systemd/system/innernet-server@.service" }
+
+[package.metadata.rpm.targets]
+innernet-server = { path = "/usr/bin/innernet-server" }

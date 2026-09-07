@@ -1,9 +1,9 @@
 # Milestones: post-quantum PSK exchange
 
 Companion to [design.md](design.md). Each milestone is a separately testable
-deliverable. The checkout currently contains no implementation or build
-harness; M0 records the baseline and establishes the tooling that later
-milestones use. These are planned acceptance criteria, not completed tests.
+deliverable. M0 restores the baseline and establishes the harness for later
+milestones; [implementation.md](implementation.md) records actual evidence.
+Criteria below are not a claim that all milestones or tests are complete.
 Follow [testing.md](testing.md) for unit fixtures, Docker peer simulation,
 fault injection, coverage mapping, and CI execution requirements.
 
