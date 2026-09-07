@@ -32,6 +32,7 @@ conflicts=('innernet' 'innernet-server')
 options=('!strip' '!debug') # bin/build-multiarch.sh already strips these binaries; there's no
                              # source tree here for makepkg's debug-package splitting to use
                              # (it was creating a bogus pkg/innernet-rp-bin/usr/src/debug/ tree)
+install=innernet-rp.install
 
 _target_x86_64='x86_64-unknown-linux-musl'
 _target_aarch64='aarch64-unknown-linux-musl'
@@ -43,13 +44,19 @@ source_aarch64=("innernet-rp-${pkgver}-${_target_aarch64}.tar.gz::https://github
 # traversal - verified: it looks up just the basename in $startdir), so innernet@.service and
 # innernet-server@.service here are symlinks to the real files at client/innernet@.service and
 # server/innernet-server@.service (the same ones this repo's .deb/.rpm packaging metadata uses) -
-# not copies, so there's nothing to keep in sync by hand.
+# not copies, so there's nothing to keep in sync by hand. innernet-rp.sysusers is packaging-only
+# (no equivalent elsewhere in the repo to symlink to) - it declares the 'rosenpass' system group
+# that --rosenpass-group rosenpass (README.md's Post-Quantum Key Exchange section) needs to
+# already exist; innernet-rp.install's post_install/post_upgrade apply it via systemd-sysusers
+# immediately, rather than leaving it until the next boot's systemd-sysusers.service run.
 source=(
   'innernet@.service'
   'innernet-server@.service'
+  'innernet-rp.sysusers'
 )
 sha256sums=('943edf174992bb72dd07501903873be40159449935c6ef90a305cad51b359167'
-            'f629debbb6539e37ac81a039447b04e66dd3e39c316e414414378e2dbb62eb69')
+            'f629debbb6539e37ac81a039447b04e66dd3e39c316e414414378e2dbb62eb69'
+            '4a0643392ba2612e3899be1705d7bd22b648a8d306c8dc4c7d845e59ca1a2b20')
 sha256sums_x86_64=('045a953f7f0d1bf45454cc0bae28d35ca6c9f49699c1104dd444347d2eb86f84')
 sha256sums_aarch64=('61f00e14734175f55c4e00ba0e82f62cec92abc057d0953a20dde271c0a89319')
 
@@ -62,4 +69,6 @@ package() {
         "$pkgdir/usr/lib/systemd/system/innernet@.service"
     install -Dm644 "$srcdir/innernet-server@.service" \
         "$pkgdir/usr/lib/systemd/system/innernet-server@.service"
+    install -Dm644 "$srcdir/innernet-rp.sysusers" \
+        "$pkgdir/usr/lib/sysusers.d/innernet-rp.conf"
 }
