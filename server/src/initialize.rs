@@ -149,8 +149,12 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
     } else {
         Input::with_theme(&theme)
             .with_prompt("Network CIDR")
-            .with_initial_text("10.42.0.0/16")
-            // TODO(mbernat): workaround for https://github.com/console-rs/dialoguer/issues/330
+            // `default()`, not `with_initial_text()`: the latter pre-fills an *editable* text
+            // buffer, which has a known dialoguer bug (console-rs/dialoguer#330) where the
+            // first Enter can fail to submit correctly, requiring the exact same value to be
+            // entered again to actually be accepted. `default()` has no such issue - Enter
+            // alone accepts it as-is, or the user can just type a different value over it.
+            .default("10.42.0.0/16".parse().expect("valid default CIDR"))
             .interact_text()?
     };
 
