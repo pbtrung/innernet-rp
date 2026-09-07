@@ -2,6 +2,7 @@
 
 Status: draft; protocol and implementation validation required before release
 Related: [milestones.md](milestones.md)
+Test execution plan: [testing.md](testing.md)
 
 ## 1. Motivation and security scope
 
@@ -586,14 +587,22 @@ and independent-implementation agreement.
 
 ## 7. Test plan and release evidence
 
+Use deterministic unit tests for protocol invariants, real database/API
+integration tests for durability, and Docker peers for network/kernel
+behavior. [testing.md](testing.md) defines fixtures, unit coverage, container
+setup, fault scenarios, and CI responsibilities. The cases below remain the
+shared acceptance checklist across those layers.
+
 ### 7.1 Topology
 
-Use one server container and at least four peers: cooperating `peer-a`/
-`peer-b`, cross-CIDR adversary `peer-m`, and authorized flood source `peer-x`.
-Use an isolated network, HTTP fault injection inside management paths,
-controllable clocks, and persistent volumes for crash/snapshot tests.
-Legacy binaries and additional simulated identities exercise compatibility
-and admission limits.
+Use one server container and at least five peers: cooperating `peer-a`/
+`peer-b`, a third cooperating `peer-c` to verify unaffected links, cross-CIDR
+adversary `peer-m`, and authorized flood source `peer-x`. Use an isolated
+underlay with real WireGuard management/data paths, HTTP fault injection
+that preserves peer identity, and separate persistent volumes for crash/
+snapshot tests. Unit tests use virtual clocks; container tests respect real
+kernel timers. Legacy binaries and extra simulated identities exercise
+compatibility and admission limits.
 
 ### 7.2 Required cases
 
@@ -663,7 +672,9 @@ and admission limits.
 
 Every numbered case needs recorded results. Establish crypto vectors and
 state-machine/crash checks before production PSK application; M9 completes
-adversarial/load review before release. Secret dumps use owner-only test
+adversarial/load review before release. Record unit and Docker evidence
+separately using the coverage manifest in [testing.md](testing.md); neither
+test layer substitutes for the other. Secret dumps use owner-only test
 storage excluded from logs/artifact uploads. This document does not claim
 these tests or an external security audit have already run.
 

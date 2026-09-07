@@ -4,6 +4,8 @@ Companion to [design.md](design.md). Each milestone is a separately testable
 deliverable. The checkout currently contains no implementation or build
 harness; M0 records the baseline and establishes the tooling that later
 milestones use. These are planned acceptance criteria, not completed tests.
+Follow [testing.md](testing.md) for unit fixtures, Docker peer simulation,
+fault injection, coverage mapping, and CI execution requirements.
 
 Introduce the enablement/policy gate in M1, before key generation, API
 traffic, or WireGuard changes. A never-enabled installation remains inert
@@ -22,6 +24,10 @@ API. No milestone claims uninterrupted two-party PSK installation.
 - Record the innernet baseline commit, supported legacy binary/schema
   versions, implementation toolchain, and test/build entry points. Establish
   the harness rather than assuming pre-reset files exist in this checkout.
+- Establish the unit framework, virtual clocks, scripted transport/storage/
+  kernel adapters, canonical fixtures, and design-case coverage manifest
+  from testing sections 1–2. Define the suite runner contracts before later
+  milestones depend on them.
 - Select the P-521/SHA-512 signing library and integrate it alongside
   leancrypto's standalone ML-KEM-1024, X448, SHA3, HMAC, and HKDF primitives.
   Confirm API availability and failure behavior, including deterministic
@@ -80,6 +86,9 @@ are recorded. Neither production interfaces nor their PSKs are modified.
   survives TTL. Retain freshness tombstones until bundle retirement.
 - Use atomic versioned migrations that reject unknown newer schemas without
   writes and never lower version markers. Establish backup/rollback fixtures.
+- Add real SQLite/API integration tests from testing section 3, including
+  concurrent transition/expiry races, authenticated requests, page loss,
+  and schema reopening; in-memory fakes alone do not verify durability.
 
 **Acceptance:** API/schema tests cover all three keys, partial registration,
 non-consuming fetches, duplicate/lost responses, phase conflicts, stale
@@ -140,6 +149,9 @@ recovery channel and its restoration are implemented and tested.
 - Model a successful PSK installer/handshake observer in this milestone,
   without changing real WireGuard state. Exercise every durable-write,
   message-loss, reorder, and crash boundary, including commit-versus-abort.
+- Add seeded unit event schedules and a Docker server/client skeleton with
+  separate identities/volumes and peer-preserving fault controls. Keep
+  simulated installer results distinct from M4's real WireGuard evidence.
 - Never independently roll back committed work. On restart reconcile its
   durable decision and recover forward; unresolved commitment blocks new
   work for that pair, not all other pairs.
@@ -173,6 +185,10 @@ logs and uploaded artifacts. Production WireGuard PSKs remain untouched.
 - Verify operator-PSK adoption/preservation and explicit unrecoverable-state
   retirement. Configuration ownership conflicts must fail visibly rather
   than silently overwriting another PSK manager.
+- Run Docker smoke and loss/install-crash/replay scenarios from testing
+  section 4.4 with real kernel peers. Use cooperating peer C as the A–C
+  traffic/progress control while A–B fails or rotates; verify both blocked
+  traffic and positive probe reachability.
 
 **Acceptance:** real WireGuard tests pass design cases 2–7: first activation,
 repeated rotations, interruption measurement, lost acknowledgments, crashes
@@ -265,6 +281,9 @@ package/ABI requirements and non-Linux feature boundaries are recorded.
   container topology, fault injector, persistent state, and real processes.
   Earlier milestone results may be reused for the same tested revision;
   happy-path convergence alone does not close this milestone.
+- Close every unit/integration/Docker entry in the testing section 5
+  coverage manifest. Require the documented pull-request/nightly/release
+  suites and preserve reproducible seeds, schedules, and sanitized results.
 - Review canonical authentication and the hybrid combiner, static-key
   compromise limits, operator-PSK retention, replay/rollback safety, secret
   persistence, strict traffic gating, and forward recovery after commitment.
