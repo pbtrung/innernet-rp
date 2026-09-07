@@ -31,7 +31,13 @@ pub const DEFAULT_HOSTS_PATH: &str = "/etc/hosts";
 
 pub fn ensure_dirs_exist(dirs: &[&Path]) -> Result<(), WrappedIoError> {
     for dir in dirs {
-        match fs::create_dir(dir).with_path(dir) {
+        // `create_dir_all`, not `create_dir`: callers like `rosenpass::generate_keypair` pass a
+        // directory two levels below an existing root (e.g. `<data_dir>/rosenpass/<interface>`),
+        // and `create_dir` fails with ENOENT if the intermediate `rosenpass/` level doesn't
+        // exist yet - only reproduces with a real, freshly-created data dir, not the tempdir
+        // fixtures unit tests build directly on top of (verified via docker-tests: this failed a
+        // real `innernet-server --enable-rosenpass` run before this fix).
+        match fs::create_dir_all(dir).with_path(dir) {
             Ok(()) => {
                 log::debug!("created dir {}", dir.to_string_lossy());
                 std::fs::set_permissions(dir, Permissions::from_mode(0o700)).with_path(dir)?;

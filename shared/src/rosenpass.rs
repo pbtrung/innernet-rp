@@ -8,7 +8,7 @@ use base64::Engine;
 use serde::Serialize;
 use std::{
     fs::File,
-    io::{BufRead, BufReader, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -590,9 +590,22 @@ fn fresh_exchanged_psk(events: &[ExchangeEvent], key_out_path: &Path, peer_id: i
     {
         return None;
     }
-    match std::fs::read_to_string(key_out_path)
-        .context("failed to read rosenpass key_out file")
-        .and_then(|contents| {
+    match File::open(key_out_path)
+        .context("failed to open rosenpass key_out file")
+        .and_then(|file| {
+            // The `rosenpass` subprocess itself creates this file (via its own `output-key`
+            // config directive) under its own process umask - typically world-readable
+            // (0o644), since it has no reason to know the contents are a secret WireGuard PSK.
+            // Tighten it to owner-only immediately, same as every other file in this codebase
+            // holding key material, rather than leaving a PSK sitting world-readable on disk
+            // indefinitely (found via a real docker-tests run - unit tests never caught this
+            // since they read a synthetic file they wrote themselves with default test
+            // permissions, never one produced by a real spawned rosenpass process).
+            chmod(&file, 0o600).context("failed to tighten rosenpass key_out file permissions")?;
+            let mut contents = String::new();
+            (&file)
+                .read_to_string(&mut contents)
+                .context("failed to read rosenpass key_out file")?;
             Key::from_base64(contents.trim())
                 .map_err(|e| anyhow::anyhow!("invalid base64 in rosenpass key_out file: {e}"))
         }) {

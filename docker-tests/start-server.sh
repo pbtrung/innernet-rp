@@ -30,4 +30,4 @@ innernet-server \
     --invite-expires "30d" \
     --yes
 
-innernet-server $INNERNET_ARGS serve evilcorp
+innernet-server $INNERNET_ARGS serve evilcorp $SERVER_ROSENPASS_ARGS

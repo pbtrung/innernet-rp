@@ -17,8 +17,14 @@ RUN mkdir /repo \
 ## Final image
 ####################################################################################################
 FROM rust:slim-bookworm
+# libsodium-dev/cmake/pkg-config are for building the `rosenpass` binary (its oqs-sys/
+# libsodium-sys-stable dependencies) - this is a test image, so a plain dynamic apt libsodium is
+# fine here (unlike bin/Dockerfile's release build, which links it statically for portability).
+# wireguard-tools provides the `wg` CLI used by run-docker-tests.sh's Rosenpass scenarios to
+# inspect preshared keys/endpoints/peer lists - it works against wireguard-go's userspace UAPI
+# socket too, not just a real kernel module, so this works regardless of --backend.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libsqlite3-dev iproute2 iputils-ping build-essential clang libclang-dev libselinux1-dev && \
+    apt-get install -y --no-install-recommends libsqlite3-dev iproute2 iputils-ping build-essential clang libclang-dev libselinux1-dev cmake pkg-config libsodium-dev wireguard-tools && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -28,6 +34,13 @@ RUN cargo build --features innernet/selinux \
     && strip /app/target/debug/innernet /app/target/debug/innernet-server \
     && cp /app/target/debug/innernet /app/target/debug/innernet-server /usr/bin/ \
     && cargo clean
+
+# Pinned to the same minimum version this project enforces at runtime (MIN_ROSENPASS_VERSION in
+# shared/src/rosenpass.rs, CVE-2023-53157 fixed >= 0.2.1).
+ARG ROSENPASS_VERSION=0.2.3
+RUN cargo install --version "${ROSENPASS_VERSION}" --locked --root /usr/local rosenpass \
+    && strip /usr/local/bin/rosenpass \
+    && rm -rf /usr/local/cargo/registry
 
 COPY ./docker-tests/start-client.sh ./
 COPY ./docker-tests/start-server.sh ./

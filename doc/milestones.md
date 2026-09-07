@@ -109,7 +109,7 @@ WireGuard PSK is touched yet (that's M4).
 other's config, and negotiate, verified by real process runs and the
 `#[ignore]`d tests in `shared/src/rosenpass.rs`.
 
-## M4 — PSK application — mostly DONE (docker-tests scenario still open)
+## M4 — PSK application — DONE
 
 - `client_core::rosenpass::apply_psks` wires the PSK-handoff mechanism from
   M0 into `PeerConfigBuilder::set_preshared_key` + `DeviceUpdate::apply`,
@@ -128,26 +128,43 @@ other's config, and negotiate, verified by real process runs and the
   stale branching) in `client-core/src/rosenpass.rs`, plus the real-binary
   convergence test from M3 that confirms the underlying mechanism (both
   sides' `key_out` files) actually produces applicable, matching keys.
-- **Not yet done**: no real WireGuard interface was exercised end-to-end
-  (this sandbox has no root/CAP_NET_ADMIN to create one) — the
-  `DeviceUpdate`/`PeerConfigBuilder` calls themselves are exercised by
-  wireguard-control's own existing test suite, but applying a
-  rosenpass-derived key to a *live* interface and confirming traffic keeps
-  flowing has not been verified. The `docker-tests/` scenario below (real
-  containers, real interfaces) is what would close that gap and remains
-  open:
-  - two containers, both `--enable-rosenpass`, confirm (a) traffic flows
-    immediately via the interim PSK, (b) the PSK changes after the first
-    real Rosenpass exchange, (c) it continues rotating (~2 min cadence)
-    without dropped traffic, (d) file/process permissions on the secret key
-    and PSK handoff file are `0o600`/owner-only.
+- **`docker-tests/` scenario now implemented and passing**
+  (`test_rosenpass_handshake` in `docker-tests/run-docker-tests.sh`): two
+  real containers, both `--enable-rosenpass`, over a real (userspace)
+  WireGuard interface, confirming (a) traffic flows immediately via the
+  interim PSK, (b) the PSK changes after the first real Rosenpass exchange,
+  (c) traffic keeps flowing after the rotation, (d) the secret key and PSK
+  handoff (`key_out`) file are both `0o600`, and (e) the server's own
+  Rosenpass sync (M6) also applies a PSK to that peer. Rotation cadence
+  itself (~2 min, ongoing) isn't polled for multiple cycles — one real
+  interim→real rotation is what the test asserts — since that's what
+  distinguishes "the mechanism actually works end to end" from "the code
+  compiles," and a multi-cycle wait would mostly just be a slower version
+  of the same assertion.
+- **Two real bugs found and fixed by finally running this against a real
+  interface** (neither reproduced against the tempdir-backed unit
+  tests/`#[ignore]`d real-binary tests, which never exercised a
+  freshly-created multi-level data directory or a `key_out` file actually
+  produced by a spawned `rosenpass` process):
+  - `shared::ensure_dirs_exist` used `fs::create_dir` (single level), which
+    fails with `ENOENT` whenever `<data_dir>/rosenpass/<interface>` is two
+    levels deep and neither level exists yet — exactly the real-world case
+    on a freshly-initialized node. A unit-test tempdir is always a single
+    already-existing level, so this never reproduced there. Fixed to
+    `fs::create_dir_all`.
+  - The `key_out` PSK handoff file is created by the `rosenpass` subprocess
+    itself (its own `output-key` config directive), under its own process
+    umask — world-readable (`0o644`) by default, since rosenpass has no way
+    to know the contents are a secret WireGuard PSK. `fresh_exchanged_psk`
+    now tightens it to `0o600` immediately upon reading, matching every
+    other key-bearing file in this codebase.
 
-**Acceptance**: partially met — PSK selection/application logic is
-implemented and unit-tested; the `docker-tests/` scenario above (real
-interfaces, real traffic) has not been run and is the remaining gap before
-this milestone is fully done.
+**Acceptance**: met — PSK selection/application logic is implemented,
+unit-tested, and now also verified end to end against a real interface via
+`docker-tests/`, which caught and led to fixing two real bugs neither the
+unit tests nor manual real-binary testing had exercised.
 
-## M5 — Permissive mode & mixed-fleet interop — mostly DONE (docker-tests scenario still open)
+## M5 — Permissive mode & mixed-fleet interop — DONE
 
 - Implemented as `client_core::interface::apply_rosenpass_visibility_policy`,
   called from `fetch()` right before diffing against the WireGuard device —
@@ -166,16 +183,20 @@ this milestone is fully done.
 - `--rosenpass-permissive`'s `--help` text now explicitly states the
   fail-open tradeoff (design.md §6) rather than just describing the
   mechanism.
-- **Not yet done**: the `docker-tests/` mixed-fleet scenario (three real
-  containers — two Rosenpass-enabled with one permissive, one plain/legacy —
-  confirming actual connectivity, not just the peer-list-filtering unit
-  tests above) remains open, same real-interface gap noted in M4.
+- **`docker-tests/` mixed-fleet scenario now implemented and passing**
+  (`test_rosenpass_permissive_fallback`): three real containers — one
+  strict `--enable-rosenpass`, one `--enable-rosenpass --rosenpass-permissive`,
+  one plain legacy peer with no Rosenpass at all — confirming actual
+  connectivity, not just the peer-list-filtering unit tests above: the
+  permissive peer reaches both the strict peer (with a real PSK) and the
+  legacy peer (fail-open, no PSK at all); the strict peer's own WireGuard
+  interface never lists the legacy peer as a peer at all, confirming strict
+  exclusion is real, not just a unit-tested code path.
 
-**Acceptance**: partially met — the policy logic is implemented and unit-
-tested; real three-peer connectivity via `docker-tests/` has not been
-verified and is the remaining gap.
+**Acceptance**: met — the policy logic is implemented, unit-tested, and now
+also verified end to end via a real three-peer `docker-tests/` scenario.
 
-## M6 — Server as a mesh peer — mostly DONE (docker-tests scenario still open)
+## M6 — Server as a mesh peer — DONE
 
 - `server/src/rosenpass.rs`: a new periodic task (`spawn`, wired into
   `serve()` alongside the existing endpoint-refresher/invite-sweeper/
@@ -205,16 +226,20 @@ verified and is the remaining gap.
 - Covered by unit tests for the DB-sourced key-caching logic
   (`server/src/rosenpass.rs`); the daemon-lifecycle/PSK-application code
   itself is the same already-tested `shared::rosenpass` code M3/M4 covered.
-- **Not yet done**: same real-interface gap as M4/M5 — no live
-  `innernet-server` process with a real WireGuard interface has exercised
-  this end-to-end in this environment (no root/CAP_NET_ADMIN available).
+- **Closed via `docker-tests/`**: `run-docker-tests.sh` now runs the
+  coordinating server itself with `--enable-rosenpass` for every test in the
+  suite (safe to do unconditionally per the scope-narrowing above — it never
+  gates any other test's peer visibility), and `test_rosenpass_handshake`
+  confirms `wg show` on the real running server reports a non-`(none)`
+  preshared key for an enrolled Rosenpass peer, closing the real-interface
+  gap this milestone had been tracking.
 
-**Acceptance**: partially met — the server-side sync logic is implemented,
-reuses already-tested shared code, and is unit-tested where it doesn't
-require a live interface; confirming `wg show` on a real running server
-shows a non-empty, rotating PSK for enrolled peers remains open.
+**Acceptance**: met — the server-side sync logic is implemented, reuses
+already-tested shared code, and is now also verified end to end: `wg show`
+on a real running server (inside `docker-tests/`) shows a non-empty PSK for
+an enrolled peer.
 
-## M7 — Security review & hardening — mostly DONE (subprocess privilege-dropping and docker-tests open)
+## M7 — Security review & hardening — mostly DONE (subprocess privilege-dropping still open)
 
 - Ran a security review against the full diff (946d53f..HEAD), using the
   same methodology as this repo's `/security-review` skill (its own
@@ -252,14 +277,18 @@ shows a non-empty, rotating PSK for enrolled peers remains open.
   a shared-ownership design for `rosenpass_dir` first, and couldn't be
   validated here anyway (no root/CAP_NET_ADMIN in this environment).
   Recorded as open in design.md §6 rather than shipped half-validated.
-- **Not done — `docker-tests/` suite**: same real-interface gap noted
-  throughout M4-M6; no docker-tests scenario has been written or run for
-  this feature yet.
+- **`docker-tests/` suite now implemented, run, and found two real bugs**
+  (both fixed — see M4): the real-interface gap noted throughout M4-M6 is
+  closed. This is exactly the kind of finding a purely source-level security
+  review can't catch — both bugs were about real filesystem/process
+  behavior (a directory-creation edge case and a subprocess's default file
+  permissions), not logic visible in a diff.
 
 **Acceptance**: partially met — security review complete with no open
 findings, fuzzing found and fixed a real bug, version pinning is now
-enforced in code (not just documented). Subprocess privilege-dropping and
-the `docker-tests/` scenarios remain open, tracked above rather than
+enforced in code (not just documented), and the `docker-tests/` suite is
+now implemented and passing (having found and fixed two further real bugs).
+Subprocess privilege-dropping remains open, tracked above rather than
 silently dropped.
 
 ## M8 — Docs & release — partially DONE (man pages and the actual release deliberately not done)
