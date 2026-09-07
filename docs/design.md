@@ -1,674 +1,374 @@
-# Design: Post-quantum WireGuard via Rosenpass
+# Design: Post-quantum WireGuard via peer-to-peer ML-KEM exchange
 
 Status: draft
 Related: [milestones.md](milestones.md)
 
 ## 1. Motivation
 
-innernet peers connect over WireGuard, whose handshake authenticates and derives
-keys using Curve25519 (X25519). That is not post-quantum secure: traffic
-recorded today could be decrypted later by an adversary with a cryptographically
-relevant quantum computer ("harvest now, decrypt later"). [Rosenpass](https://github.com/rosenpass/rosenpass)
-is a companion protocol that runs alongside WireGuard, negotiates a symmetric
-key using post-quantum-secure primitives, and periodically feeds that key into
-WireGuard as a **preshared key (PSK)**. It does not replace the WireGuard
-handshake — it strengthens it. Per the Rosenpass design goal, the combination
-is "cryptographically no less secure than using WireGuard on its own," so
-enabling it can only help.
+innernet peers connect over WireGuard, whose handshake authenticates and
+derives keys using Curve25519 (X25519). That is not post-quantum secure:
+traffic recorded today could be decrypted later by an adversary with a
+cryptographically relevant quantum computer ("harvest now, decrypt later").
 
-This doc proposes adding optional Rosenpass support to innernet: the server
-becomes a discovery channel for peers' Rosenpass public keys/endpoints (the
-same role it already plays for WireGuard endpoints), and the client manages a
-per-interface Rosenpass process that keeps PSKs fresh. It also proposes a
-`--rosenpass-permissive`-style fallback so a mixed fleet (some peers upgraded,
-some not) keeps working, modeled on NetBird's approach.
+This doc proposes hardening every WireGuard link against that threat by
+periodically deriving a **preshared key (PSK)** from a genuine post-quantum
+key encapsulation mechanism (KEM), and feeding it into WireGuard exactly the
+way any operator-supplied PSK works today. This does not replace the
+WireGuard handshake — it strengthens it: WireGuard's `Noise_IKpsk2` pattern
+mixes the PSK into the final session key, so the combination is
+cryptographically no less secure than WireGuard on its own, and enabling it
+can only help.
 
-## 2. Background: what Rosenpass actually does
+The distinguishing design choice here is **how** the two sides of a link
+exchange the KEM material: directly, peer-to-peer, using the *existing*
+coordination-server channel every peer already talks to for peer discovery —
+not a new, separately-exposed network service. The server's role stays
+exactly what it already is for WireGuard public keys and endpoints: a
+directory peers push to and pull from. It never sees a private key or a
+derived secret, only opaque ciphertext blobs it relays.
 
-- Each peer has a **separate** Rosenpass keypair (not the WireGuard keypair).
-  Rosenpass runs a companion UDP listener, negotiates keys with each configured
-  peer, and refreshes the resulting secret roughly every two minutes.
-- The reference implementation ([rosenpass/rosenpass](https://github.com/rosenpass/rosenpass))
-  is a Rust project using post-quantum KEMs (Classic McEliece + Kyber, hybrid
-  with classical crypto) via `liboqs`. It ships an `rp` wrapper that can drive
-  WireGuard directly, and a lower-level `rosenpass` binary for other
-  integrations (e.g. writing the derived key to a file instead of calling
-  `wg` itself).
-- By convention, if a Rosenpass instance listens on UDP port `N`, the
-  associated WireGuard interface listens on `N+1`. There is no hard
-  client/server distinction — an instance either has a configured
-  `listen`/endpoint (accepts connections) or doesn't (dials out).
-- The output is applied to WireGuard purely as a PSK
-  (`wg set <if> peer <pubkey> preshared-key <file>`); nothing else about the
-  WireGuard config changes.
-- **Known vulnerability, fixed upstream**: rosenpass versions before **0.2.1**
-  did not validate buffer size when decoding messages, allowing a malformed
-  UDP packet to crash the process (remote DoS) —
-  [CVE-2023-53157](https://osv.dev/vulnerability/CVE-2023-53157) /
-  GHSA-624c-2h52-gf7f, CVSS 7.5. Any vendored version **must** be pinned to
-  ≥ 0.2.1 (latest at time of writing: 0.2.3); this is a hard M0 gate (see
-  milestones.md), not just a "keep it updated" suggestion, and the M7 security
-  pass should include a regression test that a truncated/malformed packet to
-  the Rosenpass listener doesn't panic the process.
+## 2. Background: ML-KEM and why a relay, not a listener
 
-### 2.1 Prior art: how NetBird integrated it
-
-NetBird's writeup ([how-we-integrated-rosenpass](https://netbird.io/knowledge-hub/how-we-integrated-rosenpass),
-[docs](https://docs.netbird.io/client/post-quantum-cryptography)) is the
-closest existing integration into a WireGuard mesh coordinator, and it maps
-well onto innernet's architecture:
-
-- **Key/endpoint exchange piggybacks on existing peer discovery.** NetBird
-  extended its existing signaling exchange (the same channel that already
-  carries WireGuard pubkeys/endpoints) to also carry each peer's Rosenpass
-  public key. It deliberately did **not** build separate NAT traversal for
-  Rosenpass — the Rosenpass endpoint just points at the peer's already-known
-  WireGuard-reachable address.
-- **Interim PSK.** Before the first Rosenpass exchange completes, both sides
-  independently derive a deterministic placeholder PSK by lexicographically
-  ordering the two peers' Rosenpass public keys and hashing the result (this
-  is confirmed from NetBird's actual source,
-  [`client/internal/rosenpass/seed.go`](https://github.com/netbirdio/netbird/blob/main/client/internal/rosenpass/seed.go)
-  — a `DeterministicSeedKey()` producing a 32-byte PSK — rather than anything
-  ad hoc like truncating one side's key). Both peers computing over the same
-  sorted pair converge on an identical value with no round trip. This lets the
-  WireGuard tunnel come up immediately instead of blocking on the PQ handshake,
-  at the cost of that window not being PQ-secure — NetBird's docs describe
-  WireGuard's own handshake-session lifetime as keeping a "no real PSK yet"
-  window open for several minutes at connection start, which this interim key
-  only shortens, not eliminates. innernet doesn't need bit-for-bit
-  compatibility with NetBird's exact hash/ordering — only that its own two
-  peers derive the same value — but should keep the same "sort, don't pick a
-  side" shape to avoid the two ends silently deriving different keys due to
-  which one dialed first.
-- **Applying the PSK doesn't disrupt the tunnel.** Once Rosenpass produces a
-  real key, the agent updates just the PSK field for that peer — a
-  millisecond-scale operation, not a full reconnect.
-- **`--rosenpass-permissive` is a client-side-only flag**, enabled together
-  with `--enable-rosenpass`. It
-  only changes what a Rosenpass-enabled peer does when the *other* side hasn't
-  advertised Rosenpass support: fall back to a plain WireGuard connection
-  (no PSK) instead of refusing to connect. There is no server-side equivalent
-  in NetBird, because the coordinating server isn't in the data path and can't
-  force two clients to run a local daemon — it can only tell them about each
-  other.
-- **Rosenpass is embedded, not spawned.** NetBird is written in Go, so it
-  embeds a Go reimplementation (via the `cunicu` project) rather than shelling
-  out to the Rust reference implementation, to avoid packaging a second
-  binary.
-
-Since innernet is already Rust, we don't have NetBird's language-mismatch
-problem, and we should not repeat their choice by reimplementing Rosenpass's
-protocol ourselves — that reimplements security-critical PQ crypto for no
-benefit. See §5.7 for the resulting recommendation.
+- **ML-KEM** (FIPS 203, standardized 2024, formerly known as Kyber) is a
+  NIST-standardized post-quantum KEM. A KEM has three operations: `KeyGen()`
+  → `(public_key, secret_key)`; `Encapsulate(public_key)` → `(ciphertext,
+  shared_secret)`; `Decapsulate(secret_key, ciphertext)` → `shared_secret`
+  (the same value the encapsulating side produced). Critically, this is a
+  **one-shot** operation, not an interactive multi-round-trip protocol — the
+  encapsulating side needs nothing from the other side except its long-lived
+  public key, which it can fetch once and cache.
+- ML-KEM-768's sizes are small enough to travel as ordinary API payloads:
+  public key ~1184 bytes, ciphertext ~1088 bytes, both comfortably under a
+  kilobyte and a half base64-encoded. This is the key enabling fact for this
+  design: it means the public key can be *just another field* on a peer's
+  existing record, and a ciphertext can be *just another small object* the
+  coordination server temporarily stores and forwards — no separate listener,
+  no separate wire protocol, no new exposed port.
+- Because encapsulation is one-shot and asynchronous (the encapsulating side
+  doesn't need the other side to be online at that exact instant — it just
+  needs the recipient's public key, which is already cached), the natural
+  transport for the ciphertext is the *same* request/response channel a peer
+  already uses to fetch its peer list: drop the ciphertext off, the recipient
+  picks it up on its next regular poll.
+- This deliberately avoids running any new always-on network service per
+  peer. Every additional exposed listener is additional attack surface (an
+  unauthenticated flood against it, a parser bug in a new wire format, a
+  port an operator has to remember to firewall) — see §6 for why this
+  matters more than it might first appear.
 
 ## 3. Relevant existing innernet architecture
 
 (For readers unfamiliar with the codebase; skip to §5 if not.)
 
-- **Workspace**: `wireguard-control` wraps the kernel/userspace WireGuard
-  backends; `netlink-request`/`hostsfile` are its Linux/`/etc/hosts` helpers.
-  `shared` holds cross-cutting types (`Peer`, `Cidr`, `InterfaceConfig`, CLI
-  option structs) used by both `server` (binary `innernet-server`) and the
-  client stack (`client-core` library + `client` binary `innernet`).
-  `publicip` is a standalone IP-discovery helper.
-- **Peer model** (`shared/src/types.rs:572`): `PeerContents` carries
-  `name, ip, cidr_id, public_key, endpoint, persistent_keepalive_interval,
-  is_admin, is_disabled, is_redeemed, invite_expires, candidates`. `Peer`
-  wraps it with a DB `id`. The server's `/v1/user/state` endpoint
-  (`server/src/api/user.rs:62`) returns a `State { peers, cidrs }`
-  (`shared/src/types.rs:812`) — this is the entire "what should my interface
-  look like" payload a client polls.
-- **Candidate/endpoint discovery is the closest existing analog to what we're
-  building.** `server/src/api/mod.rs` (`inject_endpoints`) merges each peer's
-  self-reported endpoint override with the WireGuard-observed endpoint and a
-  list of NAT candidates, entirely server-side, before the state response goes
-  out. Clients report their own reachable addresses via
-  `PUT /v1/user/candidates` and override endpoints via
-  `PUT /v1/user/endpoint` (`server/src/api/user.rs:29-49`). A new Rosenpass
-  pubkey/endpoint field would flow through the exact same
-  report-then-broadcast pattern.
-- **DB schema** (`server/src/db/peer.rs:13`): a flat SQLite `peers` table,
-  columns listed in `COLUMNS` (`server/src/db/peer.rs:31`), read via
-  `from_row` by fixed column index. New nullable columns are additive and
-  don't require touching existing rows.
-- **wireguard-control already supports PSKs.** `PeerConfigBuilder`
-  (`wireguard-control/src/config.rs:42-181`) has `preshared_key: Option<Key>`
-  with `set_preshared_key`/`unset_preshared_key`, and applying a builder
-  updates settings "on top of" the existing peer config — it does not require
-  removing/re-adding the peer. This is the one piece of plumbing the design
-  needs that already exists end to end.
-- **Client fetch loop** (`client-core/src/interface.rs:156` `fetch()`): pulls
-  `State` from the server, diffs it against the live WireGuard device
-  (`Device::diff`, producing `PeerDiff`/`PeerConfigBuilder`s per
-  `shared/src/peer.rs:678-807`), applies the diff via
-  `DeviceUpdate::apply`, updates the hosts file, persists to `DataStore`,
-  then reports NAT candidates and runs NAT traversal. This is the natural
-  place to also (a) push newly-discovered peers into a Rosenpass config and
-  (b) reload/refresh that process.
-- **Config storage**: `InterfaceConfig`/`ServerInfo`/`InterfaceInfo`
-  (`shared/src/interface_config.rs`) hold the WireGuard keypair and server
-  contact info as TOML at `<config_dir>/<interface>.conf`, mode `0o600`.
-  `DataStore` (`client-core/src/data_store.rs`) caches the last-known peer/CIDR
-  state per interface. Both are natural homes for Rosenpass keys/state,
-  respectively.
-- **Auth model**: the server trusts the *source IP* of a request as the peer's
-  identity (`server/src/lib.rs:626` `get_session`) — it looks up
-  `DatabasePeer::get_from_ip(remote_addr)`. This only works because the
-  request already arrived over an authenticated WireGuard tunnel; the
-  `X-Innernet-Server-Key` header is a sanity check that the client is talking
-  to the right server, not the actual authentication. This matters for the
-  security section below: Rosenpass strengthens the *WireGuard* tunnel's
-  confidentiality/forward-secrecy, but the *API's* authentication model is
-  unchanged and still ultimately rests on the classical WireGuard handshake
-  until that specific peer↔server link also has a fresh Rosenpass PSK.
-- **CLI conventions**: subcommands live in a `clap::Subcommand` enum in
-  `client/src/main.rs`; per-command option structs live in
-  `shared/src/types.rs` (e.g. `ListenPortOpts`, `NatOpts`, `NetworkOpts`) and
-  are reused across `install`/`up`/`redeem-invite`/etc. via `#[clap(flatten)]`.
-  A new `RosenpassOpts` (`--enable-rosenpass`, `--rosenpass-permissive`) fits
-  this pattern directly, following the same shape as the recent
-  `--listen-port` addition (`ListenPortOpts`, PR #409).
-- **Testing infrastructure**: `server/src/test.rs` provides an in-process
-  test server (SQLite in a tempdir, fixed test peers/CIDRs) used throughout
-  `server/src/api/*.rs`'s `#[cfg(test)]` modules — this is where new endpoint
-  tests belong. `docker-tests/` builds real Debian containers running actual
-  `innernet`/`innernet-server` binaries over a Docker bridge network for
-  full end-to-end coverage (`start-server.sh`, `start-client.sh`,
-  `run-docker-tests.sh`); this is where a real two-peer Rosenpass handshake
-  and permissive-mode fallback should be exercised.
+- **Coordination server, not a data-plane relay.** The server holds a
+  SQLite-backed peer database (`server/src/db/`) — each peer's WireGuard
+  public key, IP, CIDR membership, and endpoint. It never carries actual
+  VPN traffic; peers fetch each other's info and then talk to each other
+  directly over WireGuard. This design keeps that property: the mailbox
+  described below stores tiny ciphertext blobs, never tunnel traffic.
+- **Peer visibility already follows CIDR scoping.** A peer only ever learns
+  about the peers it's authorized to see, enforced server-side per existing
+  CIDR/authorization rules. Any new per-peer field added to the peer record
+  inherits this scoping for free — nothing new to re-implement.
+- **The bulk state fetch.** Clients periodically call `GET /v1/user/state`
+  (driven by `innernet up --daemon --interval <seconds>`, default 60s) to
+  get their current peer list and apply it to the local WireGuard interface.
+  The server also runs its own equivalent sync loop for its own
+  coordination-API WireGuard link (see §5.10). This existing poll loop is
+  the natural place to also pick up and process pending KEM material —
+  no new polling loop needs to be invented.
+- **PSK application is already a solved, separate concern.** Applying a PSK
+  to a running WireGuard interface is a small, non-disruptive
+  `PeerConfigBuilder::set_preshared_key` + `DeviceUpdate::apply` call —
+  wireguard-control merges peer settings onto the existing peer rather than
+  tearing down the tunnel. Nothing about this design changes that mechanism;
+  it only changes how the PSK value gets derived.
+- **Feature flags and backward compatibility.** `ServerCapabilities`
+  (`shared/src/types.rs`) is how the server already advertises optional
+  features to clients, and `PeerContents` fields already use
+  `#[serde(default)]` so old and new client/server combinations
+  interoperate without a hard cutover. The schema changes below follow
+  that exact pattern.
 
 ## 4. Non-goals
 
-- Not reimplementing the Rosenpass protocol/crypto in this repo.
-- Not changing WireGuard key generation, the invite/redeem flow, or the
-  server's peer-authorization/CIDR-visibility model.
-- Not making Rosenpass mandatory for any existing network — it must be
-  opt-in and fail open (see permissive mode) so current deployments are
-  unaffected by default.
-- Not solving NAT traversal for Rosenpass separately from what innernet
-  already does for WireGuard (§5.5).
+- Not building general-purpose NAT traversal for the exchange — it reuses
+  the coordination server's already-authenticated channel, which every peer
+  already reaches by construction (it has to, to get its peer list at all).
+- Not attempting to hide metadata (who is exchanging keys with whom) from
+  the coordination server — it already knows the full peer graph and CIDR
+  membership; this adds nothing new to that trust boundary.
+- Not building a general pub/sub or messaging system. The mailbox is
+  intentionally narrow: one pending ciphertext per ordered peer pair, with a
+  short TTL — not a general delivery mechanism for arbitrary payloads.
 
 ## 5. Proposed design
 
 ### 5.1 Data model & schema changes
 
-Add to `PeerContents` (`shared/src/types.rs:572`), mirroring the existing
-`candidates: Vec<Endpoint>` field's backward-compat pattern:
-
-```rust
-pub struct PeerContents {
-    // ...existing fields...
-    #[serde(default)]
-    pub rosenpass_public_key: Option<String>, // base64, Rosenpass keypair pubkey (NOT the WG pubkey)
-    #[serde(default)]
-    pub rosenpass_addr: Option<Endpoint>,     // reuses the existing Endpoint type/parser
-}
-```
-
-`#[serde(default)]` means old clients talking to a migrated server, and new
-clients talking to an old server, both deserialize fine — the field is just
-absent/`None`. This is the same trick already used for `candidates`.
-
-Server DB: add nullable `rosenpass_public_key TEXT` and `rosenpass_addr TEXT`
-columns to the `peers` table (`server/src/db/peer.rs:13`), append to
-`COLUMNS`, thread through `create`/`update`/`from_row`. Because SQLite
-`ALTER TABLE ADD COLUMN` is additive and the columns are nullable, this is a
-plain migration with no backfill needed — see `server/src/db/mod.rs` for
-where existing migrations are registered.
-
-Extend `ServerCapabilities` (`shared/src/types.rs:824`) with a
-`rosenpass: bool` flag, following the existing
-`unspecified_ip_in_override_endpoint` precedent — lets a client detect "this
-server understands Rosenpass fields" without a version bump, exactly how
-`report_candidates` already probes for 404 to detect old servers
-(`client-core/src/interface.rs:390`).
+- Add a nullable `pq_kem_public_key` column to the `peers` table
+  (`server/src/db/peer.rs`), threaded through `create`/`update`/`from_row`/
+  `COLUMNS` — mirrors how the WireGuard public key column already works.
+- Add the field to `PeerContents` with `#[serde(default)]`
+  (`shared/src/types.rs`), so old clients/servers round-trip peer records
+  without it.
+- Add `pq_kem: bool` to `ServerCapabilities`, following the existing pattern
+  for advertising optional features.
+- New table, `pq_handshake_mailbox`: `(to_peer_id, from_peer_id, ciphertext,
+  created_at)`, primary-keyed on `(to_peer_id, from_peer_id)` — at most one
+  pending, undelivered ciphertext per ordered pair at a time. A fresh
+  encapsulation overwrites any previous undelivered one for that pair rather
+  than accumulating a backlog.
 
 ### 5.2 New server endpoints
 
-Add `PUT /v1/user/rosenpass` to `server/src/api/user.rs`, structurally
-identical to the existing `endpoint`/`candidates` handlers: authenticate via
-the existing `Session`, validate the submitted public key (fixed-length
-base64, same shape validation `Key::from_base64` already does for WireGuard
-keys) and `rosenpass_addr` (reuses `Endpoint::from_str`), then
-`DatabasePeer::update`. No new authorization model — visibility of the field
-in `/v1/user/state` is already scoped correctly for free, because it rides
-inside the existing `Peer`/`State` that `get_all_allowed_peers` (CIDR-scoped)
-already filters (`server/src/db/peer.rs:293`).
+- `PUT /v1/user/pq-handshake/{to_peer_id}` — upload a ciphertext addressed
+  to another peer. Validates: payload size matches the expected ML-KEM-768
+  ciphertext length exactly (reject anything else outright, same spirit as
+  the existing candidate-endpoint size caps), `to_peer_id` must be a peer
+  the caller is authorized to see (same CIDR check already applied to
+  peer-list visibility).
+- Delivery needs no separate `GET` endpoint: pending ciphertexts addressed
+  to the requester are embedded directly in the existing `GET /v1/user/state`
+  response (one extra optional field per peer entry the fetcher is
+  authorized to see). The server deletes a mailbox row once served in a
+  response — at-most-once delivery, no separate ack round trip.
+- A short TTL (a small multiple of the fetch interval — e.g. 10 minutes)
+  garbage-collects anything nobody ever picked up, so the table can't grow
+  unbounded from peers that are offline or have since been removed.
 
 ### 5.3 Client: keypair lifecycle
 
-On `install`/`redeem-invite`, generate a Rosenpass keypair (distinct from the
-WireGuard keypair — Rosenpass explicitly requires its own keys) and store it
-alongside the interface's data, e.g.
-`<data_dir>/interfaces/<interface>/rosenpass/{public,secret}key`, secret key
-mode `0o600` like the existing WireGuard private key handling in
-`interface_config.rs:104`. Register the public key + Rosenpass listen address
-with the server via a new `RestClient` method
-(`rest_client.rs`, alongside `create_peer`/`get_peers`), called once at
-install time and re-synced on `up` (mirrors how `report_candidates` re-reports
-on every `fetch`).
+- Generate an ML-KEM-768 keypair once per interface (on `install`/
+  `redeem-invite`), store the secret key `0o600` under
+  `<data_dir>/interfaces/<interface>/pq-kem/` — same permission discipline
+  and directory shape as the existing WireGuard private key handling in
+  `interface_config.rs`.
+- Register the public key via a `RestClient` method
+  (`client-core/src/rest_client.rs`) called once at install and re-checked
+  (idempotently — only send if it doesn't already match what the server has
+  on record) on every `up`, mirroring the existing idempotent-registration
+  pattern already used elsewhere in this codebase for other per-peer fields.
+- `innernet show`: display whether the local interface and each visible
+  peer has advertised a PQ KEM public key.
 
-### 5.4 Client: process lifecycle
+### 5.4 Dial/listen tie-break for exchange initiation
 
-Run one Rosenpass process per innernet interface, lifecycle tied to
-`wg::up`/`wg::down` (`client-core/src/interface.rs:85-108`, `:402`
-`interface_is_up`):
+Exactly one side of every peer pair must be the one to encapsulate first
+(the "initiator" for that pair) — if both sides encapsulated independently
+and applied their own locally-computed secret, they'd derive **two
+different** values and the tunnel would silently fail to agree on a PSK,
+with no visible error. Both sides need to reach the same
+initiator/responder assignment without coordinating, so it's derived from
+something both already know: peer ID.
 
-- On `up`: write a Rosenpass config listing every peer currently known from
-  the last fetched `State` (public key + `rosenpass_addr`, skipping peers that
-  haven't advertised one), start the process.
-- On every subsequent `fetch()` (`interface.rs:156`): after applying the
-  WireGuard peer diff, recompute the Rosenpass peer list from the new `State`
-  and reload the process if the peer set or any peer's `rosenpass_addr`
-  changed (same "only touch what changed" spirit as `PeerDiff`).
-- On `down`: stop the process.
+- The coordinating server is always peer id 1 (the first peer any network
+  has). It's special-cased to always be the **responder**, never the
+  initiator: it's the side an operator can reliably keep online 24/7, while
+  any other peer may be offline, asleep, or behind a NAT with no stable
+  reachability — none of which matters here, since initiation only requires
+  the *coordination server* to be reachable (which every peer already
+  assumes), not the other peer directly.
+- For a pair where neither side is the server, there's no such asymmetry to
+  exploit, so it falls back to an arbitrary but deterministic tie-break: the
+  lower peer ID initiates.
 
-This slots into the same place `update_hosts_file` already gets called
-(`interface.rs:264`), i.e. "things that get regenerated from the fetched
-state."
+### 5.5 Peer-to-peer exchange protocol
 
-### 5.5 Endpoint reuse (no separate NAT traversal) — and a critical asymmetry
+Per ordered pair `(initiator, responder)` decided by §5.4:
 
-Following NetBird's approach directly: don't build new NAT-traversal/endpoint
-discovery for Rosenpass. A peer's `rosenpass_addr` should default to "same
-host as my WireGuard endpoint, Rosenpass's own port," and reuse whatever
-address the WireGuard endpoint/candidate system has already resolved. This
-avoids duplicating `NatTraverse` (`client-core/src/nat.rs`) for a second
-protocol.
+1. The initiator fetches the responder's `pq_kem_public_key` (already
+   present in its regular peer-list fetch — no extra round trip).
+2. The initiator calls `Encapsulate(responder_public_key)` locally, getting
+   `(ciphertext, shared_secret_a)`.
+3. The initiator uploads only the ciphertext via
+   `PUT /v1/user/pq-handshake/{responder_id}`. The shared secret and the
+   secret key never leave the initiator's machine.
+4. On the responder's next regular state fetch, the pending ciphertext for
+   this pair is included in the response. The responder calls
+   `Decapsulate(own_secret_key, ciphertext)`, recovering
+   `shared_secret_b == shared_secret_a`.
+5. Both sides independently derive a WireGuard-compatible 32-byte PSK from
+   the shared secret via HKDF (see §5.7 for what else gets mixed in), and
+   apply it to that specific peer's WireGuard config
+   (`PeerConfigBuilder::set_preshared_key` + `DeviceUpdate::apply`) —
+   exactly as any other PSK update already works in this codebase.
 
-**However — and this was not obvious from reading Rosenpass's source, only
-discovered by actually running two real 0.2.3 processes against each other —
-configuring *both* sides of a peer pair to dial each other is actively
-broken, not merely redundant.** Each side ends up completing its own
-independent handshake and deriving a **different** preshared key from the
-other side — verified empirically: with both sides' peer entries carrying an
-`endpoint`, the two `key_out` files stably (not transiently) disagreed, even
-after the exchange settled. WireGuard requires an *identical* PSK configured
-on both peers, so applying each side's own value would silently break that
-tunnel with no visible error — the daemons look healthy, the files get
-written, nothing logs a failure. Re-running with **exactly one** side's peer
-entry carrying an `endpoint` (the other left unset, relying solely on its own
-`listen` socket) produced identical keys on both sides, matching upstream's
-own `tests/integration_test.rs`, which uses exactly this asymmetric shape.
+### 5.6 Rotation cadence & confirmation
 
-The fix: for every peer pair, exactly one side must dial. Since both sides
-must independently reach the same assignment without coordinating, it's
-derived from something both already know — peer ID, via `rosenpass::we_dial`
-(`shared/src/rosenpass.rs`). The coordinating server is always peer id 1 (the
-first peer any network has) and is special-cased to always be the listener,
-never the dialer: it's the side an operator can reliably keep online 24/7
-with a stable, easily-opened inbound port, while any other peer may be a
-NAT'd/roaming client with no stable inbound address at all — so every client
-always dials the server, not the other way around. For pairs where neither
-side is the server, there's no such asymmetry to exploit, so it falls back to
-an arbitrary but deterministic, symmetric tie-break: the lower peer ID dials
-the higher one (the same "sort, don't pick a side" principle already used for
-the interim PSK below). Used from both `client_core::rosenpass::sync` and
-`server::rosenpass::sync`. A regression test (`#[ignore]`d, requires the real
-binary — `test_two_real_peers_converge_on_identical_psk_when_only_one_dials`
-in `shared/src/rosenpass.rs`) runs two real processes end-to-end and asserts
-their derived keys match, specifically to catch anyone "fixing" this back to
-a symmetric configuration because it looks more natural.
+- There is no externally-imposed rekey timer to inherit — rotation cadence
+  is a parameter of *this* implementation, tied directly to the existing
+  `up --daemon --interval` loop (client) and the server's own periodic sync
+  task. A reasonable default is every few polling cycles, not every single
+  one, to bound the steady-state ciphertext-upload traffic.
+- **Confirmation reuses WireGuard's own handshake, rather than building a
+  bespoke acknowledgment protocol.** After applying a newly-derived PSK,
+  nothing needs to explicitly verify the two sides agree — if they don't,
+  WireGuard's own `Noise_IKpsk2` handshake (which mixes the PSK in) simply
+  fails to complete for that peer, exactly like an outright key mismatch
+  today. On failure, keep the previous working PSK in place until the next
+  rotation succeeds, rather than clearing it — the same "never leave a link
+  with no PSK at all due to a single failed cycle" principle applied
+  everywhere else PSKs are handled in this codebase.
 
-A second, unrelated portability finding from the same testing: `listen`
-should be **IPv4-any only**, not both IPv4-any and IPv6-any. Binding both on
-the same port fails with "Address already in use" on Linux, because
-dual-stack IPv6-any sockets also claim the IPv4 namespace there by default
-(`IPV6_V6ONLY` defaults to off on Linux, on on macOS/OpenBSD) — there's no
-single address pair that's portable across every OS this project supports.
-IPv6-only peers can't dial a Rosenpass listener as a result; a known,
-documented limitation rather than a silent gap.
+### 5.7 Hybrid classical+PQ secret combiner
 
-### 5.6 Applying the PSK
+Relying on a single post-quantum algorithm family means a future
+cryptanalytic break of that one algorithm compromises every derived PSK.
+Standard practice (matching TLS 1.3's `X25519MLKEM768` and OpenSSH's
+default post-quantum key exchange) is to combine an ML-KEM shared secret
+with an independent classical ECDH shared secret via a KDF, so the result
+stays secure as long as *either* half remains unbroken:
 
-**Resolved by the M0 spike, verified against the real 0.2.3 binary (not just
-its source):** file handoff, not Rosenpass's direct `wg set` integration.
-Rosenpass writes each peer's derived key, base64-encoded, to a `key_out` file
-on every exchange, and separately prints
-`output-key peer <id> key-file <path> exchanged|stale` to stdout — the
-"exchanged"/"stale" distinction matters and isn't optional to observe:
-upstream overwrites the *same* `key_out` file with random bytes on `stale`
-(invalidating a dropped session), so the file's raw contents alone can't
-distinguish a genuine PSK from that random overwrite. innernet redirects the
-daemon's stdout to a persistent log file (see §5.4) and only ever applies a
-key read after an `exchanged` line names that exact path.
+- Generate a dedicated X25519 keypair per interface alongside the ML-KEM
+  one (not the WireGuard static key itself — keeping these separate avoids
+  any cross-protocol key-reuse concerns).
+- Perform an ordinary X25519 ECDH alongside the ML-KEM encapsulation in the
+  same round described in §5.5.
+- `psk = HKDF(ikm = ml_kem_shared_secret || x25519_shared_secret, info =
+  "innernet pq-psk v1", length = 32)`.
 
-Once read, the key is applied via
-`PeerConfigBuilder::new(&pubkey).set_preshared_key(key)` +
-`DeviceUpdate::new().add_peer(builder).apply(...)` — no interface disruption,
-since wireguard-control merges peer settings onto the existing peer rather
-than replacing it. Rosenpass's alternative direct-`wg`-integration mode
-(`wg` field in its peer config, calling `wg set ... preshared-key /dev/stdin`
-itself) was rejected: it requires the `wg` CLI tool as an extra packaging
-dependency innernet doesn't otherwise need (wireguard-control talks to the
-kernel directly via netlink), and it would apply PSKs through a second,
-less-controlled code path outside innernet's own choke point for peer config.
+### 5.8 Trust boundary for the relayed ciphertext
 
-Apply an **interim PSK** the same way NetBird does — a value both sides can
-derive independently from the two Rosenpass public keys before the first
-real exchange completes — so the tunnel isn't blocked waiting on Rosenpass.
-Document (per NetBird's own admission) that this interim window is not
-PQ-secure.
+The coordination server relays the ciphertext but cannot read the shared
+secret it encapsulates — it only ever handles opaque bytes. However, since
+the server is also the source of truth for a peer's advertised
+`pq_kem_public_key`, a compromised server could in principle substitute its
+own keypair when asked "what is peer B's public key," letting it decrypt
+what it thinks is peer A's message to B (a relay-level MITM). This is
+**the same trust boundary the coordination server already has** for
+WireGuard public key distribution — a compromised server can already
+substitute a WireGuard public key and MITM the classical handshake today,
+so this doesn't newly expand what a compromised server can do, only extends
+an already-accepted trust assumption to one more field.
 
-### 5.7 Subprocess vs. embedding
+For deployments wanting a stronger guarantee that doesn't rely on trusting
+the server for this, a future extension can have each side sign its
+ciphertext (and the responder's public key it was encapsulated against)
+with a dedicated per-peer Ed25519 identity key, letting the other side
+verify the message actually came from who it claims — deferred as an
+explicit future option (§8) rather than assumed as part of the baseline
+design.
 
-Recommendation: **shell out to the upstream `rosenpass` Rust binary as a
-managed child process**, version-pinned (vendored source or pinned release
-tag, analogous to how `wireguard-control` vendors the embeddable WireGuard C
-library), rather than pulling it in as a Cargo library dependency or
-reimplementing it.
+### 5.9 Mailbox lifecycle & cleanup
 
-Rationale:
-- Rosenpass's own recommended deployment model is a companion process
-  communicating over a defined boundary (config file in, PSK file/hook out) —
-  we're not fighting the grain by doing the same.
-- Running the newest, least-battle-tested crypto code (liboqs bindings, a
-  young protocol) in a separate OS process is a meaningful security boundary
-  for defense-in-depth, independent of Rust's memory safety guarantees for
-  *logic* bugs and protocol issues, even though it isn't the privilege-boundary
-  NetBird's Go embedding foreclosed.
-- We inherit upstream security fixes by bumping a pinned version, rather than
-  needing to track a library API that (per its own repo) is still stabilizing.
-- If upstream later ships a stable, embeddable Rust crate, this can be
-  revisited — the architecture above (config generation from `State`, PSK
-  application via `PeerConfigBuilder`) doesn't change either way.
+- At most one undelivered ciphertext per ordered pair (§5.1) bounds storage
+  regardless of how many rotation cycles are missed.
+- Delete-on-delivery (§5.2) means a healthy, regularly-polling fleet never
+  accumulates backlog at all.
+- The TTL-based sweep (§5.2) bounds storage from peers that go permanently
+  offline or get removed before ever polling again.
 
-### 5.8 Permissive mode & flags
+### 5.10 Server as a mesh peer
 
-New CLI options (`shared/src/types.rs`, alongside `NatOpts`/`NetworkOpts`):
+The coordination server is itself a WireGuard peer (its own coordination-API
+link), and participates in this scheme exactly like any other peer: it
+generates its own ML-KEM/X25519 keypairs, advertises its public keys via its
+own database row, and runs the same periodic sync task client interfaces
+run, applying the resulting PSK to its own device — no special-casing beyond
+the responder role already assigned to it in §5.4.
 
-```rust
-pub struct RosenpassOpts {
-    #[clap(long = "enable-rosenpass")]
-    pub enable_rosenpass: bool,
+### 5.11 Permissive mode & mixed-fleet interop
 
-    #[clap(long = "rosenpass-permissive", requires = "enable_rosenpass")]
-    pub rosenpass_permissive: bool,
-}
-```
+Not every peer will have this enabled — a phone running a stock WireGuard
+client, for instance, has no `pq_kem_public_key` to advertise at all. This
+is handled the same way any other opt-in per-peer capability is in this
+codebase: a peer that enables PQ hardening (`--enable-pq-psk`, say) can
+additionally opt into `--pq-psk-permissive`, which falls back to a plain
+WireGuard connection (no PSK) for any peer that hasn't advertised a
+`pq_kem_public_key`, instead of treating it as unreachable. This is always a
+per-operator, client-side choice — the server isn't in the data path and
+can't force a peer to run this locally, only tell peers about each other.
 
-(Matching NetBird's flag names, since that's what operators coming from
-NetBird will already expect — see §2.1.)
+### 5.12 Independent per-peer state, by construction
 
-Semantics: with Rosenpass enabled but *not* permissive, a peer with no
-advertised `rosenpass_public_key_hash` is treated as **unreachable** (no
-WireGuard peer entry is created for it) — this matches NetBird's documented
-"connections will fail" behavior and is the strict/compliance mode. With
-`--rosenpass-permissive`, such peers get a normal WireGuard peer entry with
-no PSK, i.e. today's behavior, while peers that *do* advertise Rosenpass still
-get PQ protection.
-
-Implemented as `client_core::interface::apply_rosenpass_visibility_policy`,
-called from `fetch()` right before diffing against the WireGuard device —
-**not** inside `PeerDiff`/`peer_config_builder` (`shared/src/types.rs:715`,
-the actual location of that logic — not `shared/src/peer.rs` as an earlier
-draft of this doc said) as originally planned. A simpler mechanism was found
-while implementing: the server already makes a disabled peer "disappear" by
-filtering it out of `/state` at the SQL level (never present-but-flagged,
-see `server/src/db/peer.rs`'s `get_all_allowed_peers`), and `Device::diff`'s
-existing add/remove logic already turns a peer's absence into a clean
-removal. Strict mode reuses that exact mechanism — removing peers with no
-advertised key from the list *before* it reaches `diff()` — rather than
-teaching `PeerDiff` a new code path.
-
-**Mobile/non-innernet peers make permissive mode a permanent requirement, not
-a transitional one.** There is no Rosenpass client for Android or iOS, and
-innernet itself has no path today for a non-innernet WireGuard client (e.g.
-the stock Android/iOS WireGuard app) to join a mesh at all — see §8. Any
-network that includes phone peers, now or via a future static-config-export
-feature, can **never** have those peers advertise a `rosenpass_public_key`.
-Strict mode would not just delay those peers until they "upgrade" — it would
-permanently and silently exclude every phone from the mesh, since there is
-nothing for them to upgrade to. Operators with mobile peers must run
-permissive mode indefinitely for that reason alone, independent of any
-rollout/migration timeline; this should be called out in the user-facing docs
-(M8) so it isn't mistaken for a temporary interop shim.
-
-There is intentionally **no server-side enforcement flag** that blocks
-non-compliant peers at the coordination layer — the server isn't in the data
-path and can't force a client to run a local process (§2.1). What the server
-*can* usefully offer is an **advisory, per-network policy bit** (e.g.
-`require_rosenpass` on the `networks`/CIDR-root config) that `innernet show`
-and `innernet-server`'s admin tooling surface as a warning for peers that
-haven't enabled it — visibility, not enforcement.
-
-### 5.9 Server as a mesh peer
-
-`innernet-server` itself holds a WireGuard peer identity in the mesh (it's
-`peers.id` row zero / the "innernet-server" peer seen in
-`server/src/api/user.rs` tests). For full protection of the
-coordination-API traffic itself (§3, auth model note), the server process
-runs the same Rosenpass process-management logic as the client
-(`server/src/rosenpass.rs`) — the daemon-lifecycle and PSK-application
-pieces (`ensure_daemon_running`/`apply_psks`) are factored into `shared` so
-both `client-core` and `server` call the identical code, differing only in
-how they source data: the server has every peer's row (including its own)
-directly in its database, so registering its own key or reading a peer's key
-is a direct DB read/write, never an HTTP round trip.
-
-**The server does not apply strict/permissive peer-exclusion to its own
-device**, even without `--rosenpass-permissive` — this is a deliberate,
-narrower scope than a first reading of "run the same logic as the client"
-might suggest. Client-side strict mode (§5.8) excludes a peer from *that
-client's* WireGuard interface, which only affects peer-to-peer connectivity
-between two mesh members. Doing the equivalent on the server would make a
-peer unable to reach the coordination API *at all* — breaking invite
-redemption and state fetching for a reason unrelated to whether that
-specific link happens to have post-quantum protection yet. That's a far more
-severe and simply wrong consequence, so the server's Rosenpass sync only
-ever adds PSK protection to server↔peer links; it never gates a peer's
-visibility or reachability based on Rosenpass status.
-
-### 5.10 Static config export for non-innernet peers (e.g. mobile) — implemented
-
-Not required for Rosenpass itself, but directly motivated by §5.8's finding
-that mobile peers can never run Rosenpass and today have no way to join an
-innernet mesh at all. Implemented (M9) as a small, independent client-side
-feature:
-
-- `--export-wg-conf` on `innernet add-peer` (`shared/src/types.rs`
-  `AddPeerOpts`) renders a standard `wg-quick`-compatible `.conf`
-  (`shared::wg_export::render_wg_quick_conf`) instead of the innernet-native
-  `PeerInvitation`:
-  - `[Interface]`: the newly generated `PrivateKey` and the peer's allocated
-    `Address`, both already produced by `create_peer()`
-    (`client-core/src/peer.rs`) via `PeerInvitation::interface_config()`, a
-    small accessor added for this purpose. No `DNS`/`PostUp` — hostsfile-style
-    name resolution only works for innernet-managed peers; peer names appear
-    only as `#` comments in the exported file, for readability.
-  - `[Peer]` blocks: one per entry in the same already-fetched peer list
-    `add_peer()` uses to build a normal invitation — no extra server round
-    trip. Each peer's `PublicKey`, `AllowedIPs` (that peer's own `/32` or
-    `/128`, matching exactly what `PeerDiff`/`peer_config_builder`
-    (`shared/src/types.rs`) already computes for a normal client), and
-    `Endpoint` when known (omitted, not defaulted to anything, when a peer
-    has none yet). Disabled and not-yet-redeemed peers, and the exported
-    peer's own entry, are excluded.
-  - Never includes a Rosenpass field — an exported peer is, by construction,
-    permissive-only (§5.8) for every *other* peer's link to it. The
-    `require_rosenpass` "advisory policy bit" floated below was never
-    actually built in this implementation (M1–M8's code has no such field),
-    so there's no check to add here; the README documents the operational
-    guidance instead.
-  - **Does include a static preshared key, but only for one link.** A
-    freshly generated PSK (`wireguard_control::Key::generate_preshared`) is
-    always attached to the exported peer's `[Peer]` block for the admin
-    peer that ran the export command — the same protocol-level PSK field
-    Rosenpass itself uses, just manually provisioned instead of
-    continuously re-derived. This is deliberately *not* mesh-wide: the PSK
-    is generated and applied entirely locally (persisted at
-    `<data_dir>/exported-psks/<interface>.toml`, keyed by the exported
-    peer's public key, via `shared::wg_export::save_exported_psk`/
-    `get_exported_psk`/`apply_exported_psks`) and never sent to or read from
-    the coordination server — a PSK is exactly as sensitive as a private
-    key, so the same "never touches the server" property this design
-    already relies on for the exported private key applies here too. That
-    means it can only ever protect the *one* link this peer's own device
-    has to the exported peer; every other peer's link to it remains plain
-    WireGuard with no PSK at all, since there's no channel here to
-    distribute this secret anywhere else. Applied on every `fetch()` as its
-    own follow-up `DeviceUpdate` (`client_core::interface::fetch`), the same
-    non-disruptive pattern `rosenpass::apply_psks` uses, and independent of
-    whether Rosenpass is enabled at all — this is a plain WireGuard feature.
-    `export-peer-config` re-embeds the same stored PSK unchanged on refresh
-    (never regenerated, for the same reason the private key isn't).
-- **Staleness is a first-class limitation, stated plainly, not an edge
-  case.** Both the CLI's log output (at export and at refresh time) and the
-  exported file's own header comment say this is a point-in-time snapshot
-  with no auto-refresh. `innernet export-peer-config <interface> <path>`
-  refreshes an already-exported file's `[Peer]` blocks from the current
-  peer list, in place, without rotating its keys — implemented as a refresh
-  of the *file* (via `shared::wg_export::parse_exported_interface`, which
-  reads back the `[Interface]` section from a file this exporter itself
-  produced), not a lookup by peer name as originally sketched: the private
-  key was never sent to or stored by the server (the same property every
-  other key in this design relies on), so there's no name-keyed lookup that
-  could recover it — only the originally-exported file can.
-- **Secret handling.** The rendered `.conf` contains a raw WireGuard private
-  key in plaintext. `shared::wg_export::write_exported_conf` sets `0o600`
-  before writing, matching `InterfaceConfig`'s existing discipline — an
-  initial implementation missed this (defaulting to the OS's normal file
-  permissions), caught by a permissions-asserting test before it shipped.
-  QR code export (`--export-wg-conf-qr`) was not implemented in this pass.
-- Entirely additive to `client/src/main.rs`'s existing `add_peer()` and a
-  new `export-peer-config` subcommand — no new server endpoint, no schema
-  change, and no dependency on any Rosenpass milestone (implemented after
-  M8 here, but doesn't depend on it). See milestones.md M9.
+Because each peer pair's PSK is derived from a standalone, independent
+KEM exchange — not a shared multi-peer process with one combined
+configuration file — pausing, skipping, or backing off the rotation cadence
+for one specific idle peer has **no effect on any other peer's exchange**.
+This falls out of the architecture rather than needing to be specially
+engineered: there is no shared daemon to restart, no combined config file
+to regenerate, and no reason a per-peer idle-detection policy (e.g.
+"don't bother rotating a peer with zero WireGuard traffic in the last N
+minutes") would ever need to touch any other peer's state. Left as a
+concrete feature for future work (§8), but worth calling out here as a
+structural property this design has and a shared-process design would not.
 
 ## 6. Security considerations
 
-- **Threat model delta**: Rosenpass adds forward secrecy / PQ resistance to
-  the *transport* (WireGuard data plane) between two peers that both enable
-  it. It does **not** by itself harden the innernet coordination API's
-  authentication, which (§3) is IP-based over the existing tunnel — that only
-  improves once the specific client↔server WireGuard link also carries a
-  Rosenpass PSK (§5.9).
-- **Key storage**: Rosenpass secret keys must never be sent to the server
-  (only the public key + address are, exactly like the WireGuard model)
-  and must be stored with the same `0o600`/owner-only discipline as the
-  existing WireGuard private key (`interface_config.rs:104`,
-  `chmod`/`ensure_dirs_exist` in `shared/src/lib.rs`).
-- **New endpoint hardening**: `PUT /v1/user/rosenpass` needs the same input
-  validation rigor as `PUT /v1/user/endpoint`/`candidates` — reject malformed
-  base64/wrong-length keys, cap payload size, and reuse
-  `subtle`'s constant-time comparison pattern already used for the server's
-  own pubkey check (`server/src/lib.rs:637` `ct_eq`) for any new secret
-  comparison this feature introduces.
-- **No new SSRF surface**: `rosenpass_addr` is only ever consumed by other
-  peers' local Rosenpass processes dialing out directly (mirroring how
-  `Endpoint`/`candidates` already work) — the server never itself connects to
-  a peer-supplied address, so this doesn't expand the existing candidate
-  system's trust boundary.
-- **Subprocess hardening — pinned version check and privilege dropping both
-  implemented.** `shared::rosenpass::check_rosenpass_version` refuses to
-  spawn a `rosenpass` binary older than 0.2.1 (verified against the real
-  installed 0.2.3 binary), closing the "operator has an old binary" gap in
-  CVE-2023-53157's mitigation. Running the long-running exchange daemon
-  (not the one-shot `gen-keys` step — the daemon is the process actually
-  exposed to untrusted network input, so it's the one worth hardening) as
-  an unprivileged user is now opt-in via `--rosenpass-group <name>`:
-  - Requires the group to already exist (`groupadd --system <name>`) —
-    deliberately no install-time hook to create it, since the right
-    group/policy is deployment-specific, not something this codebase
-    should decide unilaterally.
-  - `shared::rosenpass::prepare_shared_ownership` chgrp's the per-interface
-    `rosenpass_dir` tree to that group (never changing *ownership*/uid of
-    anything — root keeps full access throughout) and loosens permissions
-    just enough for a group member to read the secret key/config/cached
-    peer keys and create/rewrite key-handoff files.
-  - `spawn_daemon` drops privileges via a single `pre_exec` closure
-    (clear supplementary groups → `setgid` → `setuid`, an order that must
-    not change, since dropping uid first forfeits the capabilities needed
-    to still change gid/groups) rather than `Command`'s own `uid()`/`gid()`
-    builder methods, keeping that ordering fully explicit rather than
-    relying on an assumption about std's internal application order.
-  - **A real bug here that only a live `docker-tests` run caught** (not
-    unit tests, and not the source-level security review pass below):
-    `prepare_shared_ownership` fixed up `rosenpass_dir` itself but not the
-    directories *above* it — `data_dir` (e.g. `/var/lib/innernet`) stays
-    `0o700` root-only several levels up (`DataStore::open_or_create`'s own
-    `ensure_dirs_exist` call), so the unprivileged daemon could never
-    traverse down to its own config file at all. It read as "config file
-    does not exist" and got killed and respawned in a tight loop every
-    fetch cycle, never completing a real exchange — exactly the kind of
-    bug that requires an actual locked-down multi-level directory tree to
-    reproduce, which no tempdir-backed unit test builds. Fixed with
-    `ensure_ancestors_traversable`, adding execute-only ("traverse", not
-    read/write) permission for `other` on every ancestor directory — the
-    same tradeoff most systems already make for e.g. `/home` (`0o711`).
-    Verified via a manual repro (the daemon now stays alive as
-    `nobody:<group>` with a stable pid, instead of crash-looping) and a
-    dedicated `docker-tests/` scenario confirming a real Rosenpass exchange
-    still completes, PSK rotation included, with the daemon provably
-    running under a non-root uid/gid (read straight from
-    `/proc/<pid>/status` inside the container).
-- **Fail-open, not fail-secure, by design** in permissive mode — document this
-  tradeoff explicitly for operators (mirrors NetBird's own documented
-  limitation) so it's a conscious choice per network, not a silent gap.
-- **Static config export (§5.10) writes a plaintext private key to disk/QR.**
-  Unlike every other key in this design, that key now leaves the machine that
-  generated it by design (handed to a phone) — it should get the same
-  `0o600`/owner-only file handling as `InterfaceConfig`, a loud CLI warning
-  about the exposure, and no QR-to-image-file path by default (terminal
-  rendering only) to reduce the chance of an accidental durable copy. The
-  same is true of the static preshared key that link now gets (§5.10): it's
-  a plaintext secret both in the exported `.conf` and in this peer's own
-  local `<data_dir>/exported-psks/<interface>.toml`, and both are `0o600`.
-- **Even a static PSK is worth having, despite never rotating.** Unlike a
-  live Rosenpass link (re-exchanged continuously, so a single compromised
-  exchange doesn't compromise future sessions), this one is fixed for the
-  life of the exported config. That's a real limitation, not a rotation
-  bug: if it's ever compromised, the fix is the same as for the private key
-  it sits next to — regenerate and redistribute the whole exported file.
-  It's still worth doing, since it protects against harvest-now/decrypt-later
-  on that one link exactly as well as Rosenpass's own interim PSK does,
-  for as long as the file itself stays uncompromised.
-- **Testing plan** (detailed per-milestone in milestones.md):
-  server-side unit tests for schema/serialization back-compat and
-  CIDR-scoped visibility of the new fields (extending
-  `server/src/api/user.rs`'s existing test module and `server/src/test.rs`
-  fixtures); a real two-container `docker-tests/` scenario running actual
-  `rosenpass` processes to verify PSK convergence and traffic continuity;
-  a mixed-fleet scenario (one upgraded peer, one not) to verify permissive
-  fallback and strict-mode blocking; and a security review pass (this repo's
-  `/security-review` skill) focused on the new endpoint, the subprocess
-  boundary, and key file permissions before the feature is enabled by
-  default for any network.
+- **No new exposed listener.** Every exchange happens over the same
+  request/response channel already used for peer discovery, authenticated
+  the same way (existing peer-key-based auth on the coordination API). There
+  is no new UDP (or any other) port for an operator to open, firewall, or
+  rate-limit, and therefore no new standalone flood/amplification/DoS
+  surface distinct from what the coordination API already has to defend
+  against.
+- **Forward secrecy is a function of rotation cadence.** Each rotation
+  produces an independent secret from a fresh encapsulation; compromising
+  one derived PSK doesn't expose any other rotation's value (ML-KEM
+  ciphertexts don't reveal the secret key, and each encapsulation is
+  independently randomized).
+- **Replay.** A captured, replayed ciphertext just re-derives the exact same
+  secret the original exchange already produced — not a new one — so replay
+  by itself doesn't help an attacker who doesn't already have the
+  corresponding secret key. The mailbox's delete-on-delivery semantics
+  additionally mean a legitimate replay opportunity (re-delivering the same
+  ciphertext twice) shouldn't normally arise at all.
+- **Server-compromise blast radius** is bounded to what §5.8 already
+  describes: a compromised server can MITM the relay, matching its existing
+  ability to MITM WireGuard peer identity distribution — not a new category
+  of exposure introduced by this design.
+- **Input validation on the mailbox endpoint** must reject anything that
+  isn't exactly a well-formed ML-KEM-768 ciphertext-sized payload outright,
+  the same discipline already applied to the existing candidate-endpoint
+  validation, so a malformed upload can't be used to probe for parser bugs
+  or store oversized garbage.
 
 ## 7. Alternatives considered
 
-- **Reimplement Rosenpass in Rust natively in this repo** (skip the
-  subprocess). Rejected: duplicates security-critical PQ crypto that upstream
-  already maintains and has had more scrutiny on; loses the ability to pick
-  up upstream security fixes independently.
-- **Embed a reimplementation like NetBird's Go/`cunicu` approach.** Rejected:
-  innernet doesn't have NetBird's single-binary/cross-language constraint —
-  we're already Rust, so shelling out to the upstream Rust implementation is
-  strictly less risky than either reimplementing or embedding a second
-  implementation.
-- **Make Rosenpass mandatory network-wide with no fallback.** Rejected for
-  the initial rollout: would make upgrading a live network a flag day
-  (every peer must upgrade atomically), which doesn't fit how innernet
-  networks are actually operated (peers added/upgraded independently over
-  time). Permissive mode is the pragmatic default; strict mode remains
-  available per-network for operators who want it.
+- **A dedicated always-on companion process with its own listening port**,
+  running an independent PQ key-exchange protocol over the network directly
+  between peers. Rejected as the default approach here specifically because
+  it reintroduces exactly the operational costs this design avoids: a new
+  exposed port per listening peer to firewall/rate-limit, a new standalone
+  DoS surface, and — because such a daemon typically holds one combined
+  config file for all of its peers rather than independent per-pair state —
+  a change to any single peer's configuration typically forces a full
+  process restart affecting every other peer's session simultaneously.
+- **A large-public-key, code-based KEM** (multi-hundred-kilobyte to
+  megabyte-scale public keys) as an additional hedge alongside a
+  lattice-based KEM. Rejected for the default design: a key that large
+  can't reasonably travel as an ordinary API field the way ML-KEM's ~1.2 KB
+  key can, which is precisely the property this design depends on to avoid
+  a separate distribution mechanism. The classical+ML-KEM hybrid in §5.7
+  provides an algorithm-family hedge without that size cost.
+- **A fully local, hash-ratcheted PSK schedule** (seed once via a trusted
+  out-of-band channel, e.g. in person or via QR code, then have both sides
+  independently derive every subsequent rotation via a one-way KDF, never
+  transmitting new key material over the network again). Genuinely
+  post-quantum secure in principle — a hash-based ratchet doesn't rely on
+  a KEM at all — but rejected as the default: it has no way to
+  automatically provision a newly-invited peer (there's no network-based
+  bootstrap step at all, by design), and any missed rotation on either side
+  permanently desynchronizes the two chains with no recovery mechanism
+  short of re-seeding out-of-band again. Not a fit for a system built
+  around automatic, network-driven peer provisioning.
 
 ## 8. Open questions / risks
 
-- Exact vendored Rosenpass version/CLI surface (config file schema, whether
-  a file-watch or exec-hook mechanism exists for PSK handoff) needs
-  confirming against upstream during the milestone-0 spike — this doc's
-  §5.6 intentionally leaves both sub-options open pending that.
-- Whether `rosenpass_addr` needs its own port allocation story (default
-  `wg_port + 1` per upstream convention) when the WireGuard listen port is
-  randomized (`ListenPortOpts`) or behind NAT.
-- Long-term: whether to also protect the coordination API's confidentiality
-  independent of the mesh's WireGuard PSK (out of scope here; noted in §6).
-- **Non-innernet WireGuard clients (e.g. the stock Android/iOS app) currently
-  have no way to join an innernet mesh at all** — `innernet add-peer`
-  produces an innernet-native invitation
-  (`shared/src/interface_config.rs:18`), not a `wg-quick`-compatible static
-  config. Proposed as its own client-side feature in §5.10 (tracked as M9);
-  such peers are, by construction, permanently permissive-only (§5.8) and the
-  exported config would go stale with no push mechanism as the mesh changes.
+- Exact rotation-interval default and whether it should be independently
+  configurable from the general `up --daemon --interval`, or simply a fixed
+  multiple of it.
+- Whether the §5.8 signed-ciphertext hardening (removing the "trust the
+  server for relay integrity" assumption) is worth building as part of the
+  initial rollout, or genuinely deferrable given it doesn't expand the
+  existing trust boundary.
+- The exact idle-detection policy and threshold for the per-peer
+  pause/resume property described in §5.12 — this design makes it possible
+  cheaply, but the concrete heuristic (what counts as "idle," how quickly to
+  resume once traffic returns, whether resumption should be eager or wait
+  for the next natural rotation) is left unspecified here.
+- Mailbox table growth under a large, mostly-online fleet with a short
+  rotation interval — the TTL sweep bounds worst case, but the concrete
+  interval/TTL defaults should be chosen with real fleet sizes in mind
+  before this ships.
