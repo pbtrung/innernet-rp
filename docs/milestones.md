@@ -6,30 +6,38 @@ should keep `main` shippable throughout: the feature stays fully inert (no
 schema reads matter, no new keypairs generated, no mailbox traffic) until a
 network operator opts in, all the way through M6.
 
-## M0 — Spike: integrate leancrypto (ML-KEM, X25519, Ed448/X448, HKDF-SHA3)
+## M0 — Spike: integrate leancrypto (ML-KEM-1024, X448, HKDF-SHA3) and p521
 
 Not user-facing; de-risks every later milestone's assumptions in design.md
 §2.1/§5.1–§5.8.
 
 - Integrate [leancrypto](https://github.com/smuellerDD/leancrypto)'s Rust
-  bindings and pin a specific version/commit. Its Rust API is explicitly
-  documented upstream as not yet stable — decide here whether to track
-  upstream directly or vendor a pinned copy, and record the decision (design
-  doc §10 flags this as an open risk to close out in this milestone).
-- Confirm actual key/ciphertext/signature byte sizes for ML-KEM-768, X25519,
-  and Ed448 against the library's own output (design.md §2/§8 state expected
-  sizes; verify against the real implementation rather than the spec alone).
+  bindings (ML-KEM-1024, X448, SHA3/HKDF) and pin a specific version/commit.
+  Its Rust API is explicitly documented upstream as not yet stable — decide
+  here whether to track upstream directly or vendor a pinned copy, and
+  record the decision (design doc §10 flags this as an open risk to close
+  out in this milestone).
+- Separately integrate the [`p521`](https://crates.io/crates/p521)
+  RustCrypto crate for the ECDSA signing scheme (§5.8) — a second,
+  independent crypto dependency from leancrypto, since leancrypto doesn't
+  implement NIST prime-field curves; confirm it interoperates cleanly with
+  leancrypto's own RNG/byte conventions.
+- Confirm actual key/ciphertext/signature byte sizes for ML-KEM-1024, X448,
+  and P-521 against both libraries' own output (design.md §2/§8 state
+  expected sizes; verify against the real implementations rather than the
+  specs alone).
 - Prototype the `Encapsulate`/`Decapsulate` round trip end-to-end in a
   throwaway test, confirming both sides converge on the identical shared
   secret.
-- Prototype the §5.7 hybrid combiner (X25519 ECDH + ML-KEM shared secret →
+- Prototype the §5.7 hybrid combiner (X448 ECDH + ML-KEM shared secret →
   HKDF-SHA3-256 → 32 bytes) and write down the exact `info` string/label so
   it's fixed before any real keys depend on it.
-- Prototype Ed448 sign/verify over a `ciphertext || to_peer_id ||
-  from_peer_id` message (§5.8), confirming exact signature byte length.
-- Decide leancrypto's minimum-supported-Rust-version and cross-compilation
-  impact on this workspace's own MSRV and build tooling (relevant to M8's
-  aarch64 target).
+- Prototype P-521 ECDSA sign/verify over a `ciphertext || to_peer_id ||
+  from_peer_id` message (§5.8) using a fixed-width raw `r || s` signature
+  encoding (not DER), confirming the exact 132-byte signature length holds.
+- Decide leancrypto's and `p521`'s minimum-supported-Rust-version and
+  cross-compilation impact on this workspace's own MSRV and build tooling
+  (relevant to M8's aarch64 target).
 
 **Acceptance**: a throwaway integration test demonstrates two independent
 `Encapsulate`/`Decapsulate` calls converging on the same derived PSK bytes,
@@ -50,9 +58,9 @@ estimates there.
   `ciphertext`, `signature`, `created_at`), primary-keyed on
   `(to_peer_id, from_peer_id)`.
 - Add `PUT /v1/user/pq-handshake/{to_peer_id}` to `server/src/api/user.rs`,
-  with input validation (exact expected ciphertext length, exact expected
-  Ed448 signature length, authorization check that the caller may see
-  `to_peer_id` per existing CIDR rules).
+  with input validation (exact expected ML-KEM-1024 ciphertext length,
+  exact expected P-521 signature length, authorization check that the
+  caller may see `to_peer_id` per existing CIDR rules).
 - Embed any pending mailbox entry addressed to the requester into the
   existing `GET /v1/user/state` response; delete the row once served.
 - A periodic sweep (mirroring the shape of other periodic server tasks
@@ -76,8 +84,8 @@ yet.
 
 ## M2 — Client keypair generation & registration
 
-- Generate an ML-KEM-768 keypair, a dedicated X25519 keypair, and a
-  dedicated Ed448 signing keypair on `install`/`redeem-invite`, store all
+- Generate an ML-KEM-1024 keypair, a dedicated X448 keypair, and a
+  dedicated P-521 signing keypair on `install`/`redeem-invite`, store all
   three secret keys `0o600` under
   `<data_dir>/interfaces/<interface>/pq-kem/` (mirrors
   `interface_config.rs`'s handling of the WireGuard private key).
@@ -103,7 +111,7 @@ WireGuard PSK is touched yet (that's M4).
 - On each rotation-interval tick:
   - as initiator for a given pair, fetch the responder's public keys,
     encapsulate, sign `ciphertext || to_peer_id || from_peer_id` with the
-    local Ed448 key, upload `{ciphertext, signature}`;
+    local P-521 key, upload `{ciphertext, signature}`;
   - as responder, for any pending mailbox entry delivered in the state
     fetch: verify the signature against the sender's cached
     `pq_sig_public_key` first — on failure, log and discard without
@@ -203,8 +211,9 @@ PSK, verified the same way M4 verifies a client-side link.
 
 ## M8 — Build targets & platform support
 
-- Confirm `leancrypto` cross-compiles cleanly for both target triples this
-  project already ships (`bin/PKGBUILD`): `x86_64-unknown-linux-musl` and
+- Confirm both `leancrypto` and the pure-Rust `p521` crate cross-compile
+  cleanly for both target triples this project already ships
+  (`bin/PKGBUILD`): `x86_64-unknown-linux-musl` and
   `aarch64-unknown-linux-musl` (design.md §5.13).
 - Extend `bin/build-multiarch.sh` (or its successor) to build this
   feature's binaries for both targets; confirm no non-Linux build path is
@@ -233,12 +242,16 @@ processes, not just unit tests with fakes:
   exactly as design.md §5.8/§6 claims (relay-level substitution without the
   signature hardening enabled; no forgery possible with it enabled) — write
   this up as a concrete test/documented finding, not just an assumption.
-- Resolve the design.md §10 open question on whether the Ed448
+- Resolve the design.md §10 open question on whether the P-521
   signed-ciphertext hardening ships default-on or opt-in, based on what
   this review finds.
 - Resolve the design.md §10 open question on whether the 5-minute
   rotation/15-minute idle defaults hold up, adjusting if the load/flood
   testing above suggests otherwise.
+- Revisit whether carrying two independent crypto dependencies
+  (`leancrypto` + `p521`, design.md §2.1/§10) is worth it versus
+  consolidating on Ed448 within `leancrypto` alone, based on what this
+  review finds about the practical audit/maintenance cost.
 
 **Acceptance**: all eleven design.md §7.2 cases automated and green in CI,
 including the security-negative ones (cross-CIDR isolation, malformed

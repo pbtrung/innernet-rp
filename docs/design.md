@@ -38,13 +38,16 @@ relays.
   **one-shot** operation, not an interactive multi-round-trip protocol — the
   encapsulating side needs nothing from the other side except its long-lived
   public key, which it can fetch once and cache.
-- ML-KEM-768's sizes are small enough to travel as ordinary API payloads:
-  public key ~1184 bytes, ciphertext ~1088 bytes, both comfortably under a
-  kilobyte and a half base64-encoded. This is the key enabling fact for this
+- This design uses **ML-KEM-1024**, the highest of the three standardized
+  parameter sets (NIST Category 5, roughly AES-256-equivalent classical
+  security), rather than the smaller ML-KEM-768/512 — see §9 for the
+  tradeoff. Its sizes are still small enough to travel as ordinary API
+  payloads: public key 1568 bytes, ciphertext 1568 bytes, comfortably under
+  two kilobytes base64-encoded. This is the key enabling fact for this
   design: it means the public key can be *just another field* on a peer's
   existing record, and a ciphertext can be *just another small object* the
-  coordination server temporarily stores and forwards — no separate listener,
-  no separate wire protocol, no new exposed port.
+  coordination server temporarily stores and forwards — no separate
+  listener, no separate wire protocol, no new exposed port.
 - Because encapsulation is one-shot and asynchronous (the encapsulating side
   doesn't need the other side to be online at that exact instant — it just
   needs the recipient's public key, which is already cached), the natural
@@ -61,27 +64,32 @@ relays.
 
 - **Language: Rust**, matching every other crate in this workspace — no new
   language/runtime to operate or package.
-- **Cryptographic primitives: [leancrypto](https://github.com/smuellerDD/leancrypto).**
-  A single library provides everything this design needs: ML-KEM, X25519,
-  Ed448/X448, and SHA3/HKDF, rather than pulling in a separate crate per
-  primitive. It ships Rust bindings over its C implementation (it is not a
-  pure-Rust crate); those bindings are explicitly documented upstream as not
-  yet API-stable, which is tracked as an integration risk in §10 rather than
-  glossed over.
+- **KEM and hybrid ECDH: [leancrypto](https://github.com/smuellerDD/leancrypto)**
+  provides ML-KEM-1024, X448, and SHA3/HKDF from a single library, rather
+  than pulling in a separate crate per primitive. It ships Rust bindings
+  over its C implementation (it is not a pure-Rust crate); those bindings
+  are explicitly documented upstream as not yet API-stable, which is
+  tracked as an integration risk in §10 rather than glossed over.
 - **KDF: HKDF-SHA3-256** (§5.7) for combining the hybrid shared secret into
   the final 32-byte WireGuard PSK. SHA3 (Keccak) is a structurally different
   hash family from SHA2, which this design prefers for the same
-  hedge-against-a-single-family reasoning already applied to the KEM choice
-  in §5.7/§7 — a future weakness specific to the SHA2 family wouldn't affect
+  hedge-against-a-single-family reasoning already applied to the KEM/curve
+  choices — a future weakness specific to the SHA2 family wouldn't affect
   this KDF.
-- **Signature scheme for §5.8's ciphertext authentication: Ed448**, the
-  EdDSA signature scheme built on the same Curve448 ("Goldilocks curve")
-  that X448 uses for ECDH. Worth being precise about the naming here: X448
-  itself is a Diffie–Hellman function, not a signature scheme — the actual
-  primitive that signs is Ed448. This design uses Ed448 specifically for
-  signing, and does not use X448's ECDH function anywhere (the hybrid
-  combiner in §5.7 uses X25519, a separate, smaller classical curve, purely
-  for the secret-combining step, not for signing).
+- **Hybrid classical DH: X448**, not X25519 (§5.7) — this design uses no
+  X25519 anywhere. X448 (Curve448, the "Goldilocks curve") gives a larger
+  classical security margin than X25519, consistent with pairing
+  ML-KEM-1024's higher PQ security category with a higher-margin classical
+  primitive rather than a smaller one.
+- **Signature scheme for §5.8's ciphertext authentication: NIST P-521**
+  (secp521r1) with ECDSA — a **separate** dependency from leancrypto, since
+  leancrypto does not implement NIST prime-field curves. The
+  [`p521`](https://crates.io/crates/p521) RustCrypto crate (pure Rust) is
+  the concrete choice, providing ECDSA sign/verify over P-521. This means
+  the design now depends on two independent cryptographic libraries rather
+  than one — an explicit, tracked tradeoff (§10), accepted here because
+  P-521 (a FIPS 186-5-approved NIST curve) is preferred over Ed448/Ed25519
+  for deployments where FIPS-approved primitives matter.
 
 ## 3. Relevant existing innernet architecture
 
@@ -139,7 +147,7 @@ relays.
 - Add nullable `pq_kem_public_key` and `pq_sig_public_key` columns to the
   `peers` table (`server/src/db/peer.rs`), threaded through
   `create`/`update`/`from_row`/`COLUMNS` — mirrors how the WireGuard public
-  key column already works. `pq_sig_public_key` holds the peer's Ed448
+  key column already works. `pq_sig_public_key` holds the peer's P-521
   public key used to verify its ciphertext signatures (§5.8).
 - Add both fields to `PeerContents` with `#[serde(default)]`
   (`shared/src/types.rs`), so old clients/servers round-trip peer records
@@ -156,11 +164,12 @@ relays.
 
 - `PUT /v1/user/pq-handshake/{to_peer_id}` — upload a ciphertext (and its
   signature, §5.8) addressed to another peer. Validates: `ciphertext`
-  matches the expected ML-KEM-768 ciphertext length exactly and `signature`
-  matches the expected Ed448 signature length exactly (reject anything else
-  outright, same spirit as the existing candidate-endpoint size caps),
-  `to_peer_id` must be a peer the caller is authorized to see (same CIDR
-  check already applied to peer-list visibility).
+  matches the expected ML-KEM-1024 ciphertext length exactly (1568 bytes)
+  and `signature` matches the expected P-521 ECDSA signature length exactly
+  (reject anything else outright, same spirit as the existing
+  candidate-endpoint size caps), `to_peer_id` must be a peer the caller is
+  authorized to see (same CIDR check already applied to peer-list
+  visibility).
 - Delivery needs no separate `GET` endpoint: pending ciphertexts addressed
   to the requester are embedded directly in the existing `GET /v1/user/state`
   response (one extra optional field per peer entry the fetcher is
@@ -172,8 +181,8 @@ relays.
 
 ### 5.3 Client: keypair lifecycle
 
-- Generate an ML-KEM-768 keypair, a dedicated X25519 keypair (§5.7), and an
-  Ed448 signing keypair (§5.8) once per interface (on `install`/
+- Generate an ML-KEM-1024 keypair, a dedicated X448 keypair (§5.7), and a
+  dedicated P-521 signing keypair (§5.8) once per interface (on `install`/
   `redeem-invite`), store all three secret keys `0o600` under
   `<data_dir>/interfaces/<interface>/pq-kem/` — same permission discipline
   and directory shape as the existing WireGuard private key handling in
@@ -217,10 +226,10 @@ full sequence diagram):
    extra round trip).
 2. The initiator calls `Encapsulate(responder_kem_public_key)` locally,
    getting `(ciphertext, ml_kem_shared_secret)`, and separately performs an
-   X25519 ECDH against the responder's X25519 public key, getting
-   `x25519_shared_secret` (§5.7).
+   X448 ECDH against the responder's X448 public key, getting
+   `x448_shared_secret` (§5.7).
 3. The initiator signs `ciphertext || to_peer_id || from_peer_id` with its
-   own Ed448 secret key (§5.8), producing `signature`.
+   own P-521 ECDSA private key (§5.8), producing `signature`.
 4. The initiator uploads `{ciphertext, signature}` via
    `PUT /v1/user/pq-handshake/{responder_id}`. Neither shared secret nor any
    secret key ever leaves the initiator's machine.
@@ -232,8 +241,8 @@ full sequence diagram):
    leaving the previously-applied PSK untouched.
 6. On a valid signature, the responder calls
    `Decapsulate(own_kem_secret_key, ciphertext)`, recovering
-   `ml_kem_shared_secret`, and performs its own X25519 ECDH against the
-   initiator's public key, recovering the identical `x25519_shared_secret`.
+   `ml_kem_shared_secret`, and performs its own X448 ECDH against the
+   initiator's public key, recovering the identical `x448_shared_secret`.
 7. Both sides independently derive the final 32-byte PSK via
    HKDF-SHA3-256 (§5.7) from the same two shared secrets, and apply it to
    that specific peer's WireGuard config
@@ -268,19 +277,21 @@ full sequence diagram):
 Relying on a single post-quantum algorithm family means a future
 cryptanalytic break of that one algorithm compromises every derived PSK.
 Standard practice (matching TLS 1.3's `X25519MLKEM768` and OpenSSH's
-default post-quantum key exchange) is to combine an ML-KEM shared secret
-with an independent classical ECDH shared secret via a KDF, so the result
-stays secure as long as *either* half remains unbroken:
+default post-quantum key exchange, generalized here to the higher-margin
+curve/parameter-set pairing described in §2.1) is to combine an ML-KEM
+shared secret with an independent classical ECDH shared secret via a KDF,
+so the result stays secure as long as *either* half remains unbroken:
 
-- Generate a dedicated X25519 keypair per interface alongside the ML-KEM
+- Generate a dedicated X448 keypair per interface alongside the ML-KEM
   one (not the WireGuard static key itself — keeping these separate avoids
-  any cross-protocol key-reuse concerns).
-- Perform an ordinary X25519 ECDH alongside the ML-KEM encapsulation in the
+  any cross-protocol key-reuse concerns). No X25519 keypair is generated
+  anywhere in this design.
+- Perform an ordinary X448 ECDH alongside the ML-KEM encapsulation in the
   same round described in §5.5.
-- `psk = HKDF-SHA3-256(ikm = ml_kem_shared_secret || x25519_shared_secret,
+- `psk = HKDF-SHA3-256(ikm = ml_kem_shared_secret || x448_shared_secret,
   info = "innernet pq-psk v1", length = 32)`.
 
-### 5.8 Signed-ciphertext hardening (Ed448 / X448 family)
+### 5.8 Signed-ciphertext hardening (P-521 / ECDSA)
 
 The coordination server relays the ciphertext but cannot read the shared
 secret it encapsulates — it only ever handles opaque bytes. However, since
@@ -296,15 +307,19 @@ already-accepted trust assumption to one more field.
 
 This design closes that specific gap with a concrete mechanism: each side
 signs its ciphertext (and the ordered peer-pair identifiers, binding the
-signature to exactly that exchange) with a dedicated **Ed448** identity
-key, distinct from its WireGuard and ML-KEM/X25519 keys (§5.3). The
+signature to exactly that exchange) with a dedicated **P-521 (ECDSA)**
+identity key, distinct from its WireGuard, ML-KEM, and X448 keys (§5.3).
+Signatures use a fixed-width raw `r || s` encoding (each 66 bytes, 132
+bytes total) rather than variable-length DER, so the mailbox endpoint's
+exact-length validation (§5.2) stays simple and deterministic. The
 receiving side verifies the signature against the sender's already-cached
 `pq_sig_public_key` before ever decapsulating — an invalid signature means
 either a corrupted delivery or a substituted/forged message, and is
-discarded without touching the existing PSK (§5.5 step 5). Ed448 rather
-than the smaller, more common Ed25519 was chosen for a larger security
-margin (§9), matching this design's general preference for higher-margin
-primitives given how new the overall construction is.
+discarded without touching the existing PSK (§5.5 step 5). P-521 was
+chosen over the smaller, more common Ed25519/Ed448 for its larger security
+margin and FIPS 186-5 approval (§9), matching this design's general
+preference for higher-margin primitives given how new the overall
+construction is — accepting a second crypto dependency (§2.1) as the cost.
 
 Whether this ships as part of the default, always-on baseline or as an
 additional opt-in hardening flag remains an open question — see §10.
@@ -322,7 +337,7 @@ additional opt-in hardening flag remains an open question — see §10.
 
 The coordination server is itself a WireGuard peer (its own coordination-API
 link), and participates in this scheme exactly like any other peer: it
-generates its own ML-KEM/X25519/Ed448 keypairs, advertises its public keys
+generates its own ML-KEM/X448/P-521 keypairs, advertises its public keys
 via its own database row, and runs the same periodic sync task client
 interfaces run, applying the resulting PSK to its own device — no
 special-casing beyond the responder role already assigned to it in §5.4.
@@ -369,7 +384,8 @@ OpenBSD, or Windows support is planned for this feature even though other
 parts of this project run there — both `leancrypto`'s own primary platform
 support and this project's existing release tooling
 (`bin/build-multiarch.sh`) already center on Linux, and extending either to
-another OS is out of scope here.
+another OS is out of scope here. The `p521` crate (§2.1) being pure Rust
+imposes no additional cross-compilation concerns of its own.
 
 ## 6. Security considerations
 
@@ -392,17 +408,17 @@ another OS is out of scope here.
   additionally mean a legitimate replay opportunity (re-delivering the same
   ciphertext twice) shouldn't normally arise at all.
 - **Forgery/substitution** of a relayed message is addressed directly by the
-  §5.8 Ed448 signature — a responder never processes a ciphertext it can't
-  verify came from the claimed sender.
+  §5.8 P-521/ECDSA signature — a responder never processes a ciphertext it
+  can't verify came from the claimed sender.
 - **Server-compromise blast radius** is bounded to what §5.8 already
   describes: without the signed-ciphertext hardening enabled, a compromised
   server can MITM the relay, matching its existing ability to MITM
   WireGuard peer identity distribution — not a new category of exposure
   introduced by this design. With it enabled, that specific MITM path is
-  closed, since the server cannot forge a valid Ed448 signature on either
+  closed, since the server cannot forge a valid P-521 signature on either
   peer's behalf.
 - **Input validation on the mailbox endpoint** must reject anything that
-  isn't exactly a well-formed ML-KEM-768-ciphertext-and-Ed448-signature-sized
+  isn't exactly a well-formed ML-KEM-1024-ciphertext-and-P-521-signature-sized
   payload outright, the same discipline already applied to the existing
   candidate-endpoint validation, so a malformed upload can't be used to
   probe for parser bugs or store oversized garbage.
@@ -450,7 +466,7 @@ expect a from-scratch PQ implementation to be any less bug-prone.
    length/shape; assert 4xx, and assert the server process is still alive
    and responsive afterward (no panic).
 6. **Invalid signature rejection.** Tamper with a captured, legitimately
-   ML-KEM-768-sized ciphertext's signature before delivery; assert the
+   ML-KEM-1024-sized ciphertext's signature before delivery; assert the
    responder logs a verification failure and does **not** apply the
    resulting PSK, leaving the previous one in place.
 7. **Replay is harmless.** Re-deliver an already-consumed (mailbox row
@@ -495,35 +511,37 @@ sequenceDiagram
     A->>S: GET /v1/user/state
     S-->>A: peer list incl. B.pq_kem_public_key, B.pq_sig_public_key
 
-    Note over A: Encapsulate(B.pq_kem_public_key) -> (ciphertext, ml_kem_ss)<br/>X25519(A.priv, B.x25519_pub) -> x25519_ss<br/>sign_ed448(A.sig_priv, ciphertext || to=B || from=A) -> signature<br/>psk_a = HKDF-SHA3-256(ml_kem_ss || x25519_ss, info="innernet pq-psk v1")
+    Note over A: Encapsulate(B.pq_kem_public_key) to ciphertext, ml_kem_ss<br/>X448(A.priv, B.x448_pub) to x448_ss<br/>sign_p521(A.sig_priv, ciphertext, to=B, from=A) to signature<br/>psk_a = HKDF-SHA3-256(ml_kem_ss, x448_ss)
 
-    A->>S: PUT /v1/user/pq-handshake/{B.id}<br/>body: {ciphertext, signature}
-    S->>S: validate exact size/shape;<br/>check A authorized to reach B (CIDR);<br/>store pq_handshake_mailbox(to=B, from=A)
+    A->>S: PUT /v1/user/pq-handshake/{B.id} with ciphertext, signature
+    S->>S: validate exact size/shape
+    S->>S: check A authorized to reach B via CIDR
+    S->>S: store pq_handshake_mailbox to=B from=A
     S-->>A: 204 No Content
 
     Note over A: apply psk_a to local WireGuard peer entry for B immediately<br/>(doesn't need to wait for B's delivery)
 
     B->>S: GET /v1/user/state (regular poll cycle)
-    S-->>B: peer list + pending mailbox entry {from=A, ciphertext, signature}
-    S->>S: delete mailbox(to=B, from=A) - at-most-once delivery
+    S-->>B: peer list plus pending entry from=A, ciphertext, signature
+    S->>S: delete mailbox to=B from=A - at-most-once delivery
 
     alt signature invalid
-        Note over B: verify_ed448(A.pq_sig_public_key, signature) fails<br/>-> log + discard, keep previous PSK, stop here
+        Note over B: verify_p521(A.pq_sig_public_key, signature) fails<br/>so log and discard, keep previous PSK, stop here
     else signature valid
-        Note over B: Decapsulate(B.priv, ciphertext) -> ml_kem_ss<br/>X25519(B.priv, A.x25519_pub) -> x25519_ss<br/>psk_b = HKDF-SHA3-256(ml_kem_ss || x25519_ss, info="innernet pq-psk v1")<br/>psk_b == psk_a
+        Note over B: Decapsulate(B.priv, ciphertext) to ml_kem_ss<br/>X448(B.priv, A.x448_pub) to x448_ss<br/>psk_b = HKDF-SHA3-256(ml_kem_ss, x448_ss)<br/>psk_b equals psk_a
         B->>B: apply psk_b to local WireGuard peer entry for A
     end
 
-    Note over A,B: Next real WireGuard handshake between A and B<br/>implicitly confirms psk_a == psk_b (Noise_IKpsk2 mixes it in) -<br/>a mismatch just fails the handshake, no bespoke ack needed.
+    Note over A,B: Next real WireGuard handshake between A and B<br/>implicitly confirms psk_a equals psk_b since Noise_IKpsk2 mixes it in -<br/>a mismatch just fails the handshake, no bespoke ack needed.
 ```
 
 Data exchanged at each hop, for reference:
 
 | Step | Endpoint | Payload | Approx. size |
 |---|---|---|---|
-| A fetches B's keys | `GET /v1/user/state` | existing peer list + `pq_kem_public_key` (~1184 B), `pq_sig_public_key` (~57 B, Ed448) per peer | existing response + ~1.2 KB/peer |
-| A uploads ciphertext | `PUT /v1/user/pq-handshake/{B.id}` | `ciphertext` (~1088 B, ML-KEM-768) + `signature` (~114 B, Ed448) | ~1.2 KB |
-| B fetches pending entry | `GET /v1/user/state` | existing response + one `{from_peer_id, ciphertext, signature}` object, only when a delivery is pending | +~1.2 KB, intermittent |
+| A fetches B's keys | `GET /v1/user/state` | existing peer list + `pq_kem_public_key` (1568 B, ML-KEM-1024), `pq_sig_public_key` (~67 B, P-521 compressed) per peer | existing response + ~1.6 KB/peer |
+| A uploads ciphertext | `PUT /v1/user/pq-handshake/{B.id}` | `ciphertext` (1568 B, ML-KEM-1024) + `signature` (132 B, P-521 raw r‖s) | ~1.7 KB |
+| B fetches pending entry | `GET /v1/user/state` | existing response + one `{from_peer_id, ciphertext, signature}` object, only when a delivery is pending | +~1.7 KB, intermittent |
 
 ## 9. Alternatives considered
 
@@ -539,7 +557,7 @@ Data exchanged at each hop, for reference:
 - **A large-public-key, code-based KEM** (multi-hundred-kilobyte to
   megabyte-scale public keys) as an additional hedge alongside a
   lattice-based KEM. Rejected for the default design: a key that large
-  can't reasonably travel as an ordinary API field the way ML-KEM's ~1.2 KB
+  can't reasonably travel as an ordinary API field the way ML-KEM's ~1.6 KB
   key can, which is precisely the property this design depends on to avoid
   a separate distribution mechanism. The classical+ML-KEM hybrid in §5.7
   provides an algorithm-family hedge without that size cost.
@@ -554,12 +572,25 @@ Data exchanged at each hop, for reference:
   permanently desynchronizes the two chains with no recovery mechanism
   short of re-seeding out-of-band again. Not a fit for a system built
   around automatic, network-driven peer provisioning.
-- **Ed25519 instead of Ed448** for the §5.8 signed-ciphertext hardening.
-  Ed25519 is smaller (32-byte public keys, 64-byte signatures, versus
-  Ed448's ~57/114 bytes) and more widely deployed. Ed448 was chosen instead
-  for its larger security margin (~224-bit versus ~128-bit), which is a
-  small absolute cost given the mailbox payload is already dominated by the
-  ~1 KB ML-KEM ciphertext.
+- **ML-KEM-768 instead of ML-KEM-1024.** Smaller (1184/1088 bytes versus
+  1568/1568), and NIST Category 3 is already considered a strong practical
+  choice by most deployments. ML-KEM-1024 was chosen instead to pair with
+  the higher-margin X448/P-521 classical primitives chosen elsewhere in
+  this design, at a modest additional size cost that's still well within
+  what an ordinary API field/mailbox row can hold.
+- **X25519 instead of X448** for the hybrid combiner. Smaller (32-byte
+  keys versus X448's 56-byte keys) and more widely used (it's what TLS
+  1.3's `X25519MLKEM768` and OpenSSH both ship today). X448 was chosen
+  instead purely for its larger classical security margin, matching the
+  ML-KEM-1024/P-521 pairing described above; this design uses no X25519
+  anywhere.
+- **Ed25519/Ed448 instead of P-521** for the §5.8 signed-ciphertext
+  hardening. Either would let signing stay inside the single `leancrypto`
+  dependency rather than adding a second library. P-521 was chosen instead
+  for its FIPS 186-5 approval (relevant to deployments with compliance
+  requirements) and its larger security margin than Ed448, accepting the
+  cost of a second crypto dependency (§2.1/§10) as worthwhile for that
+  property.
 
 ## 10. Open questions / risks
 
@@ -567,13 +598,19 @@ Data exchanged at each hop, for reference:
   threshold) hold up under real fleet testing, or need tuning — the
   *values* are now decided and CLI-overridable, but not yet validated
   against a real deployment's traffic patterns.
-- Whether the §5.8 Ed448 signed-ciphertext hardening ships as part of the
+- Whether the §5.8 P-521 signed-ciphertext hardening ships as part of the
   default, always-on baseline, or as an additional opt-in flag — the
   *mechanism and algorithm* are now decided, but its default-on/opt-in
   status is not.
 - `leancrypto`'s Rust bindings are explicitly documented upstream as not
   yet API-stable — track this as an integration risk through M0, including
   whether to pin a vendored copy rather than tracking upstream `main`.
+- This design now depends on **two** independent cryptographic libraries
+  (`leancrypto` for ML-KEM/X448/SHA3-HKDF, `p521` for the signing scheme)
+  rather than one. Worth revisiting during the M0/M9 security review
+  whether that's an acceptable increase in audited-dependency surface for
+  one primitive, versus accepting Ed448 and staying within `leancrypto`
+  alone (§9).
 - Mailbox table growth under a large, mostly-online fleet with a short
   rotation interval — the TTL sweep bounds worst case, but the concrete
   interval/TTL defaults should be chosen with real fleet sizes in mind
