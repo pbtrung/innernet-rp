@@ -6,7 +6,16 @@ PartOf=innernet.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/innernet up %i --daemon --interval 60
+# Optional per-interface file setting ROSENPASS_ARGS (e.g.
+# ROSENPASS_ARGS="--enable-rosenpass --rosenpass-group rosenpass") - see README.md's Post-Quantum
+# Key Exchange section. `up`/`install`'s rosenpass flags aren't persisted anywhere `up` itself
+# reads back, so this service's `--daemon` loop silently runs with rosenpass disabled unless
+# they're passed here too, even if an earlier one-off `install`/`up --enable-rosenpass` already
+# started the exchange daemon - it'll keep running on its own, but nothing will poll its log for
+# newly-derived preshared keys or apply them to WireGuard. The leading `-` makes a missing file a
+# no-op rather than a startup failure; an unset ROSENPASS_ARGS expands to nothing.
+EnvironmentFile=-/etc/innernet/%i-rosenpass.env
+ExecStart=/usr/bin/innernet up %i --daemon --interval 60 $ROSENPASS_ARGS
 Restart=always
 # When the daemon exits, wait this amount of secs before restarting. Used to prevent StartLimitBurst
 # (5 by default) restarts happening within StartLimitIntervalSec (10 by default) after which systemd
