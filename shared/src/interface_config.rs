@@ -27,6 +27,35 @@ pub struct InterfaceConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     peer_endpoint_overrides: BTreeMap<IpAddr, Endpoint>,
+
+    /// A static WireGuard preshared key protecting this peer's link back to whichever admin
+    /// peer created its invitation (reusing `wg_export`'s local exported-peer PSK mechanism,
+    /// not just a non-innernet-peer feature despite the module name - see `add_peer` in
+    /// `client/src/main.rs`) - baseline PSK protection for that one link, immediately, whether
+    /// or not Rosenpass ever gets enabled on either side. `None` for invitations created before
+    /// this existed. Only meaningful on first read at `install` time, which consumes it (via
+    /// `Option::take`) to seed this peer's own local PSK store before it's ever persisted here -
+    /// nothing re-reads or re-writes this field afterward, so it never lingers in a peer's own
+    /// saved config; rotating it would need a fresh invitation, like the private key itself.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_link_psk: Option<AdminLinkPsk>,
+}
+
+/// See `InterfaceConfig::admin_link_psk`.
+#[derive(Clone, Deserialize, Serialize, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct AdminLinkPsk {
+    /// The admin peer's stable database id - *not* its WireGuard public key, which changes when
+    /// this new peer redeems its own invitation (a freshly-generated keypair gets registered
+    /// with the server, replacing the invitation's temporary one), so anything keyed by public
+    /// key set at invitation-creation time would silently stop matching. The admin's own id
+    /// never changes, so this is what `shared::wg_export`'s local PSK store is keyed by on both
+    /// ends of the link (see that module for the same reasoning from the admin's side).
+    pub admin_peer_id: i64,
+    /// The preshared key itself (base64), matching what the admin peer already applied locally
+    /// to its own link to this new peer.
+    pub psk: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -89,6 +118,7 @@ impl InterfaceConfig {
             interface,
             server,
             peer_endpoint_overrides: BTreeMap::new(),
+            admin_link_psk: None,
         }
     }
 
@@ -187,6 +217,14 @@ impl PeerInvitation {
         &self.interface_config
     }
 
+    /// Attaches a static preshared key protecting this invited peer's link back to the admin
+    /// peer creating the invitation (see `InterfaceConfig::admin_link_psk`). The admin's own
+    /// side of that link is the caller's responsibility to seed locally (see `wg_export`) -
+    /// this only conveys what the new peer needs to seed its own side once installed.
+    pub fn set_admin_link_psk(&mut self, admin_peer_id: i64, psk: String) {
+        self.interface_config.admin_link_psk = Some(AdminLinkPsk { admin_peer_id, psk });
+    }
+
     /// Save a new invitation file, failing if it already exists.
     pub fn save_new(&self, path: impl AsRef<Path>) -> Result<(), io::Error> {
         let mut file = OpenOptions::new()
@@ -214,5 +252,87 @@ impl PeerInvitation {
         file.write_all(self.interface_config.as_toml().as_bytes())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wireguard_control::KeyPair;
+
+    fn test_interface_info() -> InterfaceInfo {
+        InterfaceInfo::new(
+            &"evilcorp".parse().unwrap(),
+            &KeyPair::generate(),
+            "10.80.0.5/32".parse().unwrap(),
+        )
+    }
+
+    fn test_server_info() -> ServerInfo {
+        ServerInfo {
+            public_key: "serverkey".to_string(),
+            external_endpoint: "1.2.3.4:51820".parse().unwrap(),
+            internal_endpoint: "10.80.0.1:51820".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_admin_link_psk_roundtrip() {
+        let mut config = InterfaceConfig::new(test_interface_info(), test_server_info());
+        assert!(config.admin_link_psk.is_none());
+
+        config.admin_link_psk = Some(AdminLinkPsk {
+            admin_peer_id: 1,
+            psk: "psk-base64".to_string(),
+        });
+
+        let toml = toml::to_string(&config).unwrap();
+        assert!(toml.contains("admin-link-psk"));
+
+        let parsed: InterfaceConfig = toml::from_str(&toml).unwrap();
+        let link = parsed.admin_link_psk.unwrap();
+        assert_eq!(link.admin_peer_id, 1);
+        assert_eq!(link.psk, "psk-base64");
+    }
+
+    #[test]
+    fn test_old_shaped_config_without_admin_link_psk_still_parses() {
+        // Simulates an invitation/config saved before this field existed - must still
+        // deserialize successfully, defaulting to None, not fail or panic.
+        let old = format!(
+            r#"
+            [interface]
+            network-name = "evilcorp"
+            address = "10.80.0.5/32"
+            private-key = "{}"
+            listen-port = 51820
+
+            [server]
+            public-key = "serverkey"
+            external-endpoint = "1.2.3.4:51820"
+            internal-endpoint = "10.80.0.1:51820"
+            "#,
+            KeyPair::generate().private.to_base64()
+        );
+
+        let parsed: InterfaceConfig =
+            toml::from_str(&old).expect("old-shaped config without admin-link-psk must parse");
+        assert!(parsed.admin_link_psk.is_none());
+    }
+
+    #[test]
+    fn test_peer_invitation_set_admin_link_psk() {
+        let mut invitation = PeerInvitation::new(test_interface_info(), test_server_info());
+        assert!(invitation.interface_config().admin_link_psk.is_none());
+
+        invitation.set_admin_link_psk(1, "psk-base64".to_string());
+
+        let link = invitation
+            .interface_config()
+            .admin_link_psk
+            .as_ref()
+            .unwrap();
+        assert_eq!(link.admin_peer_id, 1);
+        assert_eq!(link.psk, "psk-base64");
     }
 }

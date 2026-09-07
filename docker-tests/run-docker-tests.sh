@@ -239,6 +239,27 @@ test_install_listen_port() {
         'innernet $INNERNET_ARGS show "$INTERFACE" | grep -Fq "listening port: 51821"'
 }
 
+test_invite_baseline_psk() {
+    info "Confirming a normal (non-Rosenpass) invited peer still gets a static preshared key."
+    local psk_peer1_server
+    psk_peer1_server=$(peer_psk "$PEER1_CONTAINER" 172.18.1.1)
+    if [[ -z "$psk_peer1_server" || "$psk_peer1_server" == "(none)" ]]; then
+        info "expected peer1 to have a non-empty preshared key for its link to the server (from its own server-created invitation), got: '$psk_peer1_server'"
+        exit 1
+    fi
+
+    local psk_peer2_peer1
+    psk_peer2_peer1=$(peer_psk "$PEER2_CONTAINER" 172.18.1.2)
+    if [[ -z "$psk_peer2_peer1" || "$psk_peer2_peer1" == "(none)" ]]; then
+        info "expected peer2 to have a non-empty preshared key for its link to peer1 (who invited it), got: '$psk_peer2_peer1'"
+        exit 1
+    fi
+
+    info "Confirming connectivity still works with these preshared keys applied."
+    cmd docker exec "$PEER1_CONTAINER" ping -c3 10.66.0.1
+    cmd docker exec "$PEER2_CONTAINER" ping -c3 10.66.1.1
+}
+
 test_simultaneous_redemption() {
     info "Creating invitation for fourth and fifth peer from first peer."
     cmd docker exec "$PEER1_CONTAINER" innernet \

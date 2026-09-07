@@ -8,8 +8,8 @@ use crate::{
 };
 use hyper::{Body, Method, Request, Response, StatusCode};
 use innernet_shared::{
-    is_valid_rosenpass_public_key, Endpoint, EndpointContents, PeerContents, RedeemContents,
-    RosenpassContents, ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
+    is_valid_rosenpass_public_key, wg_export, Endpoint, EndpointContents, PeerContents,
+    RedeemContents, RosenpassContents, ServerCapabilities, State, REDEEM_TRANSITION_WAIT,
 };
 use wireguard_control::{DeviceUpdate, PeerConfigBuilder};
 
@@ -131,7 +131,10 @@ mod handlers {
 
         if cfg!(not(test)) {
             let Context {
-                interface, backend, ..
+                interface,
+                backend,
+                data_dir,
+                ..
             } = session.context;
 
             // If we were to modify the WireGuard interface immediately, the HTTP response wouldn't
@@ -153,9 +156,25 @@ mod handlers {
                     *selected_peer,
                     old_public_key.to_base64()
                 );
+                // This replaces the peer's device entry outright (remove + add), which would
+                // otherwise silently drop any preshared key applied to the old (temporary-key)
+                // entry (see shared::wg_export) until the next periodic
+                // spawn_exported_psk_applier tick (up to several seconds later) reapplied it -
+                // a real, if brief, PSK mismatch that breaks the tunnel until it catches up
+                // (found via a real docker-tests run). Re-including it here, atomically with
+                // the peer's real post-redemption key, closes that window entirely.
+                let mut builder = PeerConfigBuilder::from(&*selected_peer);
+                match wg_export::get_exported_psk(&data_dir, &interface, selected_peer.id) {
+                    Ok(Some(psk)) => builder = builder.set_preshared_key(psk),
+                    Ok(None) => {},
+                    Err(e) => log::error!(
+                        "failed to look up preshared key for peer {}: {e}",
+                        *selected_peer
+                    ),
+                }
                 DeviceUpdate::new()
                     .remove_peer_by_key(&old_public_key)
-                    .add_peer(PeerConfigBuilder::from(&*selected_peer))
+                    .add_peer(builder)
                     .apply(&interface, backend)
                     .map_err(|e| log::error!("{:?}", e))
                     .ok();

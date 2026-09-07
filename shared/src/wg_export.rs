@@ -152,9 +152,16 @@ pub fn write_exported_conf(path: &Path, contents: &str) -> Result<(), Error> {
 }
 
 /// Local-only, per-interface record of manually-generated WireGuard preshared keys protecting
-/// the link between this peer and one or more statically-exported, non-innernet peers (a phone
-/// can never run Rosenpass, so it can never get a PSK from that mechanism at all — see
-/// doc/design.md 5.10). Keyed by the *exported* peer's WireGuard public key.
+/// this peer's link to one or more other peers — statically-exported non-innernet peers (a
+/// phone can never run Rosenpass, so it can never get a PSK from that mechanism at all — see
+/// doc/design.md 5.10), and normal invited peers too (baseline PSK protection immediately at
+/// invite time, before Rosenpass, if ever enabled, takes over — see `add_peer` in
+/// `client/src/main.rs`/`server/src/lib.rs`). Keyed by the other peer's stable database id, not
+/// its WireGuard public key: a normal invited peer's public key changes when it redeems its
+/// invitation (a freshly-generated keypair replaces the invitation's temporary one), so an
+/// entry keyed by the temporary key would silently never match again — verified via a real
+/// docker-tests run that this exact mismatch broke connectivity. A statically-exported peer's id
+/// and public key are both permanently stable either way, so id-keying works unchanged there too.
 ///
 /// Deliberately never sent to or read from the coordination server: a PSK is exactly as
 /// sensitive as a private key, and this codebase's rule that a private key never touches the
@@ -193,37 +200,46 @@ fn write_exported_psks(
     write_exported_conf(&path, &contents)
 }
 
-/// Looks up a previously-saved preshared key protecting the link to `exported_peer_public_key`
-/// (a peer created via `add-peer --export-wg-conf`), if any — `None` for a config exported
-/// before this existed, or one that was never linked this way.
+/// Looks up a previously-saved preshared key protecting the link to peer `peer_id`, if any -
+/// `None` for a peer that was never linked this way. Keyed by the peer's stable database id,
+/// *not* its WireGuard public key: a normal (non-exported) invited peer's public key changes
+/// when it redeems its invitation (`update_keypair` swaps in a freshly-generated keypair and
+/// registers only that with the server - the invitation's original key is a one-time bootstrap
+/// identity, thrown away immediately after), so keying by the id set at invitation-creation time
+/// is the only thing that still matches once that rotation happens. A statically-exported
+/// (`--export-wg-conf`) peer's id and public key are both permanently stable either way, so this
+/// works unchanged for that case too - verified via a real docker-tests run that public-key
+/// keying silently broke connectivity for normal invited peers (the admin's own locally-saved
+/// PSK entry never matched the peer's real, post-redemption public key, so it was just never
+/// applied - a one-sided PSK, indistinguishable from a wrong key to WireGuard).
 pub fn get_exported_psk(
     data_dir: &Path,
     interface: &InterfaceName,
-    exported_peer_public_key: &str,
+    peer_id: i64,
 ) -> Result<Option<Key>, Error> {
     let psks = read_exported_psks(data_dir, interface)?;
-    match psks.get(exported_peer_public_key) {
+    match psks.get(&peer_id.to_string()) {
         Some(b64) => Ok(Some(Key::from_base64(b64).map_err(|e| {
-            anyhow!("stored preshared key for exported peer isn't valid: {e}")
+            anyhow!("stored preshared key for peer {peer_id} isn't valid: {e}")
         })?)),
         None => Ok(None),
     }
 }
 
-/// Persists a preshared key protecting the link between this peer and
-/// `exported_peer_public_key` (see [`get_exported_psk`]), so it survives across `innernet`
-/// invocations: reapplied on every `fetch()` (see [`apply_exported_psks`]) and re-embedded,
-/// unchanged, on every `export-peer-config` refresh (never regenerated — a fresh PSK on refresh
-/// would silently break the already-deployed exported peer's tunnel, exactly like rotating its
-/// private key would).
+/// Persists a preshared key protecting the link between this peer and peer `peer_id` (see
+/// [`get_exported_psk`] for why this is keyed by id, not public key), so it survives across
+/// `innernet` invocations: reapplied on every `fetch()` (see [`apply_exported_psks`]) and
+/// re-embedded, unchanged, on every `export-peer-config` refresh (never regenerated - a fresh
+/// PSK on refresh would silently break the already-deployed exported peer's tunnel, exactly like
+/// rotating its private key would).
 pub fn save_exported_psk(
     data_dir: &Path,
     interface: &InterfaceName,
-    exported_peer_public_key: &str,
+    peer_id: i64,
     psk: &Key,
 ) -> Result<(), Error> {
     let mut psks = read_exported_psks(data_dir, interface)?;
-    psks.insert(exported_peer_public_key.to_string(), psk.to_base64());
+    psks.insert(peer_id.to_string(), psk.to_base64());
     write_exported_psks(data_dir, interface, &psks)
 }
 
@@ -255,12 +271,12 @@ pub fn apply_exported_psks(
 
     let mut builders = Vec::new();
     for peer in peers {
-        let Some(psk_b64) = psks.get(&peer.public_key) else {
+        let Some(psk_b64) = psks.get(&peer.id.to_string()) else {
             continue;
         };
         let Ok(psk) = Key::from_base64(psk_b64) else {
             log::warn!(
-                "stored preshared key for exported peer {} isn't valid, skipping",
+                "stored preshared key for peer {} isn't valid, skipping",
                 peer.id
             );
             continue;
@@ -481,23 +497,21 @@ mod tests {
     fn test_exported_psk_roundtrip_and_default_none() {
         let dir = tempfile::tempdir().unwrap();
         let interface: InterfaceName = "evilcorp".parse().unwrap();
-        let public_key = KeyPair::generate().public.to_base64();
 
-        assert!(get_exported_psk(dir.path(), &interface, &public_key)
+        assert!(get_exported_psk(dir.path(), &interface, 1)
             .unwrap()
             .is_none());
 
         let psk = Key::generate_preshared();
-        save_exported_psk(dir.path(), &interface, &public_key, &psk).unwrap();
+        save_exported_psk(dir.path(), &interface, 1, &psk).unwrap();
 
-        let read_back = get_exported_psk(dir.path(), &interface, &public_key)
+        let read_back = get_exported_psk(dir.path(), &interface, 1)
             .unwrap()
             .unwrap();
         assert_eq!(read_back.to_base64(), psk.to_base64());
 
-        // A different peer's public key must not see this one's PSK.
-        let other_public_key = KeyPair::generate().public.to_base64();
-        assert!(get_exported_psk(dir.path(), &interface, &other_public_key)
+        // A different peer id must not see this one's PSK.
+        assert!(get_exported_psk(dir.path(), &interface, 2)
             .unwrap()
             .is_none());
     }
@@ -508,15 +522,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let interface: InterfaceName = "evilcorp".parse().unwrap();
-        let public_key = KeyPair::generate().public.to_base64();
 
-        save_exported_psk(
-            dir.path(),
-            &interface,
-            &public_key,
-            &Key::generate_preshared(),
-        )
-        .unwrap();
+        save_exported_psk(dir.path(), &interface, 1, &Key::generate_preshared()).unwrap();
 
         let path = exported_psks_path(dir.path(), &interface);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -530,19 +537,12 @@ mod tests {
     fn test_save_exported_psk_overwrites_existing_entry() {
         let dir = tempfile::tempdir().unwrap();
         let interface: InterfaceName = "evilcorp".parse().unwrap();
-        let public_key = KeyPair::generate().public.to_base64();
 
-        save_exported_psk(
-            dir.path(),
-            &interface,
-            &public_key,
-            &Key::generate_preshared(),
-        )
-        .unwrap();
+        save_exported_psk(dir.path(), &interface, 1, &Key::generate_preshared()).unwrap();
         let second = Key::generate_preshared();
-        save_exported_psk(dir.path(), &interface, &public_key, &second).unwrap();
+        save_exported_psk(dir.path(), &interface, 1, &second).unwrap();
 
-        let read_back = get_exported_psk(dir.path(), &interface, &public_key)
+        let read_back = get_exported_psk(dir.path(), &interface, 1)
             .unwrap()
             .unwrap();
         assert_eq!(read_back.to_base64(), second.to_base64());
@@ -565,5 +565,38 @@ mod tests {
             true,
         )];
         apply_exported_psks(&interface, Backend::Userspace, dir.path(), &peers).unwrap();
+    }
+
+    #[test]
+    fn test_apply_exported_psks_matches_by_peer_id_not_public_key() {
+        // The exact bug this keying scheme fixes: a normal invited peer's public key changes
+        // when it redeems (a fresh keypair is registered, replacing the invitation's temporary
+        // one) - the peer_id doesn't. A store keyed by the stale public key would never match
+        // the peer's real, current entry; verified here that keying by id does.
+        let dir = tempfile::tempdir().unwrap();
+        let interface: InterfaceName = "evilcorp".parse().unwrap();
+        let psk = Key::generate_preshared();
+        save_exported_psk(dir.path(), &interface, 1, &psk).unwrap();
+
+        let peers = vec![test_peer(
+            1,
+            "peer",
+            "10.80.0.6",
+            &KeyPair::generate().public.to_base64(), // a different key than at save time
+            None,
+            false,
+            true,
+        )];
+
+        // No real WireGuard interface exists in this test environment, so a match would try to
+        // apply a DeviceUpdate and fail - assert on the error message rather than success, to
+        // distinguish "found the entry and tried to apply it" from "never found it at all".
+        let err = apply_exported_psks(&interface, Backend::Userspace, dir.path(), &peers)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("evilcorp"),
+            "expected a device-apply error (proving the id-keyed entry was found and matched), got: {err}"
+        );
     }
 }

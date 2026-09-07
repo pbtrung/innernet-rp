@@ -176,6 +176,7 @@ impl Server {
             interface: self.interface,
             endpoints: self.endpoints.clone(),
             public_key: self.public_key.clone(),
+            data_dir: self.conf.data_dir.clone(),
             #[cfg(target_os = "linux")]
             backend: Backend::Kernel,
             #[cfg(not(target_os = "linux"))]

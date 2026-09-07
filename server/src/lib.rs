@@ -7,7 +7,7 @@ use indoc::printdoc;
 use innernet_shared::{
     get_local_addrs,
     interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
-    prompts, update_hosts_file, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
+    prompts, update_hosts_file, wg, wg_export, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
     EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface, IoErrorContext, NetworkOpts,
     PeerContents, RenameCidrOpts, RenamePeerOpts, INNERNET_PUBKEY_HEADER,
 };
@@ -55,6 +55,7 @@ pub struct Context {
     pub interface: InterfaceName,
     pub backend: Backend,
     pub public_key: Key,
+    pub data_dir: PathBuf,
 }
 
 pub struct Session {
@@ -196,10 +197,22 @@ pub fn add_peer(
         let keypair = KeyPair::generate();
         let peer_contents = new_peer_info.into_peer_contents(&keypair);
         let peer = DatabasePeer::create(&conn, peer_contents)?;
+        let server_peer = DatabasePeer::get(&conn, 1)?;
+
+        // Give this peer's link back to the server a static preshared key too - baseline PSK
+        // protection for that one link, immediately, whether or not Rosenpass ever gets enabled
+        // on either side (mirrors client/src/main.rs's own add_peer, for the same reason: a
+        // phone can never run Rosenpass at all, and even a normal peer's first exchange takes a
+        // moment - see doc/design.md 5.10/5.6). Keyed by peer.id, not public key - see
+        // shared::wg_export for why (this peer's public key changes when it redeems its
+        // invitation, its id never does).
+        let psk = Key::generate_preshared();
+        wg_export::save_exported_psk(&conf.data_dir, interface, peer.id, &psk)?;
+
         if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
             // Update the current WireGuard interface with the new peers.
             DeviceUpdate::new()
-                .add_peer(PeerConfigBuilder::from(&*peer))
+                .add_peer(PeerConfigBuilder::from(&*peer).set_preshared_key(psk.clone()))
                 .apply(interface, network.backend)
                 .map_err(|_| ServerError::WireGuard)?;
 
@@ -212,10 +225,11 @@ pub fn add_peer(
         let interface_info = InterfaceInfo::new(interface, &keypair, address);
 
         let internal_endpoint = SocketAddr::new(config.address, config.listen_port);
-        let server_peer = DatabasePeer::get(&conn, 1)?;
         let server_info = ServerInfo::new(&server_peer, internal_endpoint);
 
-        let invitation = PeerInvitation::new(interface_info, server_info);
+        let mut invitation = PeerInvitation::new(interface_info, server_info);
+        invitation.set_admin_link_psk(server_peer.id, psk.to_base64());
+
         invitation.save_new(target_path)?;
     } else {
         println!("exited without creating peer.");
@@ -438,6 +452,37 @@ fn spawn_expired_invite_sweeper(db: Db) {
     });
 }
 
+/// Periodically re-applies any peer's saved exported/invite preshared key (see
+/// `shared::wg_export`) to the live WireGuard interface. Needed because `/user/redeem`
+/// (`api::user::handlers::redeem`) removes a peer's temporary-key device entry and re-adds it
+/// under its real, post-redemption key with no PSK at all - `add_peer`'s own immediate
+/// `DeviceUpdate` (which does carry the PSK) only ever applied it to the *temporary* entry,
+/// which redemption then throws away. Independent of Rosenpass entirely, like the client-side
+/// equivalent in `client_core::interface::fetch` - this is a plain WireGuard PSK feature.
+fn spawn_exported_psk_applier(
+    db: Db,
+    interface: InterfaceName,
+    backend: Backend,
+    data_dir: PathBuf,
+) {
+    tokio::task::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let peers = match DatabasePeer::list_enabled(&db.lock()) {
+                Ok(peers) => peers.into_iter().map(|p| p.inner).collect::<Vec<_>>(),
+                Err(e) => {
+                    log::error!("Failed to list peers for exported-PSK sync: {}", e);
+                    continue;
+                },
+            };
+            if let Err(e) = wg_export::apply_exported_psks(&interface, backend, &data_dir, &peers) {
+                log::error!("Failed to apply exported peer preshared keys: {}", e);
+            }
+        }
+    });
+}
+
 fn spawn_hostfile_writer(db: Db, interface: InterfaceName, hosts_opts: HostsOpts) {
     tokio::task::spawn({
         async move {
@@ -523,6 +568,12 @@ pub async fn serve(
     let db = Arc::new(Mutex::new(conn));
     let endpoints = spawn_endpoint_refresher(interface, network);
     spawn_expired_invite_sweeper(db.clone());
+    spawn_exported_psk_applier(
+        db.clone(),
+        interface,
+        network.backend,
+        conf.data_dir.clone(),
+    );
 
     if !hosts_opts.no_write_hosts {
         spawn_hostfile_writer(db.clone(), interface, hosts_opts);
@@ -544,6 +595,7 @@ pub async fn serve(
         interface,
         public_key,
         backend: network.backend,
+        data_dir: conf.data_dir.clone(),
     };
 
     log::info!("innernet-server {} starting.", VERSION);

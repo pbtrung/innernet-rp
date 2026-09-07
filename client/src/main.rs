@@ -1,5 +1,5 @@
 use crate::util::all_installed;
-use anyhow::{anyhow, bail, Error};
+use anyhow::{anyhow, bail, Context as _, Error};
 use clap::{ArgAction, Parser, Subcommand};
 use colored::*;
 use dialoguer::{Confirm, Input};
@@ -12,12 +12,14 @@ use innernet_client_core::{
     DEFAULT_CONFIG_DIR, DEFAULT_DATA_DIR,
 };
 use innernet_shared::{
-    interface_config::InterfaceConfig, prompts, wg, wg::PeerInfoExt, wg_export, AddCidrOpts,
-    AddDeleteAssociationOpts, AddPeerOpts, Association, AssociationContents, Cidr, CidrTree,
-    DeleteCidrOpts, EnableDisablePeerOpts, Endpoint, EndpointContents, HostsOpts, InstallOpts,
-    Interface, IoErrorContext, ListenPortOpts, NatOpts, NetworkOpts, OverrideEndpointOpts,
-    OverridePeerEndpointOpts, Peer, RenameCidrOpts, RenamePeerOpts, RosenpassOpts,
-    ServerCapabilities, WrappedIoError,
+    interface_config::{AdminLinkPsk, InterfaceConfig},
+    prompts, wg,
+    wg::PeerInfoExt,
+    wg_export, AddCidrOpts, AddDeleteAssociationOpts, AddPeerOpts, Association,
+    AssociationContents, Cidr, CidrTree, DeleteCidrOpts, EnableDisablePeerOpts, Endpoint,
+    EndpointContents, HostsOpts, InstallOpts, Interface, IoErrorContext, ListenPortOpts, NatOpts,
+    NetworkOpts, OverrideEndpointOpts, OverridePeerEndpointOpts, Peer, RenameCidrOpts,
+    RenamePeerOpts, RosenpassOpts, ServerCapabilities, WrappedIoError,
 };
 use std::{
     io,
@@ -317,7 +319,44 @@ fn install(
     };
 
     let interface_name = interface_name.parse()?;
+    // Extracted before `config` moves into `redeem_invite` below - see
+    // shared::interface_config::AdminLinkPsk for why this is a one-time, take-and-consume field
+    // rather than something that lingers in this peer's own persisted config afterward.
+    let admin_link_psk = config.admin_link_psk.take();
+    // Also extracted before the move: needed below only for the coordinating-server-as-admin
+    // bootstrap case (see comment there), harmlessly unused otherwise.
+    let coordinating_server_public_key = config.server.public_key.clone();
     redeem_invite(&opts.config_dir, &opts.network, &interface_name, config)?;
+
+    if let Some(AdminLinkPsk { admin_peer_id, psk }) = admin_link_psk {
+        let psk = wireguard_control::Key::from_base64(&psk)
+            .map_err(|e| anyhow::anyhow!("invalid preshared key in invitation: {e}"))?;
+        wg_export::save_exported_psk(&opts.data_dir, &interface_name, admin_peer_id, &psk)?;
+
+        // Peer id 1 is always the coordinating server's own peer row (see
+        // server/src/lib.rs's own DatabasePeer::get(&conn, 1) - the same convention reused
+        // here): if the admin who invited us *is* the coordinating server, apply this PSK to
+        // that link directly and immediately, rather than waiting for the general
+        // wg_export::apply_exported_psks mechanism (which only runs inside a successful
+        // fetch()). That mechanism can't help here: our very first fetch needs *this exact*
+        // link to already work, but the server's own redeem handler applies its side of this
+        // same PSK atomically with redemption - leaving our side unset until fetch() succeeds
+        // would be a real deadlock (a one-sided PSK breaks the handshake fetch() itself needs,
+        // found via a real docker-tests run). For any other admin (a regular peer, not the
+        // server), no such bootstrap problem exists - that link doesn't even exist on our
+        // device until a later fetch discovers the peer, so the normal lazy mechanism is
+        // correct and sufficient.
+        if admin_peer_id == 1 {
+            let server_key = wireguard_control::Key::from_base64(&coordinating_server_public_key)
+                .map_err(|e| anyhow::anyhow!("invalid server public key: {e}"))?;
+            wireguard_control::DeviceUpdate::new()
+                .add_peer(
+                    wireguard_control::PeerConfigBuilder::new(&server_key).set_preshared_key(psk),
+                )
+                .apply(&interface_name, opts.network.backend)
+                .context(interface_name.to_string())?;
+        }
+    }
 
     let mut fetch_success = false;
     for _ in 0..3 {
@@ -616,7 +655,7 @@ fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Re
         prompts::gather_new_peer_info(&peers, &cidr_tree, &sub_opts)?
     {
         log::info!("Creating peer...");
-        let (peer, invitation) =
+        let (peer, mut invitation) =
             create_peer(&opts.config_dir, interface, &cidrs, &peers, new_peer_info)?;
 
         if sub_opts.export_wg_conf {
@@ -627,11 +666,6 @@ fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Re
             // only link it protects, and why that's still worthwhile.
             let psk = wireguard_control::Key::generate_preshared();
             let admin_public_key = admin_interface_info.public_key()?;
-            let exported_public_key =
-                wireguard_control::Key::from_base64(&interface_info.private_key)
-                    .map_err(|e| anyhow::anyhow!("invalid generated private key: {e}"))?
-                    .get_public()
-                    .to_base64();
             let rendered = wg_export::render_wg_quick_conf(
                 &interface_info.private_key,
                 interface_info.address,
@@ -639,7 +673,7 @@ fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Re
                 Some((&admin_public_key, &psk)),
             )?;
             wg_export::write_exported_conf(std::path::Path::new(&target_path), &rendered)?;
-            wg_export::save_exported_psk(&opts.data_dir, interface, &exported_public_key, &psk)?;
+            wg_export::save_exported_psk(&opts.data_dir, interface, peer.id, &psk)?;
             log::info!(
                 "Exported a standalone wg-quick config to {} for a non-innernet WireGuard \
                  client. {}",
@@ -649,6 +683,26 @@ fn add_peer(interface: &InterfaceName, opts: &Opts, sub_opts: AddPeerOpts) -> Re
                     .yellow(),
             );
         } else {
+            // Give this peer's link back to us a static preshared key too, exactly like
+            // --export-wg-conf peers get above - baseline PSK protection for this one link,
+            // immediately, whether or not Rosenpass ever gets enabled on either side. The new
+            // peer picks its half up from the invitation itself (see
+            // shared::interface_config::AdminLinkPsk) and seeds its own local store with it at
+            // `install` time (see this file's `install` function).
+            let psk = wireguard_control::Key::generate_preshared();
+            let admin_public_key = admin_interface_info.public_key()?;
+            // Our own peer id, as far as *this* fetched peer list is concerned - needed because
+            // shared::wg_export keys its local PSK store by stable peer id, not public key (see
+            // that module for why), and the new peer needs to know which id that is to seed its
+            // own side once installed.
+            let admin_peer_id = peers
+                .iter()
+                .find(|p| p.public_key == admin_public_key)
+                .ok_or_else(|| anyhow::anyhow!("couldn't find our own peer in the peer list"))?
+                .id;
+            wg_export::save_exported_psk(&opts.data_dir, interface, peer.id, &psk)?;
+            invitation.set_admin_link_psk(admin_peer_id, psk.to_base64());
+
             invitation.save_new(&target_path)?;
             prompts::print_invitation_info(&peer, &target_path);
         }
@@ -682,9 +736,18 @@ fn export_peer_config(interface: &InterfaceName, opts: &Opts, path: &Path) -> Re
 
     // Re-embed whatever PSK this exported peer was originally given (if any - configs exported
     // before this existed have none), unchanged: refreshing must never rotate it, exactly like
-    // it never rotates the private key.
+    // it never rotates the private key. shared::wg_export keys its local store by peer id, not
+    // public key (see that module for why), so find this exported peer's id in the current list
+    // by its (stable, since it never redeems/rotates) public key first.
     let admin_public_key = admin_interface_info.public_key()?;
-    let psk = wg_export::get_exported_psk(&opts.data_dir, interface, &exported_public_key)?;
+    let exported_peer_id = peers
+        .iter()
+        .find(|p| p.public_key == exported_public_key)
+        .map(|p| p.id);
+    let psk = match exported_peer_id {
+        Some(id) => wg_export::get_exported_psk(&opts.data_dir, interface, id)?,
+        None => None,
+    };
     let rendered = wg_export::render_wg_quick_conf(
         &private_key,
         address,
