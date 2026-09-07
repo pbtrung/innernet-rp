@@ -7,7 +7,7 @@
 # `makepkg`.
 
 pkgname=innernet-rp-bin
-pkgver=0.9999.1
+pkgver=0.9999.2
 pkgrel=1
 pkgdesc="A private network system built on WireGuard, with optional post-quantum key exchange via Rosenpass (prebuilt binaries)"
 arch=('x86_64' 'aarch64')
@@ -30,8 +30,8 @@ optdepends=('wireguard-tools: wg/wg-quick CLI tools for manual interface inspect
 provides=('innernet' 'innernet-server')
 conflicts=('innernet' 'innernet-server')
 options=('!strip' '!debug') # bin/build-multiarch.sh already strips these binaries; there's no
-                             # source tree here for makepkg's debug-package splitting to use
-                             # (it was creating a bogus pkg/innernet-rp-bin/usr/src/debug/ tree)
+# source tree here for makepkg's debug-package splitting to use
+# (it was creating a bogus pkg/innernet-rp-bin/usr/src/debug/ tree)
 install=innernet-rp.install
 
 _target_x86_64='x86_64-unknown-linux-musl'
@@ -57,18 +57,18 @@ source=(
 sha256sums=('943edf174992bb72dd07501903873be40159449935c6ef90a305cad51b359167'
             'f629debbb6539e37ac81a039447b04e66dd3e39c316e414414378e2dbb62eb69'
             '4a0643392ba2612e3899be1705d7bd22b648a8d306c8dc4c7d845e59ca1a2b20')
-sha256sums_x86_64=('a4494c3464ead78e5846559e99ed4084ecc696d9a0dde3e35e6807bef217d089')
-sha256sums_aarch64=('26f6f5785d331dc71b4cfd8f4ba5772947de5a760838d6902441ce1278f95903')
+sha256sums_x86_64=('6af894c5f3d3a26dd9997a084eaee567f4b17cc702a21a71cd45d1a8397f8743')
+sha256sums_aarch64=('edd85f053a2d432531cd37e6e1046d6e10bbb9fb87022b340d5501c00490f4ca')
 
 package() {
-    install -Dm755 "$srcdir/innernet" "$pkgdir/usr/bin/innernet"
-    install -Dm755 "$srcdir/innernet-server" "$pkgdir/usr/bin/innernet-server"
-    install -Dm755 "$srcdir/rosenpass" "$pkgdir/usr/bin/rosenpass"
+  install -Dm755 "$srcdir/innernet" "$pkgdir/usr/bin/innernet"
+  install -Dm755 "$srcdir/innernet-server" "$pkgdir/usr/bin/innernet-server"
+  install -Dm755 "$srcdir/rosenpass" "$pkgdir/usr/bin/rosenpass"
 
-    install -Dm644 "$srcdir/innernet@.service" \
-        "$pkgdir/usr/lib/systemd/system/innernet@.service"
-    install -Dm644 "$srcdir/innernet-server@.service" \
-        "$pkgdir/usr/lib/systemd/system/innernet-server@.service"
-    install -Dm644 "$srcdir/innernet-rp.sysusers" \
-        "$pkgdir/usr/lib/sysusers.d/innernet-rp.conf"
+  install -Dm644 "$srcdir/innernet@.service" \
+    "$pkgdir/usr/lib/systemd/system/innernet@.service"
+  install -Dm644 "$srcdir/innernet-server@.service" \
+    "$pkgdir/usr/lib/systemd/system/innernet-server@.service"
+  install -Dm644 "$srcdir/innernet-rp.sysusers" \
+    "$pkgdir/usr/lib/sysusers.d/innernet-rp.conf"
 }
