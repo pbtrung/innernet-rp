@@ -12,10 +12,12 @@ use std::{
 use wireguard_control::InterfaceName;
 
 pub mod interface_config;
+pub mod management;
 #[cfg(target_os = "linux")]
 mod netlink;
 pub mod peer;
 pub mod pq;
+pub mod private_file;
 pub mod prompts;
 pub mod types;
 pub mod wg;

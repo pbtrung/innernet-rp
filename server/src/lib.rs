@@ -21,8 +21,6 @@ use std::{
     collections::{HashMap, VecDeque},
     convert::TryInto,
     env,
-    fs::File,
-    io::prelude::*,
     net::{IpAddr, SocketAddr, TcpListener},
     ops::Deref,
     path::{Path, PathBuf},
@@ -39,6 +37,7 @@ mod body;
 mod db;
 mod error;
 pub mod initialize;
+pub mod management;
 pub mod pq;
 #[cfg(test)]
 mod test;
@@ -80,7 +79,7 @@ impl Session {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ConfigFile {
     /// The server's WireGuard key
@@ -94,31 +93,33 @@ pub struct ConfigFile {
 
     /// The CIDR prefix of the WireGuard network
     pub network_cidr_prefix: u8,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub management_required: bool,
+}
+
+impl std::fmt::Debug for ConfigFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigFile")
+            .field("private_key", &"[redacted]")
+            .field("listen_port", &self.listen_port)
+            .field("address", &self.address)
+            .field("network_cidr_prefix", &self.network_cidr_prefix)
+            .field("management_required", &self.management_required)
+            .finish()
+    }
 }
 
 impl ConfigFile {
     pub fn write_to_path<P: AsRef<Path>>(&self, path: P) -> Result<(), Error> {
-        let mut invitation_file = File::create(&path).with_path(&path)?;
-        innernet_shared::chmod(&invitation_file, 0o600)?;
-        invitation_file
-            .write_all(toml::to_string(self).unwrap().as_bytes())
-            .with_path(path)?;
+        innernet_shared::private_file::write_toml(path.as_ref(), self, false).with_path(path)?;
         Ok(())
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let path = path.as_ref();
-        let file = File::open(path).with_path(path)?;
-        if innernet_shared::chmod(&file, 0o600)? {
-            println!(
-                "{} updated permissions for {} to 0600.",
-                "[!]".yellow(),
-                path.display()
-            );
-        }
-        Ok(toml::from_str(
-            &std::fs::read_to_string(path).with_path(path)?,
-        )?)
+        let text = innernet_shared::private_file::read(path, true).with_path(path)?;
+        toml::from_str(&text)
+            .map_err(|_| anyhow!("invalid server configuration; private contents omitted"))
     }
 }
 
@@ -200,10 +201,21 @@ pub fn add_peer(
         let keypair = KeyPair::generate();
         let peer_contents = new_peer_info.into_peer_contents(&keypair);
         let peer = DatabasePeer::create(&conn, peer_contents)?;
+
+        let mut manager = management::Manager::open_or_create(conf, interface, &config, &conn)?;
+        let enrollment = manager
+            .as_mut()
+            .map(|manager| manager.provision_new_peer(peer.id, &conn))
+            .transpose()?;
+
         if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
             // Update the current WireGuard interface with the new peers.
+            let peer_config = match &manager {
+                Some(manager) => manager.peer_config(&peer)?,
+                None => PeerConfigBuilder::from(&*peer),
+            };
             DeviceUpdate::new()
-                .add_peer(PeerConfigBuilder::from(&*peer))
+                .add_peer(peer_config)
                 .apply(interface, network.backend)
                 .map_err(|_| ServerError::WireGuard)?;
 
@@ -219,7 +231,8 @@ pub fn add_peer(
         let server_key = Key::from_base64(&config.private_key)?.get_public();
         let server_id = db::pq::identify_server(&conn, &server_key.to_base64(), config.address)?;
         let server_peer = DatabasePeer::get(&conn, server_id)?;
-        let server_info = ServerInfo::new(&server_peer, internal_endpoint);
+        let server_info =
+            ServerInfo::new(&server_peer, internal_endpoint).with_management(enrollment);
 
         let invitation = PeerInvitation::new(interface_info, server_info);
         invitation.save_new(target_path)?;
@@ -261,6 +274,7 @@ pub fn enable_or_disable_peer(
     network: NetworkOpts,
     opts: EnableDisablePeerOpts,
 ) -> Result<(), Error> {
+    let config = ConfigFile::from_file(conf.config_path(interface))?;
     let conn = open_database_connection(interface, conf)?;
     let peers = DatabasePeer::list(&conn)?
         .into_iter()
@@ -278,8 +292,13 @@ pub fn enable_or_disable_peer(
         )?;
 
         if enable {
+            let manager = management::Manager::open_or_create(conf, interface, &config, &conn)?;
+            let peer_config = match &manager {
+                Some(manager) => manager.peer_config(db_peer.deref())?,
+                None => db_peer.deref().into(),
+            };
             DeviceUpdate::new()
-                .add_peer(db_peer.deref().into())
+                .add_peer(peer_config)
                 .apply(interface, network.backend)
                 .map_err(|_| ServerError::WireGuard)?;
         } else {
@@ -483,12 +502,23 @@ pub async fn serve(
     let public_key = wireguard_control::Key::from_base64(&config.private_key)?.get_public();
     db::pq::identify_server(&conn, &public_key.to_base64(), config.address)?;
 
+    // A brief handle: extract what's needed for kernel peer configs, then drop
+    // it so it never holds the private-state lock for this process's lifetime
+    // (administrative commands like `add-peer` must be able to open it too).
+    // `load` fails closed if management is required but any enabled peer's
+    // link is missing/corrupt, rather than silently reporting readiness.
+    let manager = management::Manager::load(conf, &interface, &config, &conn)?;
+
     let mut peers = DatabasePeer::list(&conn)?;
     log::debug!("peers listed...");
     let peer_configs = peers
         .iter()
-        .map(|peer| peer.deref().into())
-        .collect::<Vec<PeerConfigBuilder>>();
+        .map(|peer| match &manager {
+            Some(manager) => manager.peer_config(peer),
+            None => Ok(peer.deref().into()),
+        })
+        .collect::<Result<Vec<PeerConfigBuilder>, ServerError>>()?;
+    drop(manager);
 
     log::info!("bringing up interface.");
     wg::up(

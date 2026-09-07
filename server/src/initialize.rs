@@ -181,6 +181,7 @@ pub fn init_wizard(conf: &ServerConfig, opts: InitializeOpts) -> Result<(), Erro
     let our_keypair = KeyPair::generate();
 
     let config = ConfigFile {
+        management_required: false,
         private_key: our_keypair.private.to_base64(),
         listen_port,
         address: our_ip,

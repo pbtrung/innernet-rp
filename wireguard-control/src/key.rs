@@ -152,7 +152,9 @@ pub struct KeyPair {
 
 impl fmt::Debug for Key {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Key(\"{}\")", self.to_base64())
+        // This type also represents private and preshared keys. Public-key
+        // diagnostics must opt in explicitly with to_base64().
+        f.write_str("Key([redacted])")
     }
 }
 

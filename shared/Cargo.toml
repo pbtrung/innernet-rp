@@ -19,10 +19,12 @@ version = "2.0.0"
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.23.1"
 atty = "0.2.14"
 clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
 colored.workspace = true
 dialoguer.workspace = true
+getrandom = "0.4.3"
 hostsfile = { version = "2.0.0", path = "../hostsfile" }
 indoc = "2.0.7"
 innernet-publicip = { version = "2.0.0", path = "../publicip" }
@@ -35,6 +37,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.5"
 url = "2.5.8"
 wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
+zeroize = "1.9.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-core = "0.9.0"

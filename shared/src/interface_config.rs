@@ -1,11 +1,9 @@
-use crate::{chmod, ensure_dirs_exist, Endpoint, Error, IoErrorContext, Peer, WrappedIoError};
-use indoc::writedoc;
+use crate::{ensure_dirs_exist, Endpoint, Error, IoErrorContext, Peer, WrappedIoError};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{File, OpenOptions},
-    io::{self, Write},
+    io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
@@ -29,7 +27,7 @@ pub struct InterfaceConfig {
     peer_endpoint_overrides: BTreeMap<IpAddr, Endpoint>,
 }
 
-#[derive(Clone, Deserialize, Serialize, Debug)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct InterfaceInfo {
     /// The interface name (i.e. "tonari")
@@ -44,6 +42,17 @@ pub struct InterfaceInfo {
 
     /// The local listen port. A random port will be used if `None`.
     pub listen_port: Option<u16>,
+}
+
+impl std::fmt::Debug for InterfaceInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterfaceInfo")
+            .field("network_name", &self.network_name)
+            .field("address", &self.address)
+            .field("private_key", &"[redacted]")
+            .field("listen_port", &self.listen_port)
+            .finish()
+    }
 }
 
 impl InterfaceInfo {
@@ -68,6 +77,8 @@ pub struct ServerInfo {
 
     /// An internal endpoint in the WireGuard network that hosts the coordination API.
     pub internal_endpoint: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management: Option<crate::management::Enrollment>,
 }
 
 impl ServerInfo {
@@ -79,7 +90,13 @@ impl ServerInfo {
                 .expect("The innernet server should have a WireGuard endpoint"),
             internal_endpoint,
             public_key: server_peer.public_key.clone(),
+            management: None,
         }
+    }
+
+    pub fn with_management(mut self, management: Option<crate::management::Enrollment>) -> Self {
+        self.management = management;
+        self
     }
 }
 
@@ -95,37 +112,40 @@ impl InterfaceConfig {
     /// Save a new config file, failing if it already exists.
     pub fn save_new(&self, path: impl AsRef<Path>, mode: u32) -> Result<(), WrappedIoError> {
         let path = path.as_ref();
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(path)
-            .with_path(path)?;
-
-        chmod(&file, mode).with_path(path)?;
-
-        file.write_all(self.as_toml().as_bytes()).with_path(path)?;
-
-        Ok(())
+        if mode != 0o600 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "confidential configurations require mode 0600",
+            ))
+            .with_path(path);
+        }
+        crate::private_file::write_toml(path, self, true).with_path(path)
     }
 
     /// Overwrites the config file if it already exists.
     pub fn save(&self, config_dir: &Path, interface: &InterfaceName) -> Result<PathBuf, Error> {
         let path = Self::build_config_file_path(config_dir, interface)?;
-        File::create(&path)
-            .with_path(&path)?
-            .write_all(self.as_toml().as_bytes())?;
+        crate::private_file::write_toml(&path, self, false).with_path(&path)?;
 
         Ok(path)
     }
 
-    fn as_toml(&self) -> String {
-        toml::to_string(self).unwrap()
+    fn as_toml(&self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(
+            toml::to_string(self).expect("serializable interface configuration"),
+        )
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        Ok(toml::from_str(
-            &std::fs::read_to_string(&path).with_path(path)?,
-        )?)
+        let path = path.as_ref();
+        let text = crate::private_file::read(path, true).with_path(path)?;
+        let value: Self = toml::from_str(&text).map_err(|_| {
+            anyhow::anyhow!("invalid interface configuration; private contents omitted")
+        })?;
+        if let Some(management) = &value.server.management {
+            management.validate().map_err(|e| anyhow::anyhow!(e))?;
+        }
+        Ok(value)
     }
 
     pub fn from_interface(config_dir: &Path, interface: &InterfaceName) -> Result<Self, Error> {
@@ -183,14 +203,7 @@ impl PeerInvitation {
 
     /// Save a new invitation file, failing if it already exists.
     pub fn save_new(&self, path: impl AsRef<Path>) -> Result<(), io::Error> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-
-        writedoc!(
-            file,
+        let mut text = zeroize::Zeroizing::new(indoc::formatdoc!(
             r"
                     # This is an invitation file to an innernet network.
                     #
@@ -203,10 +216,8 @@ impl PeerInvitation {
                     #
                     # Don't edit the contents below unless you love chaos and dysfunction.
                 "
-        )?;
-
-        file.write_all(self.interface_config.as_toml().as_bytes())?;
-
-        Ok(())
+        ));
+        text.push_str(&self.interface_config.as_toml());
+        crate::private_file::write(path.as_ref(), text.as_bytes(), true)
     }
 }

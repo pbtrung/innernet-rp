@@ -173,6 +173,14 @@ impl Server {
         self.db.clone()
     }
 
+    pub fn conf(&self) -> &ServerConfig {
+        &self.conf
+    }
+
+    pub fn interface(&self) -> InterfaceName {
+        self.interface
+    }
+
     pub fn context(&self) -> Context {
         Context {
             db: self.db.clone(),

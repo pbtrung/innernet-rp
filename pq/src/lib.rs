@@ -2,6 +2,9 @@
 pub mod api;
 pub mod crypto;
 pub mod protocol;
+pub mod state;
+#[cfg(unix)]
+pub mod store;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

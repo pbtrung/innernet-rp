@@ -908,6 +908,7 @@ dependencies = [
  "toml",
  "url",
  "wireguard-control",
+ "zeroize",
 ]
 
 [[package]]
@@ -916,9 +917,11 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "atty",
+ "base64",
  "clap",
  "colored",
  "dialoguer",
+ "getrandom",
  "hostsfile",
  "indoc",
  "innernet-publicip",
@@ -936,6 +939,7 @@ dependencies = [
  "toml",
  "url",
  "wireguard-control",
+ "zeroize",
 ]
 
 [[package]]

@@ -29,6 +29,18 @@ pub fn ready(conn: &Connection) -> Result<bool, ServerError> {
     )?)
 }
 
+/// Durably records that every currently enabled peer has a provisioned
+/// management link. Never cleared automatically: a subsequently added peer
+/// without a link fails closed through `management::Manager::load` instead
+/// of silently reporting stale readiness.
+pub fn set_management_ready(conn: &Connection, ready: bool) -> Result<(), ServerError> {
+    conn.execute(
+        "UPDATE pq_network SET management_ready = ?1 WHERE singleton = 1",
+        [ready],
+    )?;
+    Ok(())
+}
+
 /// Infer a migrated server role only from both the persisted private-key public
 /// identity and address, never from the numeric peer ID.
 pub fn identify_server(
