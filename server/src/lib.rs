@@ -36,6 +36,8 @@ mod api;
 mod body;
 mod db;
 mod error;
+#[cfg(target_os = "linux")]
+pub mod gate;
 pub mod initialize;
 pub mod management;
 pub mod pq;
@@ -535,6 +537,13 @@ pub async fn serve(
         .apply(&interface, network.backend)?;
 
     log::info!("{} peers added to wireguard interface.", peers.len());
+
+    #[cfg(target_os = "linux")]
+    if config.management_required {
+        gate::apply(&interface, config.listen_port)
+            .map_err(|e| anyhow!("installing the management-only traffic policy: {e}"))?;
+        log::info!("management-only traffic policy installed.");
+    }
 
     let candidates: Vec<Endpoint> = get_local_addrs()?
         .map(|addr| SocketAddr::from((addr, config.listen_port)).into())

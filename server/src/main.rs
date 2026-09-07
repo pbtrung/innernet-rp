@@ -124,6 +124,25 @@ enum Command {
         args: DeleteCidrOpts,
     },
 
+    /// Require the management-only link policy for an existing network,
+    /// provisioning a management PSK for every currently enabled peer and
+    /// installing the server-link traffic ACL on the next `serve`. New
+    /// peers added afterward receive their link automatically through their
+    /// invitation; this command is for retrofitting an existing network.
+    RequireManagement {
+        interface: Interface,
+
+        /// Confirms this is being run over an access path independent of
+        /// the affected tunnel (console, separate management network).
+        #[clap(long)]
+        independent_admin_access: bool,
+
+        /// Optional JSON file mapping peer IDs to an already-trusted PSK to
+        /// adopt instead of generating a fresh random one for that peer.
+        #[clap(long)]
+        adopted_psks: Option<PathBuf>,
+    },
+
     /// Generate shell completion scripts
     Completions {
         #[clap(value_enum)]
@@ -172,6 +191,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::AddCidr { interface, args } => add_cidr(&interface, &conf, args)?,
         Command::RenameCidr { interface, args } => rename_cidr(&interface, &conf, args)?,
         Command::DeleteCidr { interface, args } => delete_cidr(&interface, &conf, args)?,
+        Command::RequireManagement {
+            interface,
+            independent_admin_access,
+            adopted_psks,
+        } => {
+            let path = innernet_server::management::prepare(
+                &conf,
+                &interface,
+                independent_admin_access,
+                adopted_psks.as_deref(),
+            )?;
+            println!(
+                "{} management is now required for {}.",
+                "[*]".dimmed(),
+                interface
+            );
+            println!(
+                "    Per-peer artifacts (if any peer needed one) were written under {}.",
+                path.display()
+            );
+            println!(
+                "    Transfer each peer-<id>.management.json confidentially and out of band, \
+                 then restart `serve` to install the traffic policy.",
+            );
+        },
         Command::Completions { shell } => {
             use clap::CommandFactory;
             let mut app = Opts::command();
