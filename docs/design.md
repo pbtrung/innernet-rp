@@ -1,601 +1,783 @@
-# Design: Post-quantum WireGuard via peer-to-peer ML-KEM exchange
+# Design: Post-quantum WireGuard PSKs via relayed ML-KEM exchange
 
-Status: draft
+Status: draft; protocol and implementation validation required before release
 Related: [milestones.md](milestones.md)
 
-## 1. Motivation
+## 1. Motivation and security scope
 
-innernet peers connect over WireGuard, whose handshake authenticates and
-derives keys using classical elliptic-curve Diffie–Hellman. That is not
-post-quantum secure: traffic recorded today could be decrypted later by an
-adversary with a cryptographically relevant quantum computer ("harvest now,
-decrypt later").
+WireGuard's classical elliptic-curve handshake does not protect recorded
+traffic from a future cryptographically relevant quantum computer. A secret
+32-byte preshared key (PSK), mixed into `Noise_IKpsk2`, can add protection
+against that passive "harvest now, decrypt later" threat.
 
-This doc proposes hardening every WireGuard link against that threat by
-periodically deriving a **preshared key (PSK)** from a genuine post-quantum
-key encapsulation mechanism (KEM), and feeding it into WireGuard exactly the
-way any operator-supplied PSK works today. This does not replace the
-WireGuard handshake — it strengthens it: WireGuard's `Noise_IKpsk2` pattern
-mixes the PSK into the final session key, so the combination is
-cryptographically no less secure than WireGuard on its own, and enabling it
-can only help.
+This design derives rotating PSKs for client-to-client data links using
+ML-KEM-1024 and X448. Peers exchange public material through the existing
+coordination API; no additional peer listener is required. The API server
+is a trusted directory and relay, not a relay for application traffic.
 
-The distinguishing design choice here is **how** the two sides of a link
-exchange the KEM material: directly, peer-to-peer, using the *existing*
-coordination-server channel every peer already talks to for peer discovery —
-not a new, separately-exposed network service. The server's role stays
-exactly what it already is for WireGuard public keys and endpoints: a
-directory peers push to and pull from. It never sees a private key or a
-derived secret, only opaque ciphertext blobs (and their signatures, §5.8) it
-relays.
+Each client's coordination-server link is a deliberate exception: it uses
+a separately provisioned random PSK, with administrative rotation over an
+independent access path. It does not use mailbox-driven rotation, because
+the mailbox must remain reachable when data-link PSKs are mismatched.
+Section 5.10 defines provisioning, rotation, and recovery for this link.
 
-This document describes the architecture, protocol, and data model only —
-it is implementation-language-independent, since no code exists yet.
+Claims assume honest endpoints, a trusted directory, secure randomness, and
+uncompromised long-term secrets. Mandatory P-521 signatures authenticate
+messages relative to the directory's keys; they do not remove that trust
+or provide post-quantum identity authentication. Static ML-KEM/X448 keys do
+not give the PSK layer forward secrecy after long-term key compromise.
+Rotation requires explicit durable protocol state beyond WireGuard itself.
 
-## 2. Background: ML-KEM and why a relay, not a listener
+This checkout contains design documents only. Existing innernet behavior
+is an integration baseline, not an implementation of this proposal. The
+specification is implementation-language-independent.
 
-- **ML-KEM** (FIPS 203, standardized 2024, formerly known as Kyber) is a
-  NIST-standardized post-quantum KEM. A KEM has three operations: `KeyGen()`
-  → `(public_key, secret_key)`; `Encapsulate(public_key)` → `(ciphertext,
-  shared_secret)`; `Decapsulate(secret_key, ciphertext)` → `shared_secret`
-  (the same value the encapsulating side produced). Critically, this is a
-  **one-shot** operation, not an interactive multi-round-trip protocol — the
-  encapsulating side needs nothing from the other side except its long-lived
-  public key, which it can fetch once and cache.
-- This design uses **ML-KEM-1024**, the highest of the standardized
-  parameter sets (NIST Category 5, roughly AES-256-equivalent classical
-  security). Its sizes are still small enough to travel as ordinary API
-  payloads: public key 1568 bytes, ciphertext 1568 bytes, comfortably under
-  two kilobytes base64-encoded. This is the key enabling fact for this
-  design: it means the public key can be *just another field* on a peer's
-  existing record, and a ciphertext can be *just another small object* the
-  coordination server temporarily stores and forwards — no separate
-  listener, no separate wire protocol, no new exposed port.
-- Because encapsulation is one-shot and asynchronous (the encapsulating side
-  doesn't need the other side to be online at that exact instant — it just
-  needs the recipient's public key, which is already cached), the natural
-  transport for the ciphertext is the *same* request/response channel a peer
-  already uses to fetch its peer list: drop the ciphertext off, the recipient
-  picks it up on its next regular poll.
-- This deliberately avoids running any new always-on network service per
-  peer. Every additional exposed listener is additional attack surface (an
-  unauthenticated flood against it, a parser bug in a new wire format, a
-  port an operator has to remember to firewall) — see §6 for why this
-  matters more than it might first appear.
+## 2. Cryptographic building blocks and transport sizes
 
-### 2.1 Cryptographic building blocks
+- **ML-KEM-1024** is the FIPS 203 Category 5 parameter set: public key and
+  ciphertext are each 1568 bytes; the shared secret is 32 bytes. A single
+  encapsulation is asynchronous, but reliable PSK activation requires the
+  multi-message protocol in section 5.5.
+- **X448** uses dedicated interface keys and supplies a separate classical
+  shared secret. Public keys and shared secrets are 56 bytes; its roughly
+  224-bit classical security margin is distinct from ML-KEM's category.
+- **HKDF-SHA3-256** combines secrets and authenticated context, deriving
+  separate PSK and confirmation keys (section 5.7).
+- **ECDSA P-521 with SHA-512** signs every exchange message. Public keys
+  use 67-byte compressed SEC1 encoding; signatures use 132-byte raw `r || s`.
+  Signing is mandatory in version 1, with no unsigned negotiation mode.
 
-- **KEM and hybrid ECDH: leancrypto.** A single library providing
-  ML-KEM-1024, X448, and SHA3/HKDF, rather than pulling in a separate
-  implementation per primitive. Its integration maturity for whichever
-  implementation this design is eventually built in is a tracked risk
-  (§10), not assumed away.
-- **KDF: HKDF-SHA3-256** (§5.7) for combining the hybrid shared secret into
-  the final 32-byte WireGuard PSK. SHA3 (Keccak) is a structurally different
-  hash family from SHA2, which this design prefers for the same
-  hedge-against-a-single-family reasoning already applied to the KEM/curve
-  choices — a future weakness specific to the SHA2 family wouldn't affect
-  this KDF.
-- **Hybrid classical DH: X448** (§5.7), via leancrypto. Curve448 (the
-  "Goldilocks curve") pairs a large classical security margin with
-  ML-KEM-1024's higher PQ security category.
-- **Signature scheme for §5.8's ciphertext authentication: NIST P-521**
-  (secp521r1) with ECDSA — a **separate** dependency from leancrypto, since
-  leancrypto does not implement NIST prime-field curves. This means the
-  design depends on two independent cryptographic libraries rather than
-  one — an explicit, tracked tradeoff (§10), accepted here because P-521 is
-  a FIPS 186-5-approved NIST curve, which matters for deployments with
-  FIPS-approved-primitive requirements.
-- **Storage: SQLite**, already used to hold the peer directory (§3), gains
-  two new nullable fields and one new small table (§5.1). No new storage
-  system is introduced.
-- **Linking: against system-provided installations, not vendored/bundled
-  copies.** Both the KEM/hybrid-ECDH library and SQLite are linked against
-  the versions already installed on the host, so a deployment declares them
-  as ordinary runtime dependencies rather than statically bundling private
-  copies — consistent with how this project's non-minimal-footprint
-  packaging already declares its runtime dependencies explicitly.
+A 1568-byte field becomes **2092 bytes in padded base64**, exceeding both
+2000 bytes and 2 KiB. Ciphertext plus signature alone is 2268 base64 bytes;
+all three public keys total 2260 base64 bytes. Actual requests also carry
+identifiers, versions, confirmation tags, and JSON overhead (section 8).
 
-## 3. Relevant existing innernet architecture
+Algorithm and validation references:
+[FIPS 203](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.203.pdf),
+[RFC 7748](https://www.rfc-editor.org/rfc/rfc7748.html), and
+[FIPS 186-5](https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.186-5.pdf).
 
-(For readers unfamiliar with the system; skip to §5 if not.)
+### 2.1 Libraries, storage, and packaging
 
-- **Coordination server, not a data-plane relay.** The server holds a
-  SQLite-backed peer directory — each peer's WireGuard public key, IP,
-  CIDR membership, and endpoint. It never carries actual VPN traffic; peers
-  fetch each other's info and then talk to each other directly over
-  WireGuard. This design keeps that property: the mailbox described below
-  stores tiny ciphertext blobs, never tunnel traffic.
-- **Peer visibility already follows CIDR scoping.** A peer only ever learns
-  about the peers it's authorized to see, enforced server-side per existing
-  CIDR/authorization rules. Any new per-peer field added to the peer record
-  inherits this scoping for free — nothing new to re-implement.
-- **The bulk state fetch.** Clients periodically fetch their current peer
-  list from the server (on a configurable interval, default 60 seconds) and
-  apply it to the local WireGuard interface. The server also runs its own
-  equivalent sync loop for its own coordination-API WireGuard link (see
-  §5.10). This existing poll loop is the natural place to also pick up and
-  process pending KEM material — no new polling loop needs to be invented.
-- **PSK application is already a solved, separate concern.** Applying a PSK
-  to a running WireGuard interface is already a small, non-disruptive
-  operation in this system — the existing WireGuard-control layer merges
-  peer settings onto the existing peer rather than tearing down the tunnel.
-  Nothing about this design changes that mechanism; it only changes how the
-  PSK value gets derived.
-- **Feature flags and backward compatibility.** The server already has a
-  mechanism for advertising optional features to clients, and peer record
-  fields already default gracefully when absent, so old and new
-  client/server combinations interoperate without a hard cutover. The
-  schema changes below follow that exact pattern.
+Use leancrypto for ML-KEM-1024, X448, SHA3, HMAC, and HKDF, with a separate
+P-521/SHA-512 implementation. M0 selects the signing library and verifies
+the required APIs and failure behavior of both implementations. Use the
+standalone primitives; do not silently substitute a library-specific hybrid
+encoding or KDF for section 5.7.
+
+Both crypto libraries and SQLite link against system-provided shared
+libraries, with no vendored/bundled copies. Record exact tested package
+versions in reproducible CI/build environments and declare minimum runtime
+versions and ABI requirements. Package updates repeat relevant checks;
+unpinned upstream branches are not the dependency policy. Algorithm
+approval alone does not establish FIPS module validation.
+
+SQLite gains three public-key fields, bundle metadata, and durable exchange
+records (section 5.1). It holds no client-to-client PSKs or private keys.
+Server-link PSKs are endpoint secrets stored separately with the server's
+private configuration, as specified in section 5.10.
+
+## 3. Existing architecture and integration boundaries
+
+innernet distributes peer WireGuard keys, addresses, endpoints, and CIDR
+visibility through a coordination API carried over WireGuard. Peers normally
+fetch state every 60 seconds. Reuse that loop for delivery and reconciliation,
+including when there is no application traffic. Poll and rotation timers
+have separate meanings.
+
+Explicitly enforce existing visibility and disabled/redeemed-peer checks on
+registration, writes, and every delivery. Scoping a directory field does not
+automatically authorize new endpoints, joins, or cached responses.
+
+WireGuard has one configured PSK per peer, separate from established session
+keys. It neither stages two PSKs nor automatically restores one after a
+failed handshake. Updating the PSK need not replace an old session immediately.
+Activation and strict-mode enforcement must account for this (section 5.6).
+See the [WireGuard protocol](https://www.wireguard.com/protocol/) and
+[Linux PSK update implementation](https://git.zx2c4.com/wireguard-linux/tree/drivers/net/wireguard/netlink.c).
+
+Advertise `pq_psk_versions: [1]`; missing capability means unsupported.
+Legacy clients retain their existing response shape. Versioned, paginated
+PQ state is requested explicitly (section 5.2).
 
 ## 4. Non-goals
 
-- Not building general-purpose NAT traversal for the exchange — it reuses
-  the coordination server's already-authenticated channel, which every peer
-  already reaches by construction (it has to, to get its peer list at all).
-- Not attempting to hide metadata (who is exchanging keys with whom) from
-  the coordination server — it already knows the full peer graph and CIDR
-  membership; this adds nothing new to that trust boundary.
-- Not building a general pub/sub or messaging system. The mailbox is
-  intentionally narrow: one pending ciphertext (plus its signature) per
-  ordered peer pair, with a short TTL — not a general delivery mechanism
-  for arbitrary payloads.
-- Not supporting non-Linux platforms for this feature (see §5.13) — even
-  though other parts of this project run on macOS/OpenBSD.
+- Resistance to a compromised identity directory or active quantum attacker.
+  An independent trust anchor and PQ identity authentication require a
+  separate protocol revision.
+- PSK-layer forward secrecy or post-compromise recovery following static
+  KEM/DH-key compromise. Fresh encapsulation alone supplies neither.
+- Seamless, atomic PSK replacement across two machines. Data-link interruption
+  is accepted; partitions can extend it without disabling the API.
+- Automatic rotation of the management PSK through its own protected tunnel,
+  metadata hiding from the server, a general messaging service, or new
+  NAT-traversal/listener infrastructure.
+- Non-Linux support for this feature.
 
 ## 5. Proposed design
 
-### 5.1 Data model & schema changes
+### 5.1 Data model and durable state
 
-- Add two nullable fields to the peer record and its backing storage: a
-  KEM public key and a signature public key, mirroring how the existing
-  WireGuard public key field already works. The signature public key is
-  used to verify a peer's ciphertext signatures (§5.8).
-- Both fields default to absent when serialized, so old and new
-  client/server combinations round-trip peer records without them.
-- Add one boolean feature flag advertising this capability, following the
-  existing pattern for advertising optional server features.
-- New table, a handshake mailbox: `(to_peer_id, from_peer_id, ciphertext,
-  signature, created_at)`, primary-keyed on `(to_peer_id, from_peer_id)` —
-  at most one pending, undelivered ciphertext per ordered pair at a time. A
-  fresh encapsulation overwrites any previous undelivered one for that pair
-  rather than accumulating a backlog.
+The directory has a random, persistent 16-byte `network_id`. Peer IDs are
+positive integers at most `2^63 - 1`, stable and never reused within a
+network. Server role is explicit metadata, not an assumption that restored
+networks always give the server ID 1.
 
-### 5.2 New server endpoints
+Each data peer advertises one atomic bundle:
 
-- `PUT /v1/user/pq-handshake/{to_peer_id}` — upload a ciphertext (and its
-  signature, §5.8) addressed to another peer. Validates: `ciphertext`
-  matches the expected ML-KEM-1024 ciphertext length exactly (1568 bytes)
-  and `signature` matches the expected P-521 ECDSA signature length exactly
-  (reject anything else outright, same spirit as the existing
-  candidate-endpoint size caps), `to_peer_id` must be a peer the caller is
-  authorized to see (same CIDR check already applied to peer-list
-  visibility).
-- Delivery needs no separate `GET` endpoint: pending ciphertexts addressed
-  to the requester are embedded directly in the existing bulk peer-state
-  fetch response (one extra optional field per peer entry the fetcher is
-  authorized to see). The server deletes a mailbox row once served in a
-  response — at-most-once delivery, no separate ack round trip.
-- A short TTL (a small multiple of the fetch interval — e.g. 10 minutes)
-  garbage-collects anything nobody ever picked up, so the table can't grow
-  unbounded from peers that are offline or have since been removed.
+- `pq_kem_public_key`, `pq_x448_public_key`, and `pq_sig_public_key`;
+- `pq_version = 1`, a random 16-byte `bundle_id`, and a monotonic
+  `bundle_revision` allocated by the server;
+- its existing WireGuard public key and lifecycle state `enabled` or `retired`.
 
-### 5.3 Client: keypair lifecycle
+The new fields are nullable for legacy records. All absent means unsupported;
+a partial, malformed, retired, or unsupported-version bundle is unusable,
+not permission to downgrade. Registration is atomic and idempotent. Updates
+use compare-and-swap against the current revision. Never reuse bundle IDs.
 
-- Generate an ML-KEM-1024 keypair, a dedicated X448 keypair (§5.7), and a
-  dedicated P-521 signing keypair (§5.8) once per interface, at the same
-  point the interface's WireGuard keypair is first established. Store all
-  three secret keys with the same permission discipline (owner-only) as
-  the existing WireGuard private key.
-- Register all three public keys with the server through the same
-  mechanism already used to register other per-peer fields, called once at
-  setup and re-checked idempotently (only sent if it doesn't already match
-  what the server has on record) on every regular sync.
-- The client's status display should show whether the local interface and
-  each visible peer has advertised PQ public keys.
+For each unordered data-peer pair, store at most one active exchange:
+`(network_id, initiator_id, responder_id, initiator_bundle_id,
+responder_bundle_id, sequence, exchange_id, transcript_hash, phase,
+signed_messages, created_at, prepare_expires_at)`.
 
-### 5.4 Dial/listen tie-break for exchange initiation
+Phases are `proposed`, `ready`, `committed`, `complete`, and `aborted`.
+After commitment, retain separate monotonic installation and fresh-handshake
+confirmation receipts for each endpoint. Keep a compact terminal record with
+the last sequence, exchange ID, transcript hash, and outcome for the current
+bundle pair even after large bodies expire. Index both participants, active
+phases, and expiry; enforce foreign keys.
 
-Exactly one side of every peer pair must be the one to encapsulate first
-(the "initiator" for that pair) — if both sides encapsulated independently
-and applied their own locally-computed secret, they'd derive **two
-different** values and the tunnel would silently fail to agree on a PSK,
-with no visible error. Both sides need to reach the same
-initiator/responder assignment without coordinating, so it's derived from
-something both already know: peer ID.
+Endpoints persist bundle secrets, high-water sequence marks, exact transcripts
+and signed retries, candidate and previous confirmed PSKs, and installation/
+confirmation intent. Key this state by network, peer IDs, and bundle IDs.
+Private state is never uploaded. One process owns each interface under an
+exclusive lock; multiple sync processes must not compete.
 
-- The coordinating server is always peer id 1 (the first peer any network
-  has). It's special-cased to always be the **responder**, never the
-  initiator: it's the side an operator can reliably keep online 24/7, while
-  any other peer may be offline, asleep, or behind a NAT with no stable
-  reachability — none of which matters here, since initiation only requires
-  the *coordination server* to be reachable (which every peer already
-  assumes), not the other peer directly.
-- For a pair where neither side is the server, there's no such asymmetry to
-  exploit, so it falls back to an arbitrary but deterministic tie-break: the
-  lower peer ID initiates.
+### 5.2 API, reliable delivery, and admission limits
 
-### 5.5 Peer-to-peer exchange protocol
+- `PUT /v1/user/pq-keys` atomically registers/retires the caller's bundle.
+  The authenticated session determines the sender. Initial registration
+  expects no bundle; updates require the current revision.
+- `PUT /v1/user/pq-handshake/{other_peer_id}` submits a signed phase message.
+  Section 5.5 defines transitions; section 5.14 defines exact bytes. Success
+  means the transition and its receipt are committed to durable storage.
+- `GET /v1/user/state?pq_version=1` returns visible bundles and exchanges in
+  a versioned, paginated response. In this mode paginate both peers and PQ
+  records: at most 1 MiB overall, 32 PQ records, and 128 KiB of PQ content
+  per page. Continuation tokens are bound to requester and visibility
+  revision. Recheck authorization per page; invalidated cursors restart the
+  fetch. Legacy clients do not receive this new shape. Clients drain pages
+  fairly and refresh changed bundles before accepting new exchanges.
 
-Per ordered pair `(initiator, responder)` decided by §5.4 (see §8 for the
-full sequence diagram):
+GET never consumes a message. Duplicate delivery is expected. An identical
+signed retry returns the recorded result; conflicting content for the same
+exchange/sequence or an illegal transition returns 409. Use transactions/
+compare-and-swap to serialize updates, expiry, retirement, and receipts.
+An old acknowledgment must never delete or advance a newer exchange.
 
-1. The initiator fetches the responder's KEM public key and signature
-   public key (already present in its regular peer-list fetch — no extra
-   round trip).
-2. The initiator calls `Encapsulate(responder_kem_public_key)` locally,
-   getting `(ciphertext, ml_kem_shared_secret)`, and separately performs an
-   X448 ECDH against the responder's X448 public key, getting
-   `x448_shared_secret` (§5.7).
-3. The initiator signs `ciphertext || to_peer_id || from_peer_id` with its
-   own P-521 ECDSA private key (§5.8), producing `signature`.
-4. The initiator uploads `{ciphertext, signature}` via
-   `PUT /v1/user/pq-handshake/{responder_id}`. Neither shared secret nor any
-   secret key ever leaves the initiator's machine.
-5. On the responder's next regular state fetch, the pending
-   `{from_peer_id, ciphertext, signature}` for this pair is included in the
-   response. The responder first verifies `signature` against the
-   initiator's cached signature public key — an invalid signature is
-   discarded and logged, and processing stops there for that entry (§5.8),
-   leaving the previously-applied PSK untouched.
-6. On a valid signature, the responder calls
-   `Decapsulate(own_kem_secret_key, ciphertext)`, recovering
-   `ml_kem_shared_secret`, and performs its own X448 ECDH against the
-   initiator's public key, recovering the identical `x448_shared_secret`.
-7. Both sides independently derive the final 32-byte PSK via
-   HKDF-SHA3-256 (§5.7) from the same two shared secrets, and apply it to
-   that specific peer's WireGuard configuration — exactly as any other PSK
-   update already works in this system. The initiator can apply its half
-   immediately after step 2 without waiting for delivery; the responder
-   applies once it completes step 6/7 on its next poll — see §5.6 for why
-   this timing gap is harmless.
+Before accepting a write, check current CIDR visibility, both peers' enabled/
+redeemed status, complete current bundles, sender identity, pair roles,
+size/encoding, and signature. Endpoints verify again before derivation or
+installation. Reject self-addressing and server-link exchanges.
 
-### 5.6 Rotation cadence & confirmation
+Initial configurable server limits are 8 KiB uncompressed request bodies,
+a 5-second body-read deadline, 2 concurrent PQ writes per caller/64 globally,
+token buckets of 8 writes/second with burst 16 per caller and 128/second
+with burst 256 globally, and 64 active exchanges involving one peer/4096
+globally. Enforce byte limits while reading, before JSON/base64 decoding;
+reject unsupported content encodings and duplicate JSON fields. Bound
+verification workers, log output, and database growth as well.
 
-- **Default rotation interval: 5 minutes**, independently configurable via
-  a `--pq-psk-rotation-interval <seconds>` option on both the client and
-  the server — deliberately not silently tied to the general peer-list
-  fetch interval, since an operator may reasonably want a different
-  cadence for the two.
-- **Confirmation reuses WireGuard's own handshake, rather than building a
-  bespoke acknowledgment protocol.** After applying a newly-derived PSK,
-  nothing needs to explicitly verify the two sides agree — if they don't,
-  WireGuard's own `Noise_IKpsk2` handshake (which mixes the PSK in) simply
-  fails to complete for that peer, exactly like an outright key mismatch
-  today. On failure, keep the previous working PSK in place until the next
-  rotation succeeds, rather than clearing it — the same "never leave a link
-  with no PSK at all due to a single failed cycle" principle applied
-  everywhere else PSKs are handled in this system. This is also what makes
-  the initiator/responder application-timing gap in §5.5 harmless: worst
-  case, a WireGuard handshake attempt in that narrow window fails and
-  retries once the responder catches up.
+Quota exhaustion returns 429 with `Retry-After`; infrastructure saturation
+may return 503. Reserve processing capacity for admitted exchanges and
+ordinary state fetches: new proposals cannot starve completion, recovery,
+or retirement. All requests remain rate-limited. These are service budgets,
+not a claim of immunity to arbitrary flooding (section 7).
 
-### 5.7 Hybrid classical+PQ secret combiner
+### 5.3 Key lifecycle, persistence, and upgrades
 
-Relying on a single post-quantum algorithm family means a future
-cryptanalytic break of that one algorithm compromises every derived PSK.
-Standard practice in modern hybrid key-exchange designs is to combine an
-ML-KEM shared secret with an independent classical ECDH shared secret via a
-KDF, so the result stays secure as long as *either* half remains unbroken:
+Introduce `--enable-pq-psk` in M1, before key generation or exchange behavior.
+A never-enabled interface with the flag absent generates no keys, performs
+no PQ writes, and keeps existing WireGuard behavior.
 
-- Generate a dedicated X448 keypair per interface alongside the ML-KEM
-  one (not the WireGuard static key itself — keeping these separate avoids
-  any cross-protocol key-reuse concerns).
-- Perform an ordinary X448 ECDH alongside the ML-KEM encapsulation in the
-  same round described in §5.5.
-- `psk = HKDF-SHA3-256(ikm = ml_kem_shared_secret || x448_shared_secret,
-  info = "innernet pq-psk v1", length = 32)`.
+On first enablement, including an existing interface, generate the required
+bundle once and persist it before registration. Use 0700 directories/0600
+files, atomic writes, file/directory durability, and safe creation rejecting
+symlink substitution. Do not place secrets in logs or command-line arguments.
+Fail on randomness/persistence errors without registering half a bundle.
+Erase intermediate secrets and retired keys after recovery obligations end.
 
-### 5.8 Signed-ciphertext hardening (P-521 / ECDSA)
+On restart load confirmed/pending state before changing WireGuard, and
+reconcile with the server through the independent management link. Persist
+installation intent before touching the kernel and reapply/reconcile it
+after crashes. Kernel configuration is not the only copy of a PSK.
 
-The coordination server relays the ciphertext but cannot read the shared
-secret it encapsulates — it only ever handles opaque bytes. However, since
-the server is also the source of truth for a peer's advertised KEM public
-key, a compromised server could in principle substitute its own keypair
-when asked "what is peer B's public key," letting it decrypt what it
-thinks is peer A's message to B (a relay-level MITM). This is **the same
-trust boundary the coordination server already has** for WireGuard public
-key distribution — a compromised server can already substitute a
-WireGuard public key and MITM the classical handshake today, so this
-doesn't newly expand what a compromised server can do, only extends an
-already-accepted trust assumption to one more field.
+Routine bundle replacement drains active exchanges before publishing a new
+ID/revision atomically. Retain the last working PSK until the replacement
+exchange completes, but do not encapsulate to retired keys. Pin the exact
+bundles used by an outstanding exchange; refresh caches on revision changes.
 
-This design closes that specific gap with a concrete mechanism: each side
-signs its ciphertext (and the ordered peer-pair identifiers, binding the
-signature to exactly that exchange) with a dedicated **P-521 (ECDSA)**
-identity key, distinct from its WireGuard, ML-KEM, and X448 keys (§5.3).
-Signatures use a fixed-width raw `r || s` encoding (each 66 bytes, 132
-bytes total) rather than variable-length DER, so the mailbox endpoint's
-exact-length validation (§5.2) stays simple and deterministic. The
-receiving side verifies the signature against the sender's already-cached
-signature public key before ever decapsulating — an invalid signature
-means either a corrupted delivery or a substituted/forged message, and is
-discarded without touching the existing PSK (§5.5 step 5). P-521 was
-chosen for its large security margin and FIPS 186-5 approval, matching
-this design's general preference for higher-margin primitives given how
-new the overall construction is — accepting a second crypto dependency
-(§2.1) as the cost.
+Lost/corrupt private keys or replay state, revoked keys, and stale restored
+backups require explicit identity recovery: block affected data links,
+retire the bundle and its exchanges, generate a new bundle, and re-enroll
+through the trusted directory. Never reset counters under an old bundle or
+silently regenerate keys and resume its exchanges.
 
-Whether this ships as part of the default, always-on baseline or as an
-additional opt-in hardening flag remains an open question — see §10.
+### 5.4 Pair roles, sequencing, and replay rejection
 
-### 5.9 Mailbox lifecycle & cleanup
+Only client-to-client data peers exchange through the mailbox. Lower peer
+ID initiates; higher ID responds. Both enforce this assignment. Server links
+have no mailbox role and follow section 5.10.
 
-- At most one undelivered ciphertext per ordered pair (§5.1) bounds storage
-  regardless of how many rotation cycles are missed.
-- Delete-on-delivery (§5.2) means a healthy, regularly-polling fleet never
-  accumulates backlog at all.
-- The TTL-based sweep (§5.2) bounds storage from peers that go permanently
-  offline or get removed before ever polling again.
+The initiator allocates a strictly increasing `sequence` for the current
+bundle pair, persists it before sending, and generates a random 16-byte
+`exchange_id`. Allow one outstanding exchange per pair. Counter exhaustion
+requires bundle replacement, not wraparound.
 
-### 5.10 Server as a mesh peer
+After verifying identity/signature/context, the server and endpoints reject
+sequences below their durable high-water marks. The same sequence is accepted
+only for identical retries of that exchange in legal monotonic phases.
+Earlier phases return the recorded outcome, never reinstalling a PSK.
+Completion/abort permanently consumes the sequence for those bundle IDs.
+A higher sequence cannot supersede a nonterminal exchange.
 
-The coordination server is itself a WireGuard peer (its own coordination-API
-link), and participates in this scheme exactly like any other peer: it
-generates its own ML-KEM/X448/P-521 keypairs, advertises its public keys
-via its own peer record, and runs the same periodic sync task client
-interfaces run, applying the resulting PSK to its own device — no
-special-casing beyond the responder role already assigned to it in §5.4.
+TTL is not replay protection. Obsolete generations/sequences remain invalid
+when re-uploaded with fresh HTTP or server timestamps.
 
-### 5.11 Permissive mode & mixed-fleet interop
+### 5.5 Exchange and explicit key confirmation
 
-Not every peer will have this enabled — a phone running a stock WireGuard
-client, for instance, has no PQ public keys to advertise at all. This is
-handled the same way any other opt-in per-peer capability is in this
-system: a peer that enables PQ hardening (`--enable-pq-psk`, say) can
-additionally opt into `--pq-psk-permissive`, which falls back to a plain
-WireGuard connection (no PSK) for any peer that hasn't advertised a KEM
-public key, instead of treating it as unreachable. This is always a
-per-operator, client-side choice — the server isn't in the data path and
-can't force a peer to run this locally, only tell peers about each other.
+Every message is signed, identifies the same transcript, and travels through
+the API. Directional HMAC tags confirm agreement on key material before
+installation (sections 5.7 and 5.14).
 
-### 5.12 Independent per-peer state, by construction
+1. **Propose — initiator.** Fetch and validate both current bundles. Generate
+   a fresh ML-KEM encapsulation, compute X448, and derive the PSK and two
+   confirmation keys. Persist the candidate, transcript, sequence, and signed
+   `propose` message, then upload it. Include the initiator confirmation
+   tag; leave the current WireGuard PSK unchanged.
+2. **Ready — responder.** On any state fetch verify bundle IDs, sequence,
+   signature, and transcript. Decapsulate, derive, and verify the initiator's
+   tag in constant time. Persist the candidate and signed `ready` tag, then
+   upload it. Neither side has changed WireGuard yet.
+3. **Commit — initiator.** Verify the responder's signature and tag. Persist
+   a signed `commit` decision before upload. The server atomically advances
+   `ready` to `committed` and returns a durable receipt. If the response is
+   lost, query/retry this decision; do not assume failure or start another
+   exchange. An already-terminal abort wins over a late commit.
+4. **Install — responder, then initiator.** On observing commitment, the
+   responder persists installation intent, applies section 5.6, and posts
+   `installed`. Only after observing that authenticated receipt does the
+   initiator install and post its own receipt. Retry receipts until durable.
+5. **Confirm tunnel — both.** Observe a fresh authenticated WireGuard
+   handshake under the new peer configuration and post signed `confirmed`
+   receipts. A confirmation implies that side installed the candidate. The
+   server marks complete only after both confirmations. Each endpoint
+   persists the confirmed PSK/terminal outcome and erases superseded
+   recovery secrets once no longer needed.
 
-Because each peer pair's PSK is derived from a standalone, independent
-KEM exchange — not a shared multi-peer process with one combined
-configuration file — pausing, skipping, or backing off the rotation cadence
-for one specific idle peer has **no effect on any other peer's exchange**.
-This falls out of the architecture rather than needing to be specially
-engineered: there is no shared daemon to restart, no combined config file
-to regenerate, and no reason a per-peer idle-detection policy would ever
-need to touch any other peer's state.
+Loss, duplication, and reordering are expected at every step. Process
+pending messages, retry receipts, and reconcile on every fetch independently
+of rotation/idle settings. An old successful handshake or readback of a
+configured PSK is not confirmation of this exchange.
 
-**Idle-detection policy:** rotation for a specific peer pauses after
-**15 minutes** with no observed WireGuard traffic for that peer (checked via
-transfer byte-count deltas across polls, the same signal already available
-from the WireGuard interface's own transfer statistics), independently
-configurable via a `--pq-psk-idle-timeout <seconds>` option. Resumption is
-eager: the very next poll that observes fresh traffic for that peer
-immediately resumes normal rotation for that pair specifically, rather than
-waiting for a fixed re-check interval or affecting any other peer.
+### 5.6 Activation, cadence, and failure recovery
 
-### 5.13 Build targets & platform support
+Default `--pq-psk-rotation-interval` is **300 seconds** on data clients.
+Require a positive value and reject duration overflow. Schedule the next
+rotation from completion using monotonic time. A short interval never
+supersedes pending work: this is a target cadence, not an installation SLA.
 
-This feature targets **Linux only**, on the same two architectures this
-project already ships prebuilt binaries for: **x86_64 (amd64)** and
-**aarch64**. No macOS, OpenBSD, or Windows support is planned for this
-feature even though other parts of this project run there — the chosen
-cryptographic libraries' own primary platform support and this project's
-existing release tooling already center on Linux, and extending either to
-another OS is out of scope here.
+Before commitment the previous working PSK remains installed. The initiator
+can abort proposed/ready work; prepare expiry can also abort it. Persist the
+terminal outcome before discarding candidates. Responder validation failure
+leaves the kernel unchanged; without valid `ready`, commitment cannot occur.
+
+After commitment, recover forward to the persisted candidate. Do not
+independently restore an old PSK or clear the key because of timeout, missing
+traffic, or temporary API failure. Committed work does not expire. Retry
+kernel/configuration failures over the management link; irrecoverable state
+loss follows section 5.3 and blocks the data link.
+
+Version 1 accepts interruption for unambiguous activation. Gate application
+traffic for the affected peer, remove only that WireGuard peer to discard
+old sessions/in-flight handshakes, and recreate it with the candidate and
+its full authorized configuration, including endpoints, allowed IPs, and
+keepalive settings. Reconcile this sequence after crashes; never reset the
+whole interface or unrelated peers. Fresh WireGuard keepalives can drive
+confirmation while application traffic stays gated. Release the gate after
+a fresh handshake and durable local confirmation; server completion also
+requires the remote receipt.
+
+The persistent fail-closed Linux gate must cover local and forwarded
+traffic, IPv4/IPv6, and less-specific route fallback while a peer is absent.
+Install it before strict enablement/recreation and restore it before bringing
+an interface up after boot. Existing sessions/configuration cannot bypass
+it. Handshake/keepalive probes are transport traffic, not an application
+exception. M4 must implement and validate this gate, not merely set a PSK.
+
+Do not report protection merely because public keys are advertised. Never
+use a public-key-derived interim PSK. Preserve an operator's independent
+secret PSK as the input in section 5.7, rather than replacing it with zero
+or a public placeholder.
+
+### 5.7 Hybrid combiner and operator PSKs
+
+Let `T` be section 5.14's transcript and `H = SHA3-256`. `operator_psk` is a
+provisioned 32-byte per-pair secret, or 32 zero bytes if neither side has one.
+A nonzero public 16-byte `operator_psk_id` identifies an agreed provisioned
+key; all-zero means absent. It is not a hash of the secret. Mismatched IDs
+or confirmation tags fail before installation.
+
+```text
+IKM = ml_kem_shared_secret[32] || x448_shared_secret[56] || operator_psk[32]
+PRK = HKDF-Extract-SHA3-256(salt = H(T), IKM = IKM)
+psk = HKDF-Expand-SHA3-256(PRK, ASCII("innernet pq-psk v1 psk") || H(T), 32)
+kc_i = HKDF-Expand-SHA3-256(PRK, ASCII("innernet pq-psk v1 confirm i") || H(T), 32)
+kc_r = HKDF-Expand-SHA3-256(PRK, ASCII("innernet pq-psk v1 confirm r") || H(T), 32)
+```
+
+Use [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html) extract-then-expand
+with HMAC-SHA3-256. Labels are exact ASCII without a terminating NUL. Do not
+substitute a concatenation hash or use the PSK itself as a confirmation key.
+M0 fixes interoperable vectors; M9 reviews the construction. Its intended
+hedge depends on at least one input remaining secret. X448 is not an
+independent post-quantum algorithm family.
+
+Existing manually managed PSKs require explicit adoption into this feature's
+protected state at both ends. Refuse ownership without that agreement. Never
+mistake a previous feature-derived PSK for a new operator PSK. Disabling
+requires section 5.11's coordinated policy transition.
+
+### 5.8 Authentication and the trusted directory
+
+ECDSA P-521/SHA-512 signatures are mandatory on proposals and all replies,
+including commit, abort, installation, and confirmation. Bind network,
+identities, and both complete bundles into the transcript. Validate current
+revisions for a new exchange; retain exact bundles for its retries.
+
+The directory authenticates registration through the existing peer session
+and mediates replacement/retirement. Cached verification keys are not an
+independent trust anchor. A compromised directory can replace signing, KEM,
+X448, and WireGuard keys, suppress capabilities, or split views. It can still
+impersonate peers despite signatures. Signing a ciphertext alone does not
+authenticate the recipient's advertised KEM key.
+
+Version 1 makes no server-compromise resistance claim. Independent pinning/
+certification would require trusted enrollment, authenticated complete
+bundles, and replacement/revocation rules, not just another signature field.
+
+### 5.9 Expiry, cleanup, and bounded recovery state
+
+Prepare TTL is **600 seconds** from first server acceptance and is not
+extended by retries. Reads/writes atomically abort expired proposed/ready
+work before returning or advancing it; a periodic sweep also compacts it.
+No entry remains usable merely because the sweep has not run.
+
+Commit acceptance and expiry serialize on the same record. After commitment,
+TTL cannot delete recovery messages. Compact large bodies after completion
+or abort, retaining the sequence/outcome tombstone until bundle retirement.
+A lost terminal response resolves from that tombstone; obsolete bundle
+messages remain invalid even after their rows are removed.
+
+Recheck authorization on delivery. Visibility revocation, disabling a peer,
+or emergency retirement blocks affected data links and terminates their
+exchanges transactionally. No stale delivery can restore removed peers or
+routes. Backups include directory identity/revisions and exchange state
+together; a stale server restore requires reconciliation or explicit identity
+recovery rather than reusing consumed sequences.
+
+TTL limits uncommitted lifetime, not total storage. Admission quotas bound
+active work, including committed records. Bound peer/history growth through
+network admission/database budgets; never evict freshness state to make room.
+Reserve disk capacity for admitted completion and expose stuck committed
+exchanges to operators.
+
+### 5.10 Management-link provisioning, rotation, and recovery
+
+For new PQ enrollment, provision a fresh random 32-byte PSK per client-server
+link. Deliver it with the pinned server WireGuard identity in the invitation
+through an authenticated, confidential out-of-band channel appropriate to
+the passive-quantum threat model. Do not first fetch it across a classically
+protected WireGuard session whose historical encryption is the problem.
+
+Persist it at both endpoints before enabling the link. Invitation redemption
+carries the same PSK across the temporary-to-final-client WireGuard identity
+transition, with durable server state. Remove consumed invitation secrets
+when recovery obligations permit. Each client has a distinct PSK. The server
+knows its own links' PSKs, not client-to-client exchange PSKs.
+
+In PQ mode the link is management-only: allow the coordination API and
+explicit bootstrap necessities, and deny general application/transit traffic
+to or through the server. Keep it unaffected by data-peer rotations. Restore
+all enrolled management PSKs before exposing the API after server reboot.
+Provisioning must exist before strict PQ is advertised or M4 applies data PSKs.
+
+Existing-network migration and subsequent management-PSK rotation require
+administrator access independent of the affected tunnel (for example, console
+or a separate management network). Preserve an existing trusted random PSK
+when appropriate; enabling PQ does not automatically overwrite it. Rotation:
+
+1. Generate a new per-link random secret and stage it durably at both ends
+   over the independent access path, retaining the previous secret securely.
+2. Arrange a maintenance window. Gate the link, persist installation intent,
+   and replace only the affected peer configuration on both sides to remove
+   old sessions. Apply the same new PSK and retain the management-only policy.
+3. Verify a fresh WireGuard handshake and an authenticated API request. Mark
+   the new PSK active durably on both ends before removing the previous one.
+4. On failure use independent access to reconcile both ends, either applying
+   the new secret to both or restoring the old secret to both. Never fall
+   back to zero/public PSKs or expect the broken API tunnel to repair itself.
+
+This is administrative rotation with a planned interruption, not automatic
+mailbox rotation. Automating it requires an independent recovery channel
+and a separately specified protocol; a separately keyed management tunnel
+is one possible future design. Missing management secrets require out-of-band
+repair. Server application links would need an independently recoverable
+data interface/identity and are outside version 1. Static management PSKs
+supply no PSK-layer forward secrecy even when periodically replaced.
+
+### 5.11 Strict mode, permissive mode, and disabling
+
+Strict `--enable-pq-psk` blocks data application traffic until a compatible
+complete bundle, explicit key confirmation, and fresh PSK-protected handshake
+succeed. The management-only link has its separately provisioned secret and
+needs no mailbox enrollment.
+
+`--pq-psk-permissive` requires enablement. It permits legacy WireGuard only
+for peers with no PQ bundle that have never established PQ with this local
+interface. Preserve any operator PSK. Partial/invalid bundles, failed
+signatures, timeout, retirement, or disappearing capabilities after prior
+success never trigger automatic fallback. Persist prior-PQ status and show
+legacy/PQ/recovering/blocked states separately. A compromised trusted server
+can still lie on first contact; section 5.8 defines that limitation.
+
+Disabling a previously enabled interface is an explicit administrative
+transition, not omitting a flag at restart; reject ambiguous startup options.
+Drain active work or explicitly retire it while blocking traffic, publish
+retirement atomically, stop new exchanges, and retain recovery/replay state
+until retirement is durable. Remote strict peers remain blocked. Transition
+to legacy requires local authorization at each endpoint and coordinated
+restoration of the same operator PSK (zero only when both authorize no PSK).
+Discard obsolete sessions before releasing traffic. Local opt-out cannot
+force a remote downgrade or remove its gate.
+
+### 5.12 Per-peer scheduling and tunnel inactivity
+
+Default `--pq-psk-idle-timeout` is **900 seconds**; zero disables pausing.
+It measures tunnel inactivity, not application inactivity: WireGuard byte
+counters include handshake/keepalive traffic. A persistent-keepalive link
+may never pause even without application traffic. The management link also
+carries API traffic and is not a mailbox-rotation target.
+
+Sample per-peer deltas on every state-fetch cycle. Counter reset, interface
+recreation, or first observation establishes a new baseline and counts as
+activity. Use monotonic elapsed time, never unsigned subtraction across a
+reset. Pause only new rotations after the threshold. On the first activity
+poll start an overdue rotation promptly, subject to admission limits;
+do not wait an additional rotation interval.
+
+Initial establishment, deliveries, reconciliation, and recovery never pause
+for lack of traffic. Otherwise a broken/new link could need traffic to obtain
+the key required for that traffic. Retry with bounded jittered backoff
+(1–60 seconds, respecting `Retry-After`), checked by the existing sync
+scheduler. Process due pairs fairly using per-pair state and bounded shared
+workers. Idle peers must not restart a daemon or block others, but shared
+CPU, database, and API budgets remain constraints.
+
+### 5.13 Build targets and deployment support
+
+Version 1 targets Linux x86_64/aarch64. M8 builds and executes cryptographic,
+persistence, and WireGuard checks on both with declared system-library
+versions. Dynamic linking requires target runtime packages, not only a
+successful cross-link. Existing non-Linux builds retain legacy behavior and
+reject unsupported PQ options explicitly. Linux-only scope is a project
+choice, not a claim that the libraries cannot support other systems.
+
+### 5.14 Canonical encoding and input validation
+
+JSON binary fields use canonical RFC 4648 standard padded base64 without
+whitespace. Reject alternate encodings, duplicate/unknown fields, missing
+fields, unknown message types/versions, and trailing data. IDs, sequences,
+and revisions use canonical unsigned decimal strings, not JSON numbers:
+no leading zeros, nonzero, at most `2^63 - 1`. Encode these as unsigned
+64-bit big-endian integers for signatures. Opaque IDs are 16-byte fields.
+
+Define exact fixed-width bundle and transcript bytes:
+
+```text
+B = bundle_id[16] || bundle_revision[u64be] || wg_public_key[32]
+    || pq_kem_public_key[1568] || pq_x448_public_key[56] || pq_sig_public_key[67]
+T = ASCII("innernet pq-psk v1 transcript") || version[u8 = 1]
+    || network_id[16] || initiator_id[u64be] || responder_id[u64be]
+    || B_initiator || B_responder || sequence[u64be] || exchange_id[16]
+    || operator_psk_id[16] || ciphertext[1568]
+E = ASCII("innernet pq-psk v1 message") || version[u8 = 1]
+    || network_id[16] || initiator_id[u64be] || responder_id[u64be]
+    || initiator_bundle_id[16] || responder_bundle_id[16]
+    || sequence[u64be] || exchange_id[16] || SHA3-256(T)[32]
+    || sender_id[u64be] || message_type[u8]
+tag = HMAC-SHA3-256(kc_sender, E)[32]
+signature = ECDSA-P521-SHA512(E || tag)[132]
+```
+
+Bundles are the fixed-width B bytes, not JSON/base64 text. Literal labels
+have no trailing NUL/newline. Message codes are `propose=1`, `ready=2`,
+`commit=3`, `installed=4`, `confirmed=5`, and `abort=6`. Only the initiator
+sends propose/commit/abort, only the responder sends ready, and each sends
+its own installed/confirmed receipts. `kc_sender` is `kc_i` or `kc_r` by role.
+
+A JSON message carries the named E fields (`transcript_hash` for H(T)),
+`tag`, and `signature`; `version` and `message_type` are JSON integer codes.
+Only propose additionally carries `ciphertext` and
+`operator_psk_id`; replies reference its persisted transcript. The receiver
+reconstructs T from the proposal and exact directory bundles and checks its
+hash before processing. No additional phase data is permitted. Abort is
+accepted only before commitment. Transport receipts/timestamps are server
+metadata, not signed peer-message fields.
+
+Hash `E || tag` exactly once with SHA-512 through the configured ECDSA API.
+Use [RFC 6979](https://www.rfc-editor.org/rfc/rfc6979.html) deterministic
+nonces with SHA-512 and fixed-width unsigned big-endian r/s (66 bytes each),
+not DER. Enforce `1 <= r,s < n`, normalize to low-S (`s <= n/2`), and reject
+high-S input. Persist signed bytes for identical retries. Validate compressed
+P-521 points for curve membership and reject the identity point. M0 verifies
+these library behaviors instead of relying on defaults.
+
+Check ML-KEM public-key length and FIPS 203 modulus constraints before
+encapsulation; check ciphertext length before decapsulation. A correctly
+sized ciphertext for another key can return an implicit-rejection secret.
+Do not expose its internal reject flag or treat a returned secret as success:
+verify the confirmation tag. Check X448 input length, follow RFC 7748 decoding,
+and reject an all-zero shared result in constant time. Any primitive,
+encoding, or validation failure must not apply the candidate. Rate-limit
+generic errors without exposing secret-dependent details.
+
+M0 publishes fixed vectors for B/T/E, all message types, signatures, hybrid
+derivation, and malformed inputs, including leading-zero signature integers
+and independent-implementation agreement.
 
 ## 6. Security considerations
 
-- **No new exposed listener.** Every exchange happens over the same
-  request/response channel already used for peer discovery, authenticated
-  the same way (existing peer-key-based auth on the coordination API). There
-  is no new UDP (or any other) port for an operator to open, firewall, or
-  rate-limit, and therefore no new standalone flood/amplification/DoS
-  surface distinct from what the coordination API already has to defend
-  against.
-- **Forward secrecy is a function of rotation cadence.** Each rotation
-  produces an independent secret from a fresh encapsulation; compromising
-  one derived PSK doesn't expose any other rotation's value (ML-KEM
-  ciphertexts don't reveal the secret key, and each encapsulation is
-  independently randomized).
-- **Replay.** A captured, replayed ciphertext just re-derives the exact same
-  secret the original exchange already produced — not a new one — so replay
-  by itself doesn't help an attacker who doesn't already have the
-  corresponding secret key. The mailbox's delete-on-delivery semantics
-  additionally mean a legitimate replay opportunity (re-delivering the same
-  ciphertext twice) shouldn't normally arise at all.
-- **Forgery/substitution** of a relayed message is addressed directly by the
-  §5.8 P-521/ECDSA signature — a responder never processes a ciphertext it
-  can't verify came from the claimed sender.
-- **Server-compromise blast radius** is bounded to what §5.8 already
-  describes: without the signed-ciphertext hardening enabled, a compromised
-  server can MITM the relay, matching its existing ability to MITM
-  WireGuard peer identity distribution — not a new category of exposure
-  introduced by this design. With it enabled, that specific MITM path is
-  closed, since the server cannot forge a valid P-521 signature on either
-  peer's behalf.
-- **Input validation on the mailbox endpoint** must reject anything that
-  isn't exactly a well-formed ML-KEM-1024-ciphertext-and-P-521-signature-sized
-  payload outright, the same discipline already applied to the existing
-  candidate-endpoint validation, so a malformed upload can't be used to
-  probe for parser bugs or store oversized garbage.
+- **Passive quantum threat:** protection begins with the provisioned
+  management PSK or a confirmed data PSK. Legacy permissive links without
+  secret PSKs have no such protection; public placeholders add no secrecy.
+- **Static-key compromise:** given recorded exchanges and a responder's
+  static ML-KEM/X448 private keys, past derived PSKs can be reconstructed
+  unless an independent operator PSK remains secret. Isolated derived-PSK
+  compromise need not expose other encapsulations, but this is not forward
+  secrecy after long-term-key compromise. This layer claims neither PQ
+  forward secrecy nor post-compromise recovery.
+- **Identity trust:** signatures stop forgery by ordinary peers under the
+  trusted-directory model. They do not defeat directory key substitution,
+  split views/suppression, or active quantum attacks on classical identities.
+- **Replay/crashes:** authenticated context, durable high-water marks,
+  monotonic phases, and generation retirement prevent obsolete installation.
+  State loss that breaks these guarantees blocks links pending recovery.
+- **Availability:** preparation preserves the current PSK; commitment can
+  interrupt the pair and requires forward recovery. Progress needs reachable
+  endpoints/relay. Independent management PSKs keep a data mismatch from
+  itself disabling recovery, not from all possible network failures.
+- **New workload:** an existing listener still gains parsing, crypto, storage,
+  and contention. Enforce admission budgets before expensive operations and
+  reserve resources for ordinary coordination.
+- **Secret handling:** backups now include PSKs and protocol state. Protect
+  permissions and lifetime. Secret comparisons are confined to isolated test
+  builds, never production status, logs, telemetry, or CI artifacts.
 
-## 7. Test plan: Docker-based security testing
-
-Mirrors this project's existing convention of testing against real,
-end-to-end processes in Docker containers rather than relying solely on
-unit tests with fakes — prior integration work on this project caught
-multiple real bugs (permission handling, timing, config-generation edge
-cases) this way that pure unit testing missed, and there is no reason to
-expect a from-scratch PQ implementation to be any less bug-prone.
+## 7. Test plan and release evidence
 
 ### 7.1 Topology
 
-- One coordination-server container.
-- At least four peer containers on the same isolated Docker network, no
-  external egress required:
-  - `peer-a`, `peer-b` — two normal, cooperating peers, used for the
-    happy-path, rotation, and idle-detection tests.
-  - `peer-m` — an adversarial peer with valid credentials for its own
-    identity but no authorization to see `peer-b` (different CIDR), used
-    for cross-tenant isolation tests.
-  - `peer-x` — a peer used only for flood/DoS testing against the mailbox
-    endpoint, kept separate so its behavior can't contaminate the other
-    peers' results.
+Use one server container and at least four peers: cooperating `peer-a`/
+`peer-b`, cross-CIDR adversary `peer-m`, and authorized flood source `peer-x`.
+Use an isolated network, HTTP fault injection inside management paths,
+controllable clocks, and persistent volumes for crash/snapshot tests.
+Legacy binaries and additional simulated identities exercise compatibility
+and admission limits.
 
-### 7.2 Test cases
+### 7.2 Required cases
 
-1. **Baseline convergence.** `peer-a` and `peer-b` complete one exchange;
-   assert both sides' independently-derived PSK bytes are identical
-   (compared via a debug-only dump the test harness reads, never exposed in
-   production).
-2. **PSK actually reaches WireGuard.** Assert the applied preshared-key
-   value on both containers reflects the newly-derived value, not the
-   interim/previous one.
-3. **Rotation over time.** Run past two rotation intervals (using a
-   shortened rotation-interval setting for test speed); assert the applied
-   PSK value changes between rotations.
-4. **Cross-CIDR mailbox isolation.** `peer-m` attempts
-   `PUT /v1/user/pq-handshake/{peer-b-id}`; assert the server rejects it
-   (matching the existing CIDR-authorization behavior for peer-list
-   visibility) and `peer-b` never sees a mailbox entry from `peer-m`.
-5. **Malformed payload rejection.** `peer-m` uploads a payload of the wrong
-   length/shape; assert 4xx, and assert the server process is still alive
-   and responsive afterward (no panic).
-6. **Invalid signature rejection.** Tamper with a captured, legitimately
-   ML-KEM-1024-sized ciphertext's signature before delivery; assert the
-   responder logs a verification failure and does **not** apply the
-   resulting PSK, leaving the previous one in place.
-7. **Replay is harmless.** Re-deliver an already-consumed (mailbox row
-   already deleted) ciphertext by re-uploading the same bytes; assert this
-   never produces a *different* PSK than the original exchange already did.
-8. **TTL sweep.** Upload a ciphertext addressed to a peer container that's
-   paused (simulating an offline peer) past the TTL; assert the mailbox row
-   is gone afterward and never gets delivered once the peer resumes
-   polling.
-9. **Idle-detection pause/resume.** Stop generating WireGuard traffic
-   between `peer-a` and `peer-b` past the idle threshold (shortened via the
-   idle-timeout setting for test speed); assert rotation pauses for that
-   pair specifically, and assert `peer-a`'s *other* peer relationships keep
-   rotating normally on schedule (directly exercises the §5.12 independence
-   claim). Resume traffic; assert rotation resumes without manual
-   intervention.
-10. **Mailbox flood resilience.** `peer-x` floods
-    `PUT /v1/user/pq-handshake/*` at a high rate; assert `peer-a`/`peer-b`'s
-    own exchanges are unaffected (server stays responsive, no shared
-    resource exhaustion) and the server process doesn't crash.
-11. **Permissive/mixed-fleet fallback.** A peer with no registered PQ public
-    keys at all; assert an enabled peer with permissive mode falls back to
-    a plain WireGuard connection, and without that mode treats it as
-    unreachable.
+1. **Crypto interoperability:** independent encapsulate/decapsulate endpoints
+   agree for one exchange; separate randomized exchanges differ. Check all
+   section 5.14 vectors and directional confirmation tags.
+2. **Strict activation:** no application traffic before a fresh candidate-key
+   handshake, including old sessions, forwarding, IPv6, route fallback,
+   and crashes during gate installation.
+3. **Rotation:** complete repeated rotations, verify kernel PSKs and fresh
+   handshakes, measure interruption, and keep unrelated peers connected.
+4. **Lost/duplicate delivery:** drop every PUT response/state page in turn,
+   duplicate/reorder phases, and verify eventual convergence without losing
+   proposals, reinstalling old PSKs, or clearing working keys.
+5. **Crash matrix:** restart either endpoint/server after each durable write,
+   kernel change, and acknowledgment. Include kernel-only state loss,
+   offline responders, and API outages beyond WireGuard session expiry.
+6. **Commit/abort race:** exercise expiry, ready, commit, and abort in each
+   relevant order. Only one decision wins; committed work never expires or
+   independently rolls back.
+7. **Replay rollback:** complete K0 then K1; replay every signed K0 phase
+   and assert K1 remains installed. Repeat after restart, compaction,
+   retirement, and stale-backup restoration.
+8. **Validation:** reject malformed/partial bundles, encodings, invalid
+   P-521 points/signatures, all-zero X448, invalid ML-KEM public keys,
+   wrong-size and valid-size/wrong-generation ciphertexts. Use authorized
+   senders so ACL rejection does not mask parsing/crypto checks.
+9. **Context substitution:** alter network, IDs, bundles/revisions, sequence,
+   type, ciphertext, or tag. Ordinary attacker/old signatures cannot
+   authorize changed content. Reject unexpected senders and phase order.
+10. **Directory trust boundary:** demonstrate malicious-directory key
+    substitution during fresh enrollment as an expected limitation;
+    distinguish it from ordinary-peer forgery, which must fail.
+11. **CIDR/revocation:** reject unauthorized writes, spoofing, self/server
+    targets, cross-page leaks, and delivery after removal/revocation;
+    never recreate revoked peers or routes.
+12. **Expiry/quotas:** reject expired preparation before a sweep; retries
+    do not extend TTL. Committed recovery survives TTL and stale receipts
+    cannot delete newer work. Exhaust quotas without evicting tombstones
+    or starving admitted completion.
+13. **Inactivity:** disable keepalives and stop traffic to test pause/resume
+    on the next activity poll; a keepalive-only pair must not pause.
+    Initial/pending/recovery work runs without traffic; counter resets
+    and idle peers do not stall active peers.
+14. **Flood/load:** record a 2-vCPU/2-GiB budget with 100 admitted identities;
+    sustain 1000 PQ write attempts/second for 60 seconds. Assert bounded
+    body/concurrency/record counts, rate limiting, RSS below 1 GiB, and
+    ordinary state-fetch p99 below 2 seconds. With 1-second test polls,
+    two previously admitted honest exchanges complete within 30 seconds.
+    Report actual load/results; this is not arbitrary-flood immunity.
+15. **Lifecycle/policy:** enable existing interfaces, interrupt registration,
+    replace/lose keys, retire while committed, and disable/re-enable. Cover
+    absent/partial/retired bundles, prior-PQ state, operator-PSK mismatch/
+    preservation, and explicit bilateral downgrade.
+16. **Management secrets:** test invitations/redemption, existing-network
+    migration, reboot, and successful/failed administrative rotation using
+    independent access. Data mismatch leaves API reachable; missing secrets
+    block startup and general application/transit traffic is denied.
+17. **Real compatibility:** execute old/new client/server and database
+    upgrade/rollback/re-upgrade cases in section 10 with recorded versions;
+    deserialization tests alone do not establish compatibility.
+18. **Platforms:** run crypto, durability, gate, and WireGuard checks on
+    Linux x86_64/aarch64 with system libraries; preserve non-Linux legacy
+    builds with PQ disabled.
 
 ### 7.3 Acceptance
 
-All eleven cases automated and passing in CI, specifically including the
-security-negative cases (4–8, 10) — a green suite that only covers the
-happy path is not sufficient to close out the security-review milestone.
+Every numbered case needs recorded results. Establish crypto vectors and
+state-machine/crash checks before production PSK application; M9 completes
+adversarial/load review before release. Secret dumps use owner-only test
+storage excluded from logs/artifact uploads. This document does not claim
+these tests or an external security audit have already run.
 
-## 8. Sequence diagram: full exchange, data flow, and API endpoints
+## 8. Exchange sequence and payload accounting
 
 ```mermaid
 sequenceDiagram
-    participant A as Peer A (initiator)
-    participant S as Coordination server
-    participant B as Peer B (responder)
-
-    Note over A,B: Both already hold each other's WireGuard public keys<br/>and pq_kem_public_key/pq_sig_public_key via the normal peer-list fetch.
-
-    A->>S: GET /v1/user/state
-    S-->>A: peer list incl. B.pq_kem_public_key, B.pq_sig_public_key
-
-    Note over A: Encapsulate(B.pq_kem_public_key) to ciphertext, ml_kem_ss<br/>X448(A.priv, B.x448_pub) to x448_ss<br/>sign_p521(A.sig_priv, ciphertext, to=B, from=A) to signature<br/>psk_a = HKDF-SHA3-256(ml_kem_ss, x448_ss)
-
-    A->>S: PUT /v1/user/pq-handshake/{B.id} with ciphertext, signature
-    S->>S: validate exact size/shape
-    S->>S: check A authorized to reach B via CIDR
-    S->>S: store pq_handshake_mailbox to=B from=A
-    S-->>A: 204 No Content
-
-    Note over A: apply psk_a to local WireGuard peer entry for B immediately<br/>(doesn't need to wait for B's delivery)
-
-    B->>S: GET /v1/user/state (regular poll cycle)
-    S-->>B: peer list plus pending entry from=A, ciphertext, signature
-    S->>S: delete mailbox to=B from=A - at-most-once delivery
-
-    alt signature invalid
-        Note over B: verify_p521(A.pq_sig_public_key, signature) fails<br/>so log and discard, keep previous PSK, stop here
-    else signature valid
-        Note over B: Decapsulate(B.priv, ciphertext) to ml_kem_ss<br/>X448(B.priv, A.x448_pub) to x448_ss<br/>psk_b = HKDF-SHA3-256(ml_kem_ss, x448_ss)<br/>psk_b equals psk_a
-        B->>B: apply psk_b to local WireGuard peer entry for A
-    end
-
-    Note over A,B: Next real WireGuard handshake between A and B<br/>implicitly confirms psk_a equals psk_b since Noise_IKpsk2 mixes it in -<br/>a mismatch just fails the handshake, no bespoke ack needed.
+    participant A as Data peer A (initiator)
+    participant S as Coordination API (independent management PSKs)
+    participant B as Data peer B (responder)
+    A->>S: GET state with pq_version=1
+    S-->>A: Complete KEM, X448, signing and WireGuard bundles
+    Note over A: Persist candidate, sequence and signed proposal; keep current PSK
+    A->>S: PUT pq-handshake/B (propose, ciphertext, tag, signature)
+    S-->>A: Durable proposed receipt
+    B->>S: GET state (every poll, non-consuming)
+    S-->>B: Proposed exchange
+    Note over B: Verify, derive, confirm tag and persist candidate
+    B->>S: PUT pq-handshake/A (ready, tag, signature)
+    A->>S: GET state
+    S-->>A: Signed ready
+    Note over A: Verify responder tag; persist commit intent
+    A->>S: PUT pq-handshake/B (commit, tag, signature)
+    S-->>A: Durable committed receipt
+    B->>S: GET state
+    S-->>B: Committed decision
+    Note over B: Gate data; recreate only A's peer with candidate
+    B->>S: PUT pq-handshake/A (installed, tag, signature)
+    A->>S: GET state
+    S-->>A: Responder installed receipt
+    Note over A: Gate data; recreate only B's peer with candidate
+    A->>S: PUT pq-handshake/B (installed, tag, signature)
+    A->>B: Fresh WireGuard handshake and key confirmation
+    Note over A,B: Persist local confirmation before releasing application gates
+    A->>S: PUT pq-handshake/B (confirmed, tag, signature)
+    B->>S: PUT pq-handshake/A (confirmed, tag, signature)
+    S->>S: Complete; retain sequence/outcome tombstone
+    Note over A,B: Reconcile completion on subsequent polls; retries are idempotent
 ```
 
-Data exchanged at each hop, for reference:
+| Material | Raw bytes | Padded base64 bytes |
+| --- | ---: | ---: |
+| ML-KEM public key or ciphertext | 1568 | 2092 |
+| X448 public key | 56 | 76 |
+| Compressed P-521 public key | 67 | 92 |
+| Three PQ keys (encoded separately) | 1691 | 2260 |
+| P-521 signature | 132 | 176 |
+| Confirmation tag | 32 | 44 |
+| Ciphertext + signature + tag (encoded separately) | 1732 | 2312 |
 
-| Step | Endpoint | Payload | Approx. size |
-|---|---|---|---|
-| A fetches B's keys | `GET /v1/user/state` | existing peer list + `pq_kem_public_key` (1568 B, ML-KEM-1024), `pq_sig_public_key` (~67 B, P-521 compressed) per peer | existing response + ~1.6 KB/peer |
-| A uploads ciphertext | `PUT /v1/user/pq-handshake/{B.id}` | `ciphertext` (1568 B, ML-KEM-1024) + `signature` (132 B, P-521 raw r‖s) | ~1.7 KB |
-| B fetches pending entry | `GET /v1/user/state` | existing response + one `{from_peer_id, ciphertext, signature}` object, only when a delivery is pending | +~1.7 KB, intermittent |
+Proposals add IDs, transcript hash, operator PSK ID, and JSON overhead to the
+2312 bytes above. Replies omit ciphertext. Each message/registration must
+fit the 8 KiB cap; M0 measures exact fixtures. GET follows section 5.2 page
+caps. These are not UDP/MTU bounds: HTTP handles segmentation.
 
 ## 9. Alternatives considered
 
-- **A dedicated always-on companion process with its own listening port**,
-  running an independent PQ key-exchange protocol over the network directly
-  between peers. Rejected as the default approach here specifically because
-  it reintroduces exactly the operational costs this design avoids: a new
-  exposed port per listening peer to firewall/rate-limit, a new standalone
-  DoS surface, and — because such a daemon typically holds one combined
-  config file for all of its peers rather than independent per-pair state —
-  a change to any single peer's configuration typically forces a full
-  process restart affecting every other peer's session simultaneously.
-- **A large-public-key, code-based KEM** (multi-hundred-kilobyte to
-  megabyte-scale public keys) as an additional hedge alongside a
-  lattice-based KEM. Rejected for the default design: a key that large
-  can't reasonably travel as an ordinary API field the way ML-KEM's ~1.6 KB
-  key can, which is precisely the property this design depends on to avoid
-  a separate distribution mechanism. The classical+ML-KEM hybrid in §5.7
-  provides an algorithm-family hedge without that size cost.
-- **A fully local, hash-ratcheted PSK schedule** (seed once via a trusted
-  out-of-band channel, e.g. in person or via QR code, then have both sides
-  independently derive every subsequent rotation via a one-way KDF, never
-  transmitting new key material over the network again). Genuinely
-  post-quantum secure in principle — a hash-based ratchet doesn't rely on
-  a KEM at all — but rejected as the default: it has no way to
-  automatically provision a newly-invited peer (there's no network-based
-  bootstrap step at all, by design), and any missed rotation on either side
-  permanently desynchronizes the two chains with no recovery mechanism
-  short of re-seeding out-of-band again. Not a fit for a system built
-  around automatic, network-driven peer provisioning.
-- **A smaller-margin classical/PQ parameter selection** (a lower ML-KEM
-  category paired with a smaller classical curve for the hybrid combiner
-  and signing). Rejected in favor of pairing the highest ML-KEM category
-  with higher-margin classical primitives throughout, at a modest
-  additional size cost that's still well within what an ordinary API
-  field/mailbox row can hold.
-- **Keeping signing inside the single cryptographic library** used for the
-  KEM and hybrid ECDH, rather than adding a second dependency. Rejected:
-  P-521's FIPS 186-5 approval (relevant to deployments with compliance
-  requirements) was judged worth the cost of a second crypto dependency
-  (§2.1/§10).
+- A dedicated PQ listener/daemon could use a separately reviewed protocol
+  and recovery path, with additional deployment/network-service work.
+  Configuration restart requirements are implementation-specific, not an
+  inherent property of a shared daemon.
+- Large-public-key code-based KEMs need different distribution/bandwidth
+  budgets and could add independent PQ-family diversity. X448 cannot supply
+  that diversity against quantum attackers if ML-KEM fails. Large keys do
+  not inherently require a separate listener.
+- An out-of-band seeded hash ratchet can give PQ protection and, with
+  erasure, protect earlier states. Missed steps can be recovered by advancing
+  to an authenticated index with bounded catch-up; permanent desynchronization
+  is not inherent. Full-mesh provisioning, rollback safety, and lack of
+  automatic recovery after current-state compromise remain costs. This
+  version uses out-of-band management/operator secrets, not a full mesh ratchet.
+- Ephemeral KEM/DH keys or a reviewed ratcheting protocol could add forward
+  secrecy, with additional generation, erasure, and offline-peer rules.
+  Version 1 explicitly does not claim that property.
+- Rotating the management PSK through its own tunnel requires an independent
+  rescue path or separately justified recovery protocol. Version 1 chooses
+  administrative rotation through independent access.
+- Smaller parameter sets/single-library alternatives may reduce build/audit
+  costs. Algorithm/encoding changes require a versioned design update and
+  new vectors, never a silent runtime fallback.
 
-## 10. Open questions / risks
+## 10. Validation risks and migration rules
 
-- Whether the §5.6/§5.12 chosen defaults (5-minute rotation, 15-minute idle
-  threshold) hold up under real fleet testing, or need tuning — the
-  *values* are now decided and independently configurable, but not yet
-  validated against a real deployment's traffic patterns.
-- Whether the §5.8 P-521 signed-ciphertext hardening ships as part of the
-  default, always-on baseline, or as an additional opt-in flag — the
-  *mechanism and algorithm* are now decided, but its default-on/opt-in
-  status is not.
-- The chosen KEM/hybrid-ECDH library's integration maturity is not yet
-  established — track this as a risk through the earliest implementation
-  milestone, including whether to pin an exact version or vendor a fixed
-  copy rather than tracking an upstream moving target.
-- This design now depends on **two** independent cryptographic libraries
-  (one for ML-KEM/X448/SHA3-HKDF, one for the P-521 signing scheme) rather
-  than one. Worth revisiting during the security review whether that's an
-  acceptable increase in audited-dependency surface for one primitive,
-  versus a single-library alternative (§9).
-- Mailbox table growth under a large, mostly-online fleet with a short
-  rotation interval — the TTL sweep bounds worst case, but the concrete
-  interval/TTL defaults should be chosen with real fleet sizes in mind
-  before this ships.
+M0 records tested system-library versions, signing-library selection,
+canonical vectors, and cross-compilation feasibility. M9 reviews the
+combiner/state machine and validates the 300-second rotation, 900-second
+inactivity threshold, 600-second prepare TTL, and service/load budgets.
+These are validation tasks, not undecided signing policy or a vendoring option.
+
+Select and record the supported innernet baseline commit and legacy binary
+versions before implementation. This checkout has no current build/CI
+infrastructure to reuse; milestones must establish it rather than assume
+pre-reset code is present.
+
+Migrations must be atomic/versioned with tested backup/restore and an explicit
+compatibility matrix. New code rejects unknown newer schemas before any
+write and never lowers version markers. Nullable columns alone do not prove
+downgrade safety. In the pre-reset `7ca1b57` implementation,
+`server/src/db/mod.rs` rewrites `user_version` whenever it differs, including
+when a database is newer; a subsequent upgrade can then attempt to add
+already-existing columns.
+
+Do not promise arbitrary old-server access to migrated live databases.
+Direct rollback is supported only for individually tested binaries proven
+not to corrupt newer schema/version state. Otherwise stop the new server
+and restore a matching pre-upgrade backup with matching endpoint policy and
+management configuration through a coordinated rollback. Never restore old
+exchange counters while endpoints keep the same bundle IDs; retire/re-enroll
+affected identities as necessary.
+
+Test old client/new server (PQ off and explicitly permissive), new client/old
+server (PQ off/permissive/strict), and new/new combinations, plus database
+new-to-old-to-new transitions and rejected unsupported rollbacks. Distinguish
+wire compatibility, local policy, runtime dependencies, and database
+compatibility in release notes. Installation on a never-enabled network
+stays opt-in; strict enablement and management provisioning are explicit
+behavior changes, not a claim of a behavior-free migration.

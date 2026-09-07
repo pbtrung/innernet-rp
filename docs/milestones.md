@@ -1,261 +1,316 @@
 # Milestones: post-quantum PSK exchange
 
-Companion to [design.md](design.md) — read that first for the full
-rationale. Each milestone should land as its own deliverable with tests, and
-should keep the system shippable throughout: the feature stays fully inert
-(no schema reads matter, no new keypairs generated, no mailbox traffic)
-until a network operator opts in, all the way through M6.
+Companion to [design.md](design.md). Each milestone is a separately testable
+deliverable. The checkout currently contains no implementation or build
+harness; M0 records the baseline and establishes the tooling that later
+milestones use. These are planned acceptance criteria, not completed tests.
 
-## M0 — Spike: integrate the KEM/hybrid-ECDH library and the signing library
+Introduce the enablement/policy gate in M1, before key generation, API
+traffic, or WireGuard changes. A never-enabled installation remains inert
+unless explicitly enabled. Once enabled, omission of a flag cannot silently
+discard persisted security policy. Signatures are mandatory in protocol v1.
+Before M4, enablement is confined to development/test paths; production
+activation must refuse to claim strict protection without its traffic gate.
 
-Not user-facing; de-risks every later milestone's assumptions in design.md
-§2.1/§5.1–§5.8.
+Management-link provisioning moves into M2 so that recovery is available
+before M4 applies any data PSK. M7 completes management rotation/recovery
+coverage. Data-peer rotation never changes the PSK carrying the coordination
+API. No milestone claims uninterrupted two-party PSK installation.
 
-- Integrate the chosen KEM/hybrid-ECDH library (ML-KEM-1024, X448,
-  SHA3/HKDF) and pin a specific version. Its integration maturity is not
-  yet established upstream — decide here whether to track a moving upstream
-  target or vendor a pinned copy, and record the decision (design doc §10
-  flags this as an open risk to close out in this milestone).
-- Separately integrate the chosen P-521 ECDSA signing library (§5.8) — a
-  second, independent crypto dependency from the KEM/hybrid-ECDH library,
-  since that library doesn't implement NIST prime-field curves; confirm it
-  interoperates cleanly with the other library's own randomness/byte
-  conventions.
-- Confirm both libraries link correctly against their system-provided
-  installations (§2.1), not a vendored/bundled copy.
-- Confirm actual key/ciphertext/signature byte sizes for ML-KEM-1024, X448,
-  and P-521 against both libraries' own output (design.md §2/§8 state
-  expected sizes; verify against the real implementations rather than the
-  specs alone).
-- Prototype the encapsulate/decapsulate round trip end-to-end in a
-  throwaway test, confirming both sides converge on the identical shared
-  secret.
-- Prototype the §5.7 hybrid combiner (X448 ECDH + ML-KEM shared secret →
-  HKDF-SHA3-256 → 32 bytes) and write down the exact derivation label so
-  it's fixed before any real keys depend on it.
-- Prototype P-521 ECDSA sign/verify over a `ciphertext || to_peer_id ||
-  from_peer_id` message (§5.8) using a fixed-width raw `r || s` signature
-  encoding (not DER), confirming the exact 132-byte signature length holds.
-- Decide both libraries' minimum-version and cross-compilation impact on
-  this project's own build tooling (relevant to M8's aarch64 target).
+## M0 — Baseline, crypto integration, and protocol fixtures
 
-**Acceptance**: a throwaway integration test demonstrates two independent
-encapsulate/decapsulate calls converging on the same derived PSK bytes, and
-a sign/verify round trip over a sample message; library/version choices and
-exact sizes recorded back into design.md §2/§8 if they differ from the
-estimates there.
+- Record the innernet baseline commit, supported legacy binary/schema
+  versions, implementation toolchain, and test/build entry points. Establish
+  the harness rather than assuming pre-reset files exist in this checkout.
+- Select the P-521/SHA-512 signing library and integrate it alongside
+  leancrypto's standalone ML-KEM-1024, X448, SHA3, HMAC, and HKDF primitives.
+  Confirm API availability and failure behavior, including deterministic
+  ECDSA, canonical signatures, and all required public-key checks.
+- Link both crypto libraries and SQLite against system-provided shared
+  installations. Record exact tested package versions in reproducible build
+  environments, minimum runtime versions, ABI requirements, and x86_64/
+  aarch64 cross-compilation constraints. Do not vendor/bundle copies or
+  silently use a differently encoded library hybrid.
+- Freeze the canonical B/T/E encodings, SHA-512 signature digest, RFC 6979
+  nonce behavior, raw low-S signature representation, HKDF labels/salt,
+  operator-PSK input, and directional confirmation tags in design section
+  5.14/5.7. Publish fixed cross-implementation vectors for every message type.
+- Verify ML-KEM modulus/length checks, X448 all-zero rejection, P-521 point
+  and scalar validation, encoding boundaries, randomness failure, and
+  correctly sized ciphertexts that produce implicit rejection. No API may
+  expose ML-KEM's internal implicit-reject flag.
+- Measure raw/base64/JSON fixtures, including all three public-key fields.
+  Confirm 2092 bytes for a base64 ML-KEM key/ciphertext and all
+  submitted message/registration fixtures fitting the 8 KiB request cap.
+- Model proposed/ready/committed/complete/aborted transitions, durable
+  receipts, and replay high-water marks before writing production PSKs.
 
-## M1 — Schema & API plumbing
+**Acceptance:** independent encapsulate/decapsulate endpoints agree within
+one exchange; separate randomized exchanges produce different PSKs. Both
+implementations reproduce canonical vectors, including negative cases.
+Library versions, build prerequisites, actual sizes, and protocol fixtures
+are recorded. Neither production interfaces nor their PSKs are modified.
 
-- Add two new nullable fields to the peer record and its backing storage —
-  a KEM public key and a signature public key.
-- Both fields default to absent so old and new client/server combinations
-  round-trip peer records without them.
-- Add one boolean feature flag advertising this capability, alongside the
-  server's other existing feature flags.
-- New handshake-mailbox table (`to_peer_id`, `from_peer_id`, `ciphertext`,
-  `signature`, `created_at`), primary-keyed on `(to_peer_id, from_peer_id)`.
-- Add `PUT /v1/user/pq-handshake/{to_peer_id}` to the server's API, with
-  input validation (exact expected ML-KEM-1024 ciphertext length, exact
-  expected P-521 signature length, authorization check that the caller may
-  see `to_peer_id` per existing CIDR rules).
-- Embed any pending mailbox entry addressed to the requester into the
-  existing bulk peer-state fetch response; delete the row once served.
-- A periodic sweep (mirroring the shape of other periodic server tasks)
-  deletes mailbox rows past the TTL.
-- Tests, using the server's existing test harness:
-  - round-trip a peer's KEM/signature public keys through a peer record and
-    the bulk state fetch;
-  - old-shaped peer records (no PQ fields) still deserialize (back-compat);
-  - a peer outside the requester's authorized CIDR set never has PQ fields
-    or mailbox entries leaked;
-  - malformed/wrong-length ciphertext or signature upload is rejected with
-    a 4xx response, not a crash;
-  - a delivered mailbox entry is deleted and not served twice;
-  - a TTL-expired, undelivered entry is swept.
+## M1 — Early policy gate, schema, and reliable API
 
-**Acceptance**: the full automated test suite passes; a client on an old
-build can still talk to a migrated server and vice versa (verified by the
-back-compat test above); no keypair-generation/PSK-application behavior
-changed yet.
+- Introduce `--enable-pq-psk` and `--pq-psk-permissive`, validating their
+  dependency from the start. Advertise `pq_psk_versions: [1]` only when the
+  server's required enrollment/recovery prerequisites are ready; installing
+  schema support alone is not operational readiness.
+- Add the persistent network ID, explicit server role, stable non-reused
+  peer IDs, and all three nullable public keys: KEM, X448, and signing.
+  Add atomic bundle ID/revision, WireGuard identity binding, and lifecycle
+  metadata. Distinguish absent, partial, malformed, and retired bundles.
+- Implement atomic `PUT /v1/user/pq-keys` registration/retirement with revision
+  compare-and-swap and the signed phase-message handshake endpoint.
+- Implement one active durable exchange per unordered data pair and compact
+  terminal sequence/outcome records. Enforce role-specific monotonic phase
+  transitions and per-endpoint installation/confirmation receipts.
+- Add opt-in, versioned paginated state responses. Keep legacy response
+  shapes for legacy requests. Deliver non-destructively; duplicate retries
+  return the recorded outcome. Old receipts cannot delete newer exchanges.
+- Enforce current session identity, enabled/redeemed status, CIDR visibility,
+  complete bundles, signatures, phase rules, and self/server-target rejection
+  on writes and deliveries, including every continuation page.
+- Enforce the design section 5.2 body/read-time/concurrency/rate/record caps
+  before costly decoding or crypto. Reserve resources for admitted recovery,
+  retirement, and ordinary coordination. Return bounded 4xx/429/503 errors.
+- Enforce the 600-second prepare TTL on reads/writes and in a sweep; retries
+  do not extend it, and expiry serializes with commitment. Committed work
+  survives TTL. Retain freshness tombstones until bundle retirement.
+- Use atomic versioned migrations that reject unknown newer schemas without
+  writes and never lower version markers. Establish backup/rollback fixtures.
 
-## M2 — Client keypair generation & registration
+**Acceptance:** API/schema tests cover all three keys, partial registration,
+non-consuming fetches, duplicate/lost responses, phase conflicts, stale
+receipts, authorization changes between pages, expiry races, tombstones,
+and resource admission. Old-shaped records still deserialize, but this
+alone does not claim old/new binary compatibility. With enablement absent
+on a never-enabled interface, no keys or PQ traffic are generated and no
+WireGuard behavior changes.
 
-- Generate an ML-KEM-1024 keypair, a dedicated X448 keypair, and a
-  dedicated P-521 signing keypair once per interface, at the same point the
-  interface's WireGuard keypair is first established. Store all three
-  secret keys with the same permission discipline (owner-only) as the
-  existing WireGuard private key.
-- Register all three public keys with the server through the same
-  mechanism already used for other per-peer fields, called once at setup
-  and idempotently re-checked on every regular sync.
-- The client's status display: show whether the local interface and each
-  visible peer has advertised PQ public keys (best-effort, no exchange
-  running yet — this milestone is data-plumbing only).
+## M2 — Durable identity and management-link provisioning
 
-**Acceptance**: setting up a network with this feature enabled generates
-and registers all three keypairs; the status display reflects it; no
-WireGuard PSK is touched yet (that's M4).
+- Generate and register complete bundles on first enablement, including
+  existing interfaces. Persist before registration using 0700 directories,
+  0600 files, atomic durable writes, safe file creation, and an interface
+  ownership lock. Handle failed randomness/writes without partial identity.
+- Persist confirmed/pending exchange secrets, replay marks, retry messages,
+  and gate/installation intent. Load them before touching a restarted
+  interface; never rely on kernel configuration as the only PSK copy.
+- Implement atomic bundle replacement after draining work, cache revision
+  invalidation, and explicit emergency retirement/re-enrollment for lost
+  keys, lost replay state, or stale backups. Never restart counters under
+  an old bundle ID or silently overwrite another process's state.
+- Provision an independent random per-client management PSK through the
+  invitation's authenticated confidential out-of-band transfer. Preserve it
+  across invitation redemption and persist it at server and client before
+  link activation. Existing-network migration uses independent admin access
+  and preserves any suitable existing operator-provisioned secret.
+- Restore management PSKs before serving/reaching the API after reboot and
+  enforce the management-only access policy. Missing/mismatched secrets block
+  readiness rather than falling back to zero or a public placeholder.
+- Display advertised, legacy, preparing, recovering, confirmed, and blocked
+  states separately. A public key on file is not proof of protected traffic.
 
-## M3 — Peer-to-peer exchange loop
+**Acceptance:** fresh/existing-interface enablement, registration crashes,
+permissions/symlinks, simultaneous processes, identity retirement, invitation
+redemption, and server/client reboot tests pass. A provisioned management
+link remains usable independently of any client-to-client data key. No
+mailbox-derived data PSK is applied yet. M4 is blocked until this independent
+recovery channel and its restoration are implemented and tested.
 
-- Implement the dial/listen (initiator/responder) tie-break from design.md
-  §5.4: the coordinating server (peer id 1) is always responder; otherwise
-  lower peer ID initiates.
-- Add a `--pq-psk-rotation-interval <seconds>` option (client and server),
-  default **5 minutes** (design.md §5.6) — independent of the general
-  peer-list fetch interval.
-- On each rotation-interval tick:
-  - as initiator for a given pair, fetch the responder's public keys,
-    encapsulate, sign `ciphertext || to_peer_id || from_peer_id` with the
-    local P-521 key, upload `{ciphertext, signature}`;
-  - as responder, for any pending mailbox entry delivered in the state
-    fetch: verify the signature against the sender's cached signature
-    public key first — on failure, log and discard without decapsulating;
-    on success, decapsulate and derive the shared secret.
-- Wire the derived shared secret through the §5.7 hybrid combiner into a
-  32-byte value, but **do not yet apply it to WireGuard** — that's M4, kept
-  separate so this milestone's tests can assert on the derived bytes
-  directly without needing a real WireGuard interface.
-- Tests: two simulated peers (initiator + responder) converge on an
-  identical derived PSK end-to-end through the mailbox mechanism (using a
-  fake/in-memory server for the mailbox, not a real network round trip); a
-  tampered signature is rejected without crashing and without disturbing
-  the previous derived value; a stale/wrong-length ciphertext delivered to
-  the responder is rejected the same way.
+## M3 — Durable exchange and confirmation loop
 
-**Acceptance**: two real client processes (or client+server) against a real
-test server converge on identical derived secret bytes for a pair, verified
-by a shared test assertion point (e.g. writing the derived value to a file
-each side can compare, similar in spirit to other cross-process convergence
-checks in this project's test suite); a forged/tampered signature is
-provably rejected in the same test run.
+- Implement lower-ID initiator/higher-ID responder for data peers only;
+  reject management-server pairs. Persist increasing per-bundle-pair
+  sequences and random exchange IDs, permitting one outstanding exchange.
+- Introduce `--pq-psk-rotation-interval`, default 300 seconds, on data clients.
+  Reject nonpositive/overflowing values. Schedule from prior completion;
+  short intervals cannot overwrite unfinished work.
+- Implement propose, ready, commit, installed, confirmed, and abort messages
+  with design section 5.14's exact signed envelopes and directional tags.
+  Before commitment both sides must have verified agreement on the candidate.
+- Derive the hybrid candidate using an explicitly adopted operator PSK, or
+  the specified absent-key input. A mismatch fails before installation;
+  a previous feature-derived PSK must not be misclassified as an operator key.
+- Process all delivered phases on each state fetch, independently of rotation
+  ticks and idleness. Retry identical persisted messages with bounded jittered
+  backoff/`Retry-After`; use fair bounded workers across peers.
+- Model a successful PSK installer/handshake observer in this milestone,
+  without changing real WireGuard state. Exercise every durable-write,
+  message-loss, reorder, and crash boundary, including commit-versus-abort.
+- Never independently roll back committed work. On restart reconcile its
+  durable decision and recover forward; unresolved commitment blocks new
+  work for that pair, not all other pairs.
 
-## M4 — PSK application
+**Acceptance:** independent processes converge on one candidate and terminal
+outcome through a real test API, with fake kernel application. Lost responses,
+replays after newer completion, stale generations, wrong confirmation tags,
+TTL races, and restarts cannot change the decision or reinstall an obsolete
+key. Test-only comparisons use owner-only temporary storage excluded from
+logs and uploaded artifacts. Production WireGuard PSKs remain untouched.
 
-- Apply the M3-derived PSK to the relevant WireGuard peer configuration, on
-  both initial exchange and each subsequent rotation.
-- On a failed/rejected exchange (§5.6), leave the previously-applied PSK in
-  place rather than clearing it.
-- Before the very first successful exchange for a pair, apply a
-  deterministic interim PSK derived locally from both sides' already-known
-  public keys (no round trip needed) so the tunnel isn't left with no PSK
-  at all while the first real exchange is still pending — same "sort, don't
-  pick a side" shape needed to guarantee both ends converge on the same
-  value independently.
-- Tests: applying a derived PSK doesn't disrupt an already-up tunnel
-  (existing peer config merge behavior, not a reconnect); a failed rotation
-  leaves the prior PSK in place; the interim PSK is deterministic and
-  identical when computed independently from either side's data.
+## M4 — Fail-closed data activation and kernel recovery
 
-**Acceptance**: a real two-peer test run shows the applied WireGuard
-preshared-key value change from the interim value to the real derived value
-once the first exchange completes, and again on subsequent rotations.
+- Implement the persistent Linux application-traffic gate from design
+  section 5.6, covering local/forwarded IPv4/IPv6 traffic and route fallback.
+  Restore the gate before interfaces/peers on boot; existing sessions cannot
+  bypass initial strict enablement. Transport handshake/keepalive probes may
+  run while application traffic remains gated.
+- After durable commitment, install on the responder first and wait for its
+  authenticated installed receipt before installing on the initiator.
+  Persist intent before kernel writes. Remove/recreate only the affected
+  peer with the full authorized configuration and candidate PSK, discarding
+  old sessions/in-flight handshakes. Accept and measure the interruption.
+- Require a fresh authenticated handshake on that new peer instance; persist
+  confirmation before opening its application gate and send the signed
+  receipt. Old handshake timestamps or configured-key readback alone cannot
+  prove the exchange completed.
+- Before commitment leave the working PSK unchanged; afterward reapply/retry
+  the candidate following crashes or kernel/API errors. No timeout-based
+  unilateral rollback, PSK clearing, or public-key-derived interim PSK.
+- Verify operator-PSK adoption/preservation and explicit unrecoverable-state
+  retirement. Configuration ownership conflicts must fail visibly rather
+  than silently overwriting another PSK manager.
 
-## M5 — Idle-detection pause/resume
+**Acceptance:** real WireGuard tests pass design cases 2–7: first activation,
+repeated rotations, interruption measurement, lost acknowledgments, crashes
+around every gate/kernel/write boundary, and replay rollback. Strict traffic
+never escapes through an old unprotected session or route fallback; unrelated
+peers and the management API remain usable throughout data-key mismatch.
 
-- Add a `--pq-psk-idle-timeout <seconds>` option, default **15 minutes**
-  (design.md §5.12).
-- Before each rotation tick for a given peer, check that peer's WireGuard
-  transfer byte-count delta since the last check; if unchanged for longer
-  than the idle timeout, skip rotation for that pair only.
-- Resume eagerly: the very next tick that observes a nonzero transfer delta
-  for that peer resumes normal rotation for that pair, with no effect on
-  any other peer's schedule.
-- Tests: an idle peer's rotation pauses while a concurrently-active peer's
-  rotation continues on schedule (directly exercises the design.md §5.12
-  independence claim); resuming traffic on the idle peer resumes its
-  rotation without needing to touch the active peer's state.
+## M5 — Tunnel-inactivity pause and fair scheduling
 
-**Acceptance**: in a real multi-peer test run, one peer's rotation
-demonstrably pauses and later resumes based on its own traffic alone, while
-a second peer's rotation is unaffected throughout.
+- Introduce `--pq-psk-idle-timeout`, default 900 seconds; zero disables
+  pausing. Document that it measures tunnel traffic including keepalives,
+  not application idleness.
+- Sample WireGuard counters on every state-fetch cycle. First observations,
+  counter resets, and peer recreation establish a fresh baseline and count
+  as activity; use monotonic elapsed time and checked arithmetic.
+- Pause only new rotations. Resume an overdue rotation on the first poll
+  observing traffic, without waiting another rotation interval. Initial
+  exchanges, receipt processing, reconciliation, and recovery never pause.
+- Exercise healthy persistent keepalive, keepalive-disabled inactivity,
+  counter reset, distinct poll/rotation periods, resource backoff, and
+  concurrent active/idle peers under fair scheduling.
 
-## M6 — Permissive mode & mixed-fleet interop
+**Acceptance:** design case 13 passes: a truly inactive tunnel pauses and
+resumes promptly, a keepalive-only tunnel does not pause, pending work
+progresses without application traffic, and other peers remain independent
+within shared resource budgets.
 
-- Add `--enable-pq-psk` and `--pq-psk-permissive` options, following the
-  existing option pattern already used for other optional per-peer
-  features in this project.
-- A peer with `--enable-pq-psk` but not `--pq-psk-permissive` treats a peer
-  with no advertised KEM public key as unreachable (fail-closed, matching
-  the existing default for other optional protections in this project).
-- With `--pq-psk-permissive`, fall back to a plain WireGuard connection (no
-  PSK) for such peers instead.
-- Tests: a mixed fleet (one peer with PQ enabled, one without) connects
-  successfully only when permissive mode is set on the enabled side, and is
-  treated as unreachable otherwise.
+## M6 — Mixed-fleet policy and explicit lifecycle transitions
 
-**Acceptance**: documented, tested fail-closed default with an explicit,
-tested opt-in fallback — no silent degradation either direction.
+- Complete strict/permissive behavior using the options introduced in M1.
+  Strict blocks until confirmed PQ data activation. Permissive permits
+  legacy only for entirely absent bundles with no prior successful local
+  PQ relationship, preserving an existing operator PSK.
+- Persist prior-PQ status. Partial/invalid/retired bundles, failed signatures,
+  failed rotations, and disappearing capabilities never silently downgrade.
+- Make disabling/re-enabling explicit and durable. Drain work or retire it
+  while gated, publish retirement atomically, and retain recovery state until
+  retirement is confirmed. Missing startup flags cannot bypass this process.
+- Legacy transition requires explicit authorization on both endpoints and
+  matching restoration of the operator PSK, or explicitly authorized zero
+  PSK. Remote strict peers remain blocked; local opt-out cannot force them.
+- Execute actual old/new client/server binaries with PQ off/permissive/strict
+  combinations, checking response parsing, optional capability discovery,
+  unavailable endpoints, and expected policy refusals, not just
+  deserialization tests.
 
-## M7 — Server as a mesh peer
+**Acceptance:** design cases 15 and the wire-policy portion of 17 pass.
+Reports distinguish supported legacy interoperation from expected strict
+refusal, and configured/advertised/confirmed protection states are accurate.
 
-- The coordination server generates and registers its own PQ keypairs for
-  its own coordination-API WireGuard link, and runs the same periodic
-  exchange logic as any client interface (design.md §5.10) — no special
-  casing beyond the responder role already assigned to it by §5.4.
-- Tests: the server's own coordination-API link gets a real derived PSK
-  applied and rotated, using the same test harness pattern as M3/M4.
+## M7 — Management PSK rotation and operational recovery
 
-**Acceptance**: running the server with this feature enabled results in its
-own link to at least one enabled client carrying a real derived PSK,
-verified the same way M4 verifies a client-side link.
+- Extend M2's working management provisioning with design section 5.10's
+  administrative rotation procedure: independent admin access, durable
+  staging at both ends, coordinated peer replacement, fresh-handshake/API
+  verification, and removal of superseded secrets only after confirmation.
+- Exercise failed installation at either end and coordinated repair to the
+  same old or new secret using independent access. Never depend on a broken
+  management tunnel to transport its own repair or fall back to no PSK.
+- Test simultaneous server reboot/client restart, invitation-to-final-peer
+  identity changes, management-only ACLs, lost management secrets, and
+  restoration of many per-client management PSKs before API startup.
+- Verify mailbox targets exclude the server link, and client data-key
+  disagreement cannot itself disrupt the management key/configuration.
+  Automatic management-PSK rotation is not part of version 1.
 
-## M8 — Build targets & platform support
+**Acceptance:** design case 16 passes, including successful and failed
+administrative rotations, out-of-band repair, and general server/transit
+traffic denial. Operational docs distinguish stable independent recovery
+from a claim that the management secret can never be changed.
 
-- Confirm both crypto libraries (§2.1) cross-compile and link cleanly for
-  both architectures this project already ships prebuilt binaries for:
-  x86_64 (amd64) and aarch64 (design.md §5.13).
-- Extend the existing release/build tooling to build this feature's
-  binaries for both targets; confirm no non-Linux build path is silently
-  affected (this feature stays Linux-only per design.md §4).
-- Tests: a build matrix (CI) covering both architectures, not just the
-  developer's native one.
+## M8 — Build targets and runtime dependencies
 
-**Acceptance**: both architectures' binaries build in CI and successfully
-run the M3/M4 convergence test under emulation or real hardware for the
-non-native target.
+- Build and execute on Linux x86_64 and aarch64 using the system shared
+  libraries/version constraints established in M0. Check actual target
+  runtime loading as well as cross-compilation.
+- Establish release/build automation for both architectures and record the
+  exact test environments. Run the crypto, durability, gate, and WireGuard
+  convergence checks under supported emulation or real hardware.
+- Keep legacy non-Linux paths usable with PQ disabled; reject unsupported
+  feature options clearly without pulling mandatory Linux-only runtime
+  requirements into those paths.
 
-## M9 — Security review & hardening
+**Acceptance:** design case 18 passes on both architectures, and runtime
+package/ABI requirements and non-Linux feature boundaries are recorded.
 
-Implements design.md §7's full Docker-based test plan against real
-processes, not just unit tests with fakes:
+## M9 — Security, fault, and load review
 
-- Stand up the four-container topology from design.md §7.1
-  (`peer-a`/`peer-b` cooperating, `peer-m` adversarial/cross-CIDR, `peer-x`
-  flood-only) in a new Docker-based test harness.
-- Automate all eleven cases from design.md §7.2: baseline convergence, PSK
-  reaching WireGuard, rotation over time, cross-CIDR mailbox isolation,
-  malformed-payload rejection, invalid-signature rejection, replay
-  harmlessness, TTL sweep, idle-detection pause/resume independence,
-  mailbox flood resilience, and permissive/mixed-fleet fallback.
-- Confirm a compromised/malicious server's practical capability is bounded
-  exactly as design.md §5.8/§6 claims (relay-level substitution without the
-  signature hardening enabled; no forgery possible with it enabled) — write
-  this up as a concrete test/documented finding, not just an assumption.
-- Resolve the design.md §10 open question on whether the P-521
-  signed-ciphertext hardening ships default-on or opt-in, based on what
-  this review finds.
-- Resolve the design.md §10 open question on whether the 5-minute
-  rotation/15-minute idle defaults hold up, adjusting if the load/flood
-  testing above suggests otherwise.
-- Revisit whether carrying two independent crypto dependencies (design.md
-  §2.1/§10) is worth it versus a single-library alternative, based on what
-  this review finds about the practical audit/maintenance cost.
+- Complete all 18 numbered cases in design section 7.2 against the specified
+  container topology, fault injector, persistent state, and real processes.
+  Earlier milestone results may be reused for the same tested revision;
+  happy-path convergence alone does not close this milestone.
+- Review canonical authentication and the hybrid combiner, static-key
+  compromise limits, operator-PSK retention, replay/rollback safety, secret
+  persistence, strict traffic gating, and forward recovery after commitment.
+- Demonstrate the trusted-directory limitation: initial key substitution by
+  a malicious directory is possible despite mandatory signatures. Ordinary
+  peers must still fail forgery/substitution checks. Do not report the
+  directory-compromise demonstration as a prevented attack.
+- Exercise the quantitative flood target in design case 14, recording
+  hardware, offered load, admission responses, peak RSS, response percentiles,
+  and progress of already-admitted exchanges. Test body caps, TTL/read races,
+  database budgets, and recovery-capacity reservation independently.
+- Validate the 300/900/600-second rotation/inactivity/prepare defaults and
+  per-peer/global budgets. Any adjustments update design, implementation,
+  tests, and release docs together. Signature policy and system linking are
+  already decided and are not optional downgrade mechanisms.
+- Finish process/database downgrade/re-upgrade testing from design section
+  10, including legacy binaries that rewrite newer schema markers. Prevent
+  unsupported rollback and test the coordinated backup recovery procedure.
 
-**Acceptance**: all eleven design.md §7.2 cases automated and green in CI,
-including the security-negative ones (cross-CIDR isolation, malformed
-payload, invalid signature, flood resilience) — a suite that only covers
-the happy path does not close this milestone; findings and any resulting
-default changes recorded back into design.md §6/§10.
+**Acceptance:** all design cases have recorded passing enforcement checks
+and documented expected limitations. Review findings are resolved or the
+relevant release claim is narrowed explicitly. Secret material is absent
+from production outputs, test logs, and uploaded artifacts. Do not claim an
+external cryptographic audit unless one has actually been performed.
 
-## M10 — Docs & release
+## M10 — Documentation and release
 
-- Documentation section covering `--enable-pq-psk`, `--pq-psk-permissive`,
-  `--pq-psk-rotation-interval`, and `--pq-psk-idle-timeout`, modeled on how
-  any other optional feature is documented in this project.
-- Manual-page updates, if this project ships them for other options.
-- Migration note for existing deployments: this is purely additive/opt-in
-  (new nullable fields, new table, no behavior change until an option is
-  passed) — confirm and document that an old server can run against a
-  migrated database with the new fields simply unused.
+- Document the enable/permissive/rotation/inactivity options and their exact
+  defaults, validation, persistence, and client/server applicability.
+- Document management invitation provisioning, independent administrative
+  PSK rotation, data-link interruption, forward recovery, key loss/retirement,
+  explicit disable/downgrade, and operator-PSK ownership.
+- State the passive-quantum threat model, trusted directory, classical
+  signatures, absent PSK-layer forward secrecy, management-link exception,
+  and the distinction between tunnel inactivity and application idleness.
+- Publish exact supported client/server/runtime/schema combinations and
+  their real test results. Nullable fields and old-shaped deserialization
+  are not evidence of arbitrary backward compatibility.
+- Allow direct old-server database rollback only for proven-compatible
+  binaries. Otherwise require a matching pre-upgrade backup and coordinated
+  endpoint/policy/management restoration, retiring bundle IDs if replay
+  state would go backward. Never lower newer schema version markers.
+- Update manual pages if the selected baseline ships them. Explain that
+  upgrading a never-enabled network is opt-in, while strict enablement and
+  management-link provisioning intentionally change behavior.
+
+**Acceptance:** release documentation matches the implemented/tested
+protocol and compatibility matrix; required management provisioning and
+recovery instructions are available before users can enable strict PQ.
