@@ -7,7 +7,7 @@
 # `makepkg`.
 
 pkgname=innernet-rp-bin
-pkgver=0.9999.6
+pkgver=0.9999.7
 pkgrel=1
 pkgdesc="A private network system built on WireGuard, with optional post-quantum key exchange via Rosenpass (prebuilt binaries)"
 arch=('x86_64' 'aarch64')
@@ -57,8 +57,8 @@ source=(
 sha256sums=('8b665a33724f1ff79b2b0395124376247e44eb890a5f08690b373050651fa2bc'
             'bf35134589a37066bad48c22b465f27b228edf97aa10ab17063d2f8be6a930b3'
             '4a0643392ba2612e3899be1705d7bd22b648a8d306c8dc4c7d845e59ca1a2b20')
-sha256sums_x86_64=('a7d2a72eb46b74053e1d6b06f7f110e7f919deba71fb56bd6206fe17804f3e6e')
-sha256sums_aarch64=('963989c66fd1e6c57a97d664a4d0cf79b219b0c3de8c055fdecc5e057c1720ca')
+sha256sums_x86_64=('14a87c9b2e3dc63c5775f7d5d0f663d6b4ce57b15263f79db6b9efcefc1e7056')
+sha256sums_aarch64=('a87fcc770a2888e846586c6a601d53c65c1b7ed9ec52659e375cb98dde370585')
 
 package() {
   install -Dm755 "$srcdir/innernet" "$pkgdir/usr/bin/innernet"
