@@ -553,23 +553,49 @@ feature:
   `Endpoint`/`candidates` already work) — the server never itself connects to
   a peer-supplied address, so this doesn't expand the existing candidate
   system's trust boundary.
-- **Subprocess hardening — pinned version check implemented, privilege
-  dropping NOT done, genuinely open.** `shared::rosenpass::check_rosenpass_version`
-  now refuses to spawn a `rosenpass` binary older than 0.2.1 (verified
-  against the real installed 0.2.3 binary), closing the "operator has an old
-  binary" gap in CVE-2023-53157's mitigation. Running the child as an
-  unprivileged user was investigated and deliberately **not** implemented:
-  the child needs to read the secret key file (`0o600`, owned by whatever
-  user runs `innernet`/`innernet-server`, frequently root) and write
-  `key_out`/log/pid files back into the same directory, so naively dropping
-  its privileges would either break those reads/writes or require first
-  designing a shared-ownership model for the whole `rosenpass_dir` (e.g. a
-  dedicated system group) — a real design task, not a one-line fix, and one
-  that couldn't be validated in the environment this was implemented in (no
-  root/CAP_NET_ADMIN available to test a live privilege-dropped process).
-  Shipping an unvalidated privilege-drop risked silently breaking the
-  feature rather than hardening it, so this remains explicitly open rather
-  than half-implemented.
+- **Subprocess hardening — pinned version check and privilege dropping both
+  implemented.** `shared::rosenpass::check_rosenpass_version` refuses to
+  spawn a `rosenpass` binary older than 0.2.1 (verified against the real
+  installed 0.2.3 binary), closing the "operator has an old binary" gap in
+  CVE-2023-53157's mitigation. Running the long-running exchange daemon
+  (not the one-shot `gen-keys` step — the daemon is the process actually
+  exposed to untrusted network input, so it's the one worth hardening) as
+  an unprivileged user is now opt-in via `--rosenpass-group <name>`:
+  - Requires the group to already exist (`groupadd --system <name>`) —
+    deliberately no install-time hook to create it, since the right
+    group/policy is deployment-specific, not something this codebase
+    should decide unilaterally.
+  - `shared::rosenpass::prepare_shared_ownership` chgrp's the per-interface
+    `rosenpass_dir` tree to that group (never changing *ownership*/uid of
+    anything — root keeps full access throughout) and loosens permissions
+    just enough for a group member to read the secret key/config/cached
+    peer keys and create/rewrite key-handoff files.
+  - `spawn_daemon` drops privileges via a single `pre_exec` closure
+    (clear supplementary groups → `setgid` → `setuid`, an order that must
+    not change, since dropping uid first forfeits the capabilities needed
+    to still change gid/groups) rather than `Command`'s own `uid()`/`gid()`
+    builder methods, keeping that ordering fully explicit rather than
+    relying on an assumption about std's internal application order.
+  - **A real bug here that only a live `docker-tests` run caught** (not
+    unit tests, and not the source-level security review pass below):
+    `prepare_shared_ownership` fixed up `rosenpass_dir` itself but not the
+    directories *above* it — `data_dir` (e.g. `/var/lib/innernet`) stays
+    `0o700` root-only several levels up (`DataStore::open_or_create`'s own
+    `ensure_dirs_exist` call), so the unprivileged daemon could never
+    traverse down to its own config file at all. It read as "config file
+    does not exist" and got killed and respawned in a tight loop every
+    fetch cycle, never completing a real exchange — exactly the kind of
+    bug that requires an actual locked-down multi-level directory tree to
+    reproduce, which no tempdir-backed unit test builds. Fixed with
+    `ensure_ancestors_traversable`, adding execute-only ("traverse", not
+    read/write) permission for `other` on every ancestor directory — the
+    same tradeoff most systems already make for e.g. `/home` (`0o711`).
+    Verified via a manual repro (the daemon now stays alive as
+    `nobody:<group>` with a stable pid, instead of crash-looping) and a
+    dedicated `docker-tests/` scenario confirming a real Rosenpass exchange
+    still completes, PSK rotation included, with the daemon provably
+    running under a non-root uid/gid (read straight from
+    `/proc/<pid>/status` inside the container).
 - **Fail-open, not fail-secure, by design** in permissive mode — document this
   tradeoff explicitly for operators (mirrors NetBird's own documented
   limitation) so it's a conscious choice per network, not a silent gap.

@@ -239,7 +239,7 @@ already-tested shared code, and is now also verified end to end: `wg show`
 on a real running server (inside `docker-tests/`) shows a non-empty PSK for
 an enrolled peer.
 
-## M7 — Security review & hardening — mostly DONE (subprocess privilege-dropping still open)
+## M7 — Security review & hardening — DONE
 
 - Ran a security review against the full diff (946d53f..HEAD), using the
   same methodology as this repo's `/security-review` skill (its own
@@ -270,26 +270,66 @@ an enrolled peer.
 - Re-ran `cargo clippy --workspace --locked --all-targets -- -D warnings`
   (clean) and the full `cargo test --workspace --locked` suite (all passing)
   after every change in this milestone.
-- **Not done — subprocess privilege dropping**: investigated running the
-  `rosenpass` child as an unprivileged user, but the child needs read access
-  to the `0o600` secret key and write access to `key_out`/log/pid files in
-  the same directory the parent (often root) owns; doing this safely needs
-  a shared-ownership design for `rosenpass_dir` first, and couldn't be
-  validated here anyway (no root/CAP_NET_ADMIN in this environment).
-  Recorded as open in design.md §6 rather than shipped half-validated.
-- **`docker-tests/` suite now implemented, run, and found two real bugs**
-  (both fixed — see M4): the real-interface gap noted throughout M4-M6 is
-  closed. This is exactly the kind of finding a purely source-level security
-  review can't catch — both bugs were about real filesystem/process
-  behavior (a directory-creation edge case and a subprocess's default file
-  permissions), not logic visible in a diff.
+- **Subprocess privilege-dropping — implemented and verified**, closing the
+  gap this milestone had left open. New `--rosenpass-group <name>` opt
+  (`RosenpassOpts::rosenpass_group`, `shared/src/types.rs`): when set, the
+  long-running exchange daemon (`rosenpass exchange-config` — the process
+  actually exposed to untrusted network input, unlike the one-shot
+  `gen-keys` step) runs as the fixed unprivileged user `nobody` with that
+  group as its only group, instead of inheriting whatever privileged user
+  started `innernet`/`innernet-server` (typically root).
+  - `resolve_privilege_drop_target` looks up `nobody`'s uid and the
+    configured group's gid, failing loudly (not silently running as root)
+    if either doesn't exist — the group must be created ahead of time
+    (`groupadd --system <name>`); this project has no install-time hook to
+    create it, by design, since the right group name/policy is
+    deployment-specific.
+  - `prepare_shared_ownership` chgrp's the per-interface `rosenpass_dir`
+    tree to that group and loosens permissions just enough for a member to
+    read the secret key/config/cached peer keys and create/rewrite
+    key-handoff files, without ever changing *ownership* (uid) of
+    anything — root keeps full access throughout, unaffected.
+  - `spawn_daemon` drops privileges via a single `pre_exec` closure
+    (clear supplementary groups, then `setgid`, then `setuid`, in that
+    order — reordering would forfeit the capabilities needed to still
+    change gid/groups after dropping uid) rather than `Command`'s own
+    `uid()`/`gid()` builder methods, to keep that ordering fully explicit
+    and under our control rather than relying on an assumption about std's
+    internal application order.
+  - **Found and fixed a real bug via `docker-tests`, not unit tests**:
+    `prepare_shared_ownership` only fixed up `rosenpass_dir` itself, but
+    `data_dir` (e.g. `/var/lib/innernet`) stays `0o700` root-only several
+    levels above it (`DataStore::open_or_create`'s own `ensure_dirs_exist`
+    call) — so the unprivileged daemon could never even traverse down to
+    its own config file. It read as "config file does not exist" and got
+    killed and respawned in a fast (~1s) loop every fetch cycle forever,
+    never actually completing an exchange. A unit test building on an
+    already-existing tempdir never hits a locked-down multi-level ancestor
+    like this, exactly the same class of gap M4's `ensure_dirs_exist` bug
+    was. Fixed with a new `ensure_ancestors_traversable`, which adds
+    execute-only ("traverse", not read/write) permission for `other` on
+    every ancestor directory — the same tradeoff most systems already make
+    for e.g. `/home` (`0o711`) — confirmed via both a manual repro (daemon
+    stays alive as `nobody:<group>` with a stable pid) and a dedicated
+    `docker-tests/` scenario (`test_rosenpass_privilege_drop`): two real
+    containers with `--rosenpass-group rosenpass`, confirming the daemon's
+    actual `/proc/<pid>/status` reports a non-root uid/gid and a real
+    exchange still completes (interim PSK, then rotation) despite running
+    unprivileged.
+- **`docker-tests/` suite now implemented, run, and found three real bugs
+  in total** (all fixed — see M4 and above): the real-interface gap noted
+  throughout M4-M6 is closed. This is exactly the kind of finding a purely
+  source-level security review can't catch — all three bugs were about
+  real filesystem/process behavior (a directory-creation edge case, a
+  subprocess's default file permissions, and an ancestor-directory
+  traversal gap), not logic visible in a diff.
 
-**Acceptance**: partially met — security review complete with no open
-findings, fuzzing found and fixed a real bug, version pinning is now
-enforced in code (not just documented), and the `docker-tests/` suite is
-now implemented and passing (having found and fixed two further real bugs).
-Subprocess privilege-dropping remains open, tracked above rather than
-silently dropped.
+**Acceptance**: met — security review complete with no open findings,
+fuzzing found and fixed a real bug, version pinning is now enforced in
+code (not just documented), the `docker-tests/` suite is implemented and
+passing (having found and fixed three real bugs along the way), and
+subprocess privilege-dropping is implemented, unit-tested, and verified
+end to end against real containers.
 
 ## M8 — Docs & release — partially DONE (man pages and the actual release deliberately not done)
 

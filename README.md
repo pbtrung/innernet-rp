@@ -215,6 +215,19 @@ client-side choice rather than something the server enforces.
 `innernet-server serve` accepts the same two flags, so the coordination API's own
 WireGuard link can carry a Rosenpass PSK too.
 
+By default, the Rosenpass exchange daemon runs under the same (typically root)
+user as `innernet`/`innernet-server` itself. To harden it — it's the process
+actually exposed to untrusted network input — create a dedicated system group
+(e.g. `groupadd --system rosenpass`) and pass `--rosenpass-group rosenpass`:
+the daemon then runs as the unprivileged `nobody` user with only that group,
+which is granted just enough access to the Rosenpass state directory to do its
+job.
+
+```sh
+sudo groupadd --system rosenpass
+sudo innernet up --enable-rosenpass --rosenpass-group rosenpass <interface>
+```
+
 ### Remove Network
 
 To permanently uninstall a created network, use
