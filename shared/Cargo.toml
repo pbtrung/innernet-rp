@@ -38,15 +38,10 @@ toml = "1.1.5"
 url = "2.5.8"
 wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
 zeroize = "1.9.0"
-
-[target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-core = "0.9.0"
 netlink-packet-route = "0.33.0"
 netlink-request = { version = "2.0.0", path = "../netlink-request" }
 netlink-sys = "0.9.0"
-
-[target.'cfg(any(target_os = "macos", target_os= "openbsd"))'.dependencies]
-nix = "0.31.3"
 
 [features]
 selinux = ["hostsfile/selinux"]

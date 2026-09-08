@@ -10,40 +10,17 @@ mod key;
 
 pub use crate::{config::*, device::*, key::*};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
-    #[cfg(target_os = "linux")]
+    #[default]
     Kernel,
-    #[cfg(target_os = "openbsd")]
-    OpenBSD,
     Userspace,
-}
-
-#[allow(clippy::derivable_impls)]
-impl Default for Backend {
-    fn default() -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            Self::Kernel
-        }
-        #[cfg(target_os = "openbsd")]
-        {
-            Self::OpenBSD
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
-        {
-            Self::Userspace
-        }
-    }
 }
 
 impl Display for Backend {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(target_os = "linux")]
             Self::Kernel => write!(f, "kernel"),
-            #[cfg(target_os = "openbsd")]
-            Self::OpenBSD => write!(f, "kernel"),
             Self::Userspace => write!(f, "userspace"),
         }
     }
@@ -54,10 +31,7 @@ impl FromStr for Backend {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            #[cfg(target_os = "linux")]
             "kernel" => Ok(Self::Kernel),
-            #[cfg(target_os = "openbsd")]
-            "kernel" => Ok(Self::OpenBSD),
             "userspace" => Ok(Self::Userspace),
             _ => Err(format!("valid values: {}.", Self::variants().join(", "))),
         }
@@ -66,13 +40,6 @@ impl FromStr for Backend {
 
 impl Backend {
     pub fn variants() -> &'static [&'static str] {
-        #[cfg(any(target_os = "linux", target_os = "openbsd"))]
-        {
-            &["kernel", "userspace"]
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
-        {
-            &["userspace"]
-        }
+        &["kernel", "userspace"]
     }
 }

@@ -189,10 +189,7 @@ impl Server {
             public_key: self.public_key.clone(),
             pq: self.pq.clone(),
             management: None,
-            #[cfg(target_os = "linux")]
             backend: Backend::Kernel,
-            #[cfg(not(target_os = "linux"))]
-            backend: Backend::Userspace,
         }
     }
 

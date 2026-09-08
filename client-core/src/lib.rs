@@ -26,10 +26,7 @@ pub mod rest_client;
 
 pub const DEFAULT_CONFIG_DIR: &str = "/etc/innernet";
 
-#[cfg(not(target_os = "openbsd"))]
 pub const DEFAULT_DATA_DIR: &str = "/var/lib/innernet";
-#[cfg(target_os = "openbsd")]
-pub const DEFAULT_DATA_DIR: &str = "/var/db/innernet";
 
 /// Set the `listen_port`. `None` value unsets it.
 pub fn set_listen_port(

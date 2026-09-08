@@ -13,7 +13,6 @@ use wireguard_control::InterfaceName;
 
 pub mod interface_config;
 pub mod management;
-#[cfg(target_os = "linux")]
 mod netlink;
 pub mod peer;
 pub mod pq;
@@ -82,36 +81,6 @@ pub fn chmod(file: &File, new_mode: u32) -> Result<bool, io::Error> {
     Ok(updated)
 }
 
-#[cfg(any(target_os = "macos", target_os = "openbsd"))]
-pub fn _get_local_addrs() -> Result<impl Iterator<Item = std::net::IpAddr>, io::Error> {
-    use std::net::Ipv4Addr;
-
-    use nix::net::if_::InterfaceFlags;
-
-    let addrs = nix::ifaddrs::getifaddrs()?
-        .filter(|addr| {
-            addr.flags.contains(InterfaceFlags::IFF_UP)
-                && !addr.flags.intersects(
-                    InterfaceFlags::IFF_LOOPBACK
-                        | InterfaceFlags::IFF_POINTOPOINT
-                        | InterfaceFlags::IFF_PROMISC,
-                )
-        })
-        .filter_map(|interface_addr| {
-            interface_addr.address.and_then(|addr| {
-                if let Some(sockaddr_in) = addr.as_sockaddr_in() {
-                    Some(IpAddr::V4(Ipv4Addr::from(sockaddr_in.ip())))
-                } else {
-                    addr.as_sockaddr_in6()
-                        .map(|sockaddr_in6| IpAddr::V6(sockaddr_in6.ip()))
-                }
-            })
-        });
-
-    Ok(addrs)
-}
-
-#[cfg(target_os = "linux")]
 pub use netlink::get_local_addrs as _get_local_addrs;
 
 pub fn get_local_addrs() -> Result<impl Iterator<Item = std::net::IpAddr>, io::Error> {

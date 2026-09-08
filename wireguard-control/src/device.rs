@@ -240,30 +240,21 @@ impl Device {
     /// detailed information on each interface.
     pub fn list(backend: Backend) -> Result<Vec<InterfaceName>, std::io::Error> {
         match backend {
-            #[cfg(target_os = "linux")]
             Backend::Kernel => backends::kernel::enumerate(),
-            #[cfg(target_os = "openbsd")]
-            Backend::OpenBSD => backends::openbsd::enumerate(),
             Backend::Userspace => backends::userspace::enumerate(),
         }
     }
 
     pub fn get(name: &InterfaceName, backend: Backend) -> Result<Self, std::io::Error> {
         match backend {
-            #[cfg(target_os = "linux")]
             Backend::Kernel => backends::kernel::get_by_name(name),
-            #[cfg(target_os = "openbsd")]
-            Backend::OpenBSD => backends::openbsd::get_by_name(name),
             Backend::Userspace => backends::userspace::get_by_name(name),
         }
     }
 
     pub fn delete(self) -> Result<(), std::io::Error> {
         match self.backend {
-            #[cfg(target_os = "linux")]
             Backend::Kernel => backends::kernel::delete_interface(&self.name),
-            #[cfg(target_os = "openbsd")]
-            Backend::OpenBSD => backends::openbsd::delete_interface(&self.name),
             Backend::Userspace => backends::userspace::delete_interface(&self.name),
         }
     }
@@ -446,10 +437,7 @@ impl DeviceUpdate {
     /// An interface with the provided name will be created if one does not exist already.
     pub fn apply(self, iface: &InterfaceName, backend: Backend) -> io::Result<()> {
         match backend {
-            #[cfg(target_os = "linux")]
             Backend::Kernel => backends::kernel::apply(&self, iface),
-            #[cfg(target_os = "openbsd")]
-            Backend::OpenBSD => backends::openbsd::apply(&self, iface),
             Backend::Userspace => backends::userspace::apply(&self, iface),
         }
     }

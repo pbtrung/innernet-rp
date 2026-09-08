@@ -19,8 +19,6 @@ libc = "0.2.189"
 log = "0.4.34"
 getrandom = "0.4.3"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-core = "0.9.0"
 netlink-packet-generic = "0.5.0"
 netlink-packet-route = "0.33.0"
@@ -28,6 +26,3 @@ netlink-packet-utils = "0.6.0"
 netlink-packet-wireguard = "0.5.0"
 netlink-request = { version = "2.0.0", path = "../netlink-request" }
 netlink-sys = "0.9.0"
-
-[target.'cfg(target_os = "openbsd")'.dependencies]
-nix = { version = "0.31.3", features = ["net"] }
