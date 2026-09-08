@@ -706,7 +706,7 @@ sequenceDiagram
     participant B as Data peer B (responder)
     A->>S: GET state with pq_version=1
     S-->>A: Complete KEM, X448, signing and WireGuard bundles
-    Note over A: Persist candidate, sequence and signed proposal; keep current PSK
+    Note over A: Persist candidate, sequence and signed proposal, keep current PSK
     A->>S: PUT pq-handshake/B (propose, ciphertext, tag, signature)
     S-->>A: Durable proposed receipt
     B->>S: GET state (every poll, non-consuming)
@@ -715,23 +715,23 @@ sequenceDiagram
     B->>S: PUT pq-handshake/A (ready, tag, signature)
     A->>S: GET state
     S-->>A: Signed ready
-    Note over A: Verify responder tag; persist commit intent
+    Note over A: Verify responder tag, persist commit intent
     A->>S: PUT pq-handshake/B (commit, tag, signature)
     S-->>A: Durable committed receipt
     B->>S: GET state
     S-->>B: Committed decision
-    Note over B: Gate data; recreate only A's peer with candidate
+    Note over B: Gate data, recreate only A's peer with candidate
     B->>S: PUT pq-handshake/A (installed, tag, signature)
     A->>S: GET state
     S-->>A: Responder installed receipt
-    Note over A: Gate data; recreate only B's peer with candidate
+    Note over A: Gate data, recreate only B's peer with candidate
     A->>S: PUT pq-handshake/B (installed, tag, signature)
     A->>B: Fresh WireGuard handshake and key confirmation
     Note over A,B: Persist local confirmation before releasing application gates
     A->>S: PUT pq-handshake/B (confirmed, tag, signature)
     B->>S: PUT pq-handshake/A (confirmed, tag, signature)
-    S->>S: Complete; retain sequence/outcome tombstone
-    Note over A,B: Reconcile completion on subsequent polls; retries are idempotent
+    S->>S: Complete, retain sequence/outcome tombstone
+    Note over A,B: Reconcile completion on subsequent polls, retries are idempotent
 ```
 
 | Material | Raw bytes | Padded base64 bytes |
