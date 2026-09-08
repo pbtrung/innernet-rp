@@ -420,6 +420,7 @@ mod tests {
     };
     use innernet_shared::PeerContents;
     use std::cell::RefCell;
+    use wireguard_control::KeyPair;
 
     fn peer_state(id: u64, server_id: u64) -> (EndpointState, Bundle) {
         let identity = Identity::generate(
@@ -474,6 +475,29 @@ mod tests {
                 lifecycle: Lifecycle::Enabled,
                 bundle,
             }),
+        }
+    }
+
+    fn legacy_peer_entry(id: i64, ip: &str, public_key: &Key) -> PeerState<Peer> {
+        PeerState {
+            peer: Peer {
+                id,
+                contents: PeerContents {
+                    name: "legacy-peer".parse().unwrap(),
+                    ip: ip.parse().unwrap(),
+                    cidr_id: 1,
+                    public_key: public_key.to_base64(),
+                    endpoint: None,
+                    persistent_keepalive_interval: None,
+                    is_admin: false,
+                    is_disabled: false,
+                    is_redeemed: true,
+                    invite_expires: None,
+                    candidates: vec![],
+                },
+            },
+            is_server: false,
+            pq: None,
         }
     }
 
@@ -558,5 +582,48 @@ mod tests {
             vec![c_id],
             "only C's healthy relationship should have attempted to send"
         );
+    }
+
+    #[test]
+    fn a_bundle_less_peer_is_never_touched_by_the_engine_or_installer() {
+        // Whatever policy decides about *gating* a legacy peer is
+        // client_core::interface's job (pq_install::legacy_eligible); this
+        // proves the durable/kernel-facing half of "preserve any operator
+        // PSK" independently: apply()'s loop must never create a
+        // Relationship, send a message, or invoke the installer for a peer
+        // that advertises no PQ bundle at all, regardless of policy.
+        let (mut state, _own_bundle) = peer_state(2, 1);
+        let legacy_key = KeyPair::generate().public;
+        let legacy_id = Number::new(3).unwrap();
+
+        let peers = vec![legacy_peer_entry(3, "10.0.0.3", &legacy_key)];
+        let exchanges = vec![];
+        let transport = RecordingTransport::default();
+        let mut installer = FakeInstaller::default();
+        let mut rng = SystemRandom;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("state"), true).unwrap();
+
+        apply(
+            &peers,
+            &exchanges,
+            &transport,
+            &mut store,
+            &mut state,
+            &mut installer,
+            &mut rng,
+            0,
+            300,
+            0,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !state.relationships.contains_key(&legacy_id),
+            "a bundle-less peer must never get a Relationship"
+        );
+        assert!(transport.sent.borrow().is_empty());
+        assert!(installer.installed_psks.is_empty());
     }
 }
