@@ -599,6 +599,17 @@ impl AsRef<Peer> for Peer {
     }
 }
 
+/// The single allowed IP a peer's own overlay address grants it: a `/32`
+/// for IPv4, a `/128` for IPv6. Shared by the ordinary peer-diff sync path
+/// and the PQ data-traffic gate/installer, so both agree on exactly which
+/// address a peer's kernel entry and gate rules are scoped to.
+pub fn peer_allowed_ip(peer: &Peer) -> AllowedIp {
+    AllowedIp {
+        address: peer.ip,
+        cidr: if peer.ip.is_ipv4() { 32 } else { 128 },
+    }
+}
+
 impl Deref for Peer {
     type Target = PeerContents;
 
@@ -732,10 +743,7 @@ impl<'a> PeerDiff<'a> {
         // diff.new is now guaranteed to be a Some(_) variant.
         let new = new.unwrap();
 
-        let new_allowed_ips = &[AllowedIp {
-            address: new.ip,
-            cidr: if new.ip.is_ipv4() { 32 } else { 128 },
-        }];
+        let new_allowed_ips = &[peer_allowed_ip(new)];
         if old.is_none() || matches!(old, Some(old) if old.allowed_ips != new_allowed_ips) {
             builder = builder
                 .replace_allowed_ips()

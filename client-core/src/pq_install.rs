@@ -1,0 +1,205 @@
+//! The real `innernet_pq::engine::Installer` (M4): recreates a WireGuard
+//! peer with the candidate PSK and observes genuine kernel handshakes,
+//! gating that peer's application traffic around the transition.
+//!
+//! Stateless by design: `pq::engine::EndpointState::reconcile` already
+//! tracks `pending.installed`/`pending.confirmed` durably, so `install` is
+//! never called twice for one rotation and `handshake_fresh` can safely
+//! read straight from the kernel every call. Freshness proof is structural,
+//! not timestamp-comparison: `install` always removes-then-recreates the
+//! kernel peer entry, which resets its `last_handshake_time` to `None`, so
+//! any `Some(_)` observed afterward is necessarily a handshake under the new
+//! instance -- never a stale one carried over from before the rotation.
+use crate::gate;
+use innernet_pq::{
+    crypto::Candidate, engine::Installer, protocol::Bundle, Error as PqError, Result as PqResult,
+};
+use innernet_shared::{peer_allowed_ip, Peer};
+use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
+
+/// Borrows the just-fetched peer directory so it never needs a second
+/// network round trip to find a peer's endpoint/keepalive/allowed IP.
+pub struct RealInstaller<'a> {
+    interface: InterfaceName,
+    backend: Backend,
+    peers: &'a [Peer],
+}
+
+impl<'a> RealInstaller<'a> {
+    pub fn new(interface: InterfaceName, backend: Backend, peers: &'a [Peer]) -> Self {
+        Self {
+            interface,
+            backend,
+            peers,
+        }
+    }
+
+    fn find_peer(&self, bundle: &Bundle) -> PqResult<&Peer> {
+        let key = Key(bundle.wg_public_key.0).to_base64();
+        self.peers
+            .iter()
+            .find(|p| p.public_key == key)
+            .ok_or(PqError::Installer)
+    }
+}
+
+impl Installer for RealInstaller<'_> {
+    fn install(&mut self, bundle: &Bundle, candidate: &Candidate) -> PqResult<()> {
+        let peer = self.find_peer(bundle)?;
+        let allowed_ip = peer_allowed_ip(peer);
+        let public_key = Key::from_base64(&peer.public_key).map_err(|_| PqError::Installer)?;
+
+        // Gate before touching the kernel peer at all (design 5.6's ordering).
+        gate::block(&self.interface, std::slice::from_ref(&allowed_ip))
+            .map_err(|_| PqError::Installer)?;
+
+        // Remove, then recreate with the full authorized config and the
+        // candidate PSK, in two separate applies: a single DeviceUpdate
+        // batching both for the same key must not be relied on to discard
+        // the old session, since backends key peer updates by public key
+        // and could collapse a remove+add pair into a no-op merge.
+        DeviceUpdate::new()
+            .add_peer(PeerConfigBuilder::new(&public_key).remove())
+            .apply(&self.interface, self.backend)
+            .map_err(|_| PqError::Installer)?;
+
+        let mut builder = PeerConfigBuilder::new(&public_key)
+            .replace_allowed_ips()
+            .add_allowed_ip(allowed_ip.address, allowed_ip.cidr)
+            .set_preshared_key(Key(*candidate.psk.0));
+        if let Some(interval) = peer.persistent_keepalive_interval {
+            builder = builder.set_persistent_keepalive_interval(interval);
+        }
+        if let Some(endpoint) = peer.endpoint.as_ref().and_then(|e| e.resolve().ok()) {
+            builder = builder.set_endpoint(endpoint);
+        }
+        DeviceUpdate::new()
+            .add_peer(builder)
+            .apply(&self.interface, self.backend)
+            .map_err(|_| PqError::Installer)?;
+        Ok(())
+    }
+
+    fn handshake_fresh(&mut self, bundle: &Bundle) -> PqResult<bool> {
+        let peer = self.find_peer(bundle)?;
+        let public_key = Key::from_base64(&peer.public_key).map_err(|_| PqError::Installer)?;
+        let device = Device::get(&self.interface, self.backend).map_err(|_| PqError::Installer)?;
+        let fresh = device
+            .peers
+            .iter()
+            .find(|p| p.config.public_key == public_key)
+            .is_some_and(|p| p.stats.last_handshake_time.is_some());
+        if fresh {
+            let allowed_ip = peer_allowed_ip(peer);
+            gate::release(&self.interface, std::slice::from_ref(&allowed_ip))
+                .map_err(|_| PqError::Installer)?;
+        }
+        Ok(fresh)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innernet_pq::protocol::Binary;
+    use innernet_shared::{NetworkOpts, PeerContents};
+    use std::{net::IpAddr, process::Command, time::SystemTime};
+    use wireguard_control::{Key, KeyPair};
+
+    fn candidate(byte: u8) -> Candidate {
+        Candidate {
+            psk: innernet_pq::crypto::Secret::from_bytes([byte; 32]),
+            initiator_confirmation: innernet_pq::crypto::Secret::from_bytes([0; 32]),
+            responder_confirmation: innernet_pq::crypto::Secret::from_bytes([0; 32]),
+        }
+    }
+
+    fn fake_peer(id: i64, name: &str, ip: IpAddr, public_key: &Key) -> Peer {
+        Peer {
+            id,
+            contents: PeerContents {
+                name: name.parse().unwrap(),
+                ip,
+                cidr_id: 1,
+                public_key: public_key.to_base64(),
+                endpoint: None,
+                persistent_keepalive_interval: Some(25),
+                is_admin: false,
+                is_disabled: false,
+                is_redeemed: true,
+                invite_expires: None,
+                candidates: vec![],
+            },
+        }
+    }
+
+    fn fake_bundle(public_key: &Key) -> Bundle {
+        Bundle {
+            bundle_id: Binary([1; 16]),
+            bundle_revision: innernet_pq::protocol::Number::new(1).unwrap(),
+            wg_public_key: Binary(public_key.0),
+            pq_kem_public_key: Binary([2; 1568]),
+            pq_x448_public_key: Binary([3; 56]),
+            pq_sig_public_key: Binary([4; 67]),
+        }
+    }
+
+    /// Exercises real kernel WireGuard peer installation and nft gating.
+    /// Requires root/NET_ADMIN, the `nft` binary, and a Linux kernel
+    /// WireGuard module -- a container with `--cap-add NET_ADMIN`, not this
+    /// sandbox; never run on a production host.
+    #[test]
+    #[ignore = "requires root/NET_ADMIN, nft, and a Linux kernel WireGuard module"]
+    fn install_recreates_the_peer_with_the_candidate_psk_and_gates_it() {
+        let interface: InterfaceName = "wg-pq-instl0".parse().unwrap();
+        let own = KeyPair::generate();
+        let remote = KeyPair::generate();
+        innernet_shared::wg::up(
+            &interface,
+            &own.private.to_base64(),
+            "10.77.0.1/24".parse().unwrap(),
+            None,
+            None,
+            &NetworkOpts {
+                no_routing: true,
+                backend: Backend::Kernel,
+                mtu: None,
+            },
+        )
+        .unwrap();
+
+        let peer = fake_peer(2, "peer-b", "10.77.0.2".parse().unwrap(), &remote.public);
+        let bundle = fake_bundle(&remote.public);
+        let peers = vec![peer];
+        let mut installer = RealInstaller::new(interface, Backend::Kernel, &peers);
+
+        installer.install(&bundle, &candidate(7)).unwrap();
+        let device = Device::get(&interface, Backend::Kernel).unwrap();
+        let installed = device
+            .peers
+            .iter()
+            .find(|p| p.config.public_key == remote.public)
+            .expect("peer installed");
+        assert_eq!(installed.config.preshared_key, Some(Key([7; 32])));
+        assert_eq!(installed.stats.last_handshake_time, None::<SystemTime>);
+        let listed = Command::new("nft")
+            .args([
+                "list",
+                "table",
+                "inet",
+                &format!("innernet_pq_data_{}", interface.as_str_lossy()),
+            ])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&listed.stdout).contains("10.77.0.2"));
+
+        // No real handshake occurred yet: freshness must not be claimed.
+        assert!(!installer.handshake_fresh(&bundle).unwrap());
+
+        gate::clear(&interface).unwrap();
+        Device::get(&interface, Backend::Kernel)
+            .unwrap()
+            .delete()
+            .unwrap();
+    }
+}

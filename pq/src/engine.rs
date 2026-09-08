@@ -13,7 +13,13 @@ use crate::{
 
 /// Installs a candidate PSK and observes a fresh authenticated handshake.
 /// M3 models this; M4 replaces `FakeInstaller` with a real WireGuard-backed
-/// implementation without changing the engine that calls it.
+/// implementation (`client_core::pq_install::RealInstaller`) without
+/// changing the engine that calls it. A real implementation is expected to
+/// gate that peer's application traffic before `install` touches the
+/// kernel, and to release that gate as a side effect of `handshake_fresh`
+/// returning `true` -- the engine itself has no separate "release the
+/// gate" action, so this is the one point in the trait contract where a
+/// real installer's gate-release happens.
 pub trait Installer {
     fn install(&mut self, bundle: &Bundle, candidate: &Candidate) -> Result<()>;
     fn handshake_fresh(&mut self, bundle: &Bundle) -> Result<bool>;

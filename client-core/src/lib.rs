@@ -20,6 +20,7 @@ pub mod interface;
 pub mod management;
 mod nat;
 pub mod peer;
+pub mod pq_install;
 pub mod pq_sync;
 pub mod rest_client;
 
