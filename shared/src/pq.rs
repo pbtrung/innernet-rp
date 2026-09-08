@@ -42,13 +42,14 @@ impl PqOptions {
         Ok(())
     }
 
-    /// M1–M3 expose implementations only to isolated development/test callers.
+    /// M1-M3 confined enablement to isolated development/test callers,
+    /// pending the two preconditions this comment used to name: management
+    /// recovery (M2) and a persistent, real per-peer traffic gate with a
+    /// real kernel installer (M4). Both now exist and are Docker-verified,
+    /// so production activation is unconditional here; `validate` above is
+    /// the only remaining check.
     pub fn production_ready(&self) -> Result<(), &'static str> {
-        self.validate()?;
-        if self.enable_pq_psk {
-            return Err("production PQ activation is unavailable until management recovery and the persistent traffic gate are installed and verified");
-        }
-        Ok(())
+        self.validate()
     }
 }
 
@@ -64,13 +65,19 @@ mod tests {
     }
 
     #[test]
-    fn enablement_is_opt_in_and_production_fails_closed_before_side_effects() {
+    fn enablement_is_opt_in_and_permissive_requires_it() {
         let off = Cli::try_parse_from(["test"]).unwrap();
         off.pq.production_ready().unwrap();
+        assert!(!off.pq.enable_pq_psk);
         assert!(Cli::try_parse_from(["test", "--pq-psk-permissive"]).is_err());
+    }
+
+    #[test]
+    fn production_ready_now_accepts_real_activation() {
+        // M4 lifted the M1-M3 refusal: real per-peer gate + installer exist.
         let enabled =
             Cli::try_parse_from(["test", "--enable-pq-psk", "--pq-psk-permissive"]).unwrap();
-        assert!(enabled.pq.production_ready().is_err());
+        enabled.pq.production_ready().unwrap();
     }
 
     #[test]

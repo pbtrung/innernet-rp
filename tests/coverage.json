@@ -169,13 +169,16 @@
     {
       "design_case": 15,
       "unit": [
-        "enablement_is_opt_in_and_production_fails_closed_before_side_effects"
+        "enablement_is_opt_in_and_permissive_requires_it",
+        "production_ready_now_accepts_real_activation"
       ],
       "integration": [
         "pq_api_capability_readiness_and_atomic_registration"
       ],
-      "docker": [],
-      "status": "m1-api-storage-only"
+      "docker": [
+        "m4_smoke: --enable-pq-psk activates for real against a production build (no dev-harness feature)"
+      ],
+      "status": "m4-production-activation-lifted-and-gate-verified"
     },
     {
       "design_case": 16,
