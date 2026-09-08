@@ -57,6 +57,13 @@ fn durably_sent(remote: Option<&Exchange>, pending: &Pending, self_id: Number) -
     {
         return false;
     }
+    // The server's own terminal record (not our possibly-optimistic local
+    // mirror of it) subsumes any specific message check: reaching a
+    // terminal state server-side already required every necessary message,
+    // even one this side can no longer see post-compaction.
+    if exchange.decision.terminal() {
+        return true;
+    }
     match pending.outbox.last() {
         None => true,
         Some(last) => exchange
@@ -232,10 +239,12 @@ impl EndpointState {
             }
         }
 
-        // A terminal record may already be compacted (messages cleared), so
-        // there is nothing left to find there to confirm; reaching a locally
-        // terminal decision is itself the proof every step was accounted for.
-        if !pending.decision.terminal()
+        // Always re-check durability here, even if our own local decision
+        // already optimistically shows terminal: that local view can be
+        // ahead of what the server actually durably recorded (our own final
+        // message may have been lost), and only the server's own record
+        // (which durably_sent consults) is trustworthy proof of receipt.
+        if pending.decision.phase != Phase::Aborted
             && !durably_sent(remote, pending, self_id)
             && let Some(last) = pending.outbox.last()
         {
