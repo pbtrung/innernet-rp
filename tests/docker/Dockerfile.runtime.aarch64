@@ -1,0 +1,6 @@
+# M8: builds the workspace inside the aarch64 emulated-native image.
+# Reuses the pinned base/package snapshot from Dockerfile.build.aarch64 so
+# crypto/library versions match what this milestone recorded.
+FROM innernet-pq-build:aarch64
+COPY . /work
+RUN cargo build --workspace --locked

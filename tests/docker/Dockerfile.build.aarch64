@@ -1,0 +1,18 @@
+# M8: real aarch64 evidence via an emulated-native build (QEMU user-mode
+# under `docker buildx build --platform linux/arm64`), not host-to-target
+# cross-compilation -- cargo's host triple is aarch64 inside this image, so
+# pq/build.rs's plain pkg-config probe needs no cross-compilation-specific
+# sysroot plumbing. Arch Linux ARM packages the exact same leancrypto/
+# openssl/rust versions Dockerfile.build pins for x86_64. Unlike
+# archive.archlinux.org, Arch Linux ARM has no dated-snapshot mirror
+# service, so reproducibility here relies solely on the pinned base image
+# digest, not a frozen package-archive date; updating the digest requires
+# repeating crypto checks, same discipline as Dockerfile.build.
+FROM menci/archlinuxarm@sha256:a8d02c1dbaa387901a5ad89763d134163387ad329edce1f97678e9cadaf9eb15
+# Newer pacman's Landlock-based download sandbox isn't supported under
+# QEMU user-mode emulation (syscalls reach the host kernel, which may
+# lack Landlock or disagree with the emulated process's view of it).
+RUN sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
+RUN pacman -Syyu --noconfirm --needed base-devel rust leancrypto openssl sqlite python iproute2 nftables wireguard-tools procps-ng
+RUN pkg-config --modversion leancrypto openssl sqlite3 && rustc --version
+WORKDIR /work
