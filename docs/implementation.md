@@ -511,3 +511,110 @@ policy — explicitly M6 territory per milestones.md's own scoping); the
 idle-timeout/inactivity pause scheduling that reuses this driver loop (M5);
 and management PSK rotation's own full failure/recovery testing (M7 — M4
 only needs the already-provisioned M2 management link to remain usable).
+
+## M5 — Tunnel-inactivity pause and fair scheduling
+
+M5 is a scheduling-layer refinement, not a protocol change: don't start a
+*new* PSK rotation for a data peer whose tunnel has seen no traffic (not
+even a keepalive) for a while, resume promptly the moment traffic
+reappears, and make one peer's failure or backoff never block or crash
+progress on any other peer. Nothing about the exchange protocol, the gate,
+or the installer changes.
+
+`--pq-psk-idle-timeout` (default 900s) joins `PqOptions` following the
+exact existing pattern, with one different convention: `0` means "pausing
+disabled" (a valid value), not an error — unlike the rotation interval,
+which rejects `0`.
+
+`pq/src/state.rs`'s `Relationship` gains a durable `activity:
+Option<Activity>` field (`rx_bytes`, `tx_bytes`, `last_active_at`),
+`#[serde(default)]` so a pre-M5 persisted relationship — which under
+`deny_unknown_fields` would otherwise fail to deserialize — loads fine
+with `activity: None`, correctly meaning "never observed yet" and matching
+design 5.12's "first observation... counts as activity". A new
+`EndpointState::observe_activity` updates it: activity is "new" whenever
+the sampled counters differ *at all* from the stored baseline, covering
+both a genuine increase and a reset-to-a-different-value from peer
+recreation, without ever subtracting — sidestepping design 5.12's "never
+unsigned subtraction across a reset" concern entirely by never computing a
+delta magnitude, only equality.
+
+The engine stays pure. `EndpointState::reconcile` gains one new parameter,
+`idle_timeout: u64`, used only inside the existing initiator `due`
+computation: a repeat rotation is due only if the rotation interval
+elapsed *and* (idle_timeout is 0, or the relationship has no activity
+baseline yet, or activity was observed within idle_timeout). The engine
+never reads kernel counters itself — the caller samples them and calls
+`observe_activity` *before* `reconcile`, in the same cycle, which is what
+makes "resume promptly on the first poll observing traffic" (design 5.12)
+fall out for free: the just-updated `last_active_at` is what the `due`
+check sees. An unconfirmed (never-yet-completed) relationship is still
+always due, unconditionally — initial exchanges never pause.
+
+Also finally read for the first time: `Pending`'s `attempts`/
+`next_retry_at` fields, carried unused since M2. A new
+`EndpointState::note_send_failure` applies a bounded jittered backoff
+(1-60s, doubling per consecutive attempt) after a transport-send failure;
+the existing retry check gains `pending.next_retry_at <= now` as an
+additional condition. Every outbox push that represents real progress
+(Commit, Installed, Confirmed) resets `attempts`/`next_retry_at`, so a
+stale backoff from an earlier phase never delays a brand new message.
+
+`client-core/src/pq_sync.rs`'s `apply` no longer propagates a single
+relationship's failure (an `observe_remote` conflict, an engine error, a
+storage error, or a transport error) with `?`, aborting the entire cycle —
+each is now logged (`log::warn!`, never silently swallowed) and the loop
+moves on to the next peer. This was a real, previously-existing fragility,
+not a hypothetical one: a single bad request could kill the whole
+`up --daemon` process (observed firsthand while diagnosing M4's Docker
+bugs), directly violating design 5.12's "other peers remain independent"
+and "must not restart a daemon or block others". A transport send failure
+now also calls `note_send_failure` instead of hammering immediately next
+cycle. `apply`/`sync` gain `idle_timeout: u64` and `device:
+Option<&wireguard_control::Device>` parameters; when `device` is `Some`,
+each peer's real WireGuard byte counters are sampled via `observe_activity`
+before `reconcile`. `None` (M3's dev harness, the real-API integration
+test) skips sampling entirely, preserving their existing behavior
+unchanged. `client-core::interface::fetch()` passes the real kernel
+`Device` it already fetches for the ordinary peer diff — no second kernel
+read needed — and `pq.pq_psk_idle_timeout`.
+
+"Bounded shared workers" (design 5.12) needed no new concurrency
+primitives: it is already satisfied structurally by the server's existing
+semaphore-based admission control (M1, `server/src/pq.rs`'s
+`Limits`/`Permit`); the client side only needed to stop letting one peer's
+failure block reaching the others in the same sequential loop, which the
+fault-tolerant restructure above provides.
+
+Building the M5 Docker scenario surfaced a real constraint worth recording:
+this codebase's server applies one hardcoded persistent-keepalive interval
+(`shared::PERSISTENT_KEEPALIVE_INTERVAL_SECS`, 25s) to *every* peer, with no
+per-peer override anywhere in the schema or CLI. A genuinely
+keepalive-disabled, truly-idle tunnel therefore cannot be produced with
+real containers today. `tests/docker/scenarios/m5_inactivity.sh` instead
+proves the achievable real-kernel half of testing.md section 4.4 scenario
+7: with a short test-only rotation interval (15s) and an idle timeout set
+comfortably above the 25s keepalive (40s), both A-B and A-C complete two
+full rotation cycles on schedule through real kernel peers — the
+idle-pause mechanism, once wired into real activation, never throttles a
+healthy keepalive-carrying link, and A-C's independent progress throughout
+is the fair-scheduling control. The genuinely-idle-pauses/resumes-promptly
+half is instead covered at the engine unit-test level (a fixed simulated
+baseline, not a real kernel counter), which is where it must stay until a
+per-peer keepalive control exists.
+
+Tested on Linux x86_64, Arch Linux, 2026-09-08, Docker 29.7.2:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --workspace --locked` | all suites pass (pq: 4+17+1+12+2, including the 300-schedule property test; server: 54 + 1 explicitly ignored; client-core: 12 + 1 real-API integration test; shared: 8; wireguard-control: 12 + 1 explicitly ignored) |
+| `cargo clippy --workspace --locked --all-targets -- -D warnings` (default, and again with `--features pq-dev-harness,test-harness`) | passed both ways |
+| `bash tests/run.sh unit` / `integration` | passed |
+| `bash tests/run.sh docker-smoke` (`m2_management.sh` + `m3_exchange.sh` + `m4_smoke.sh` + `m4_crash.sh` + `m5_inactivity.sh`) | passed: M2/M3/M4 scenarios unaffected; M5's inactivity scenario passes with real kernel peers |
+
+Explicitly out of scope for M5: a real-kernel demonstration of a genuinely
+idle tunnel pausing and resuming (needs a per-peer persistent-keepalive
+control this codebase does not yet have — covered at the engine
+unit-test level instead, as described above); the numeric 300s/900s
+rotation/idle defaults are not re-validated here (M9's job); and mixed
+strict/permissive/legacy scheduling interactions stay M6 territory.

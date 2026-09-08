@@ -166,10 +166,22 @@
     },
     {
       "design_case": 13,
-      "unit": [],
-      "integration": [],
-      "docker": [],
-      "status": "planned"
+      "unit": [
+        "idle_timeout_defaults_and_accepts_zero_but_rejects_overflow",
+        "idle_timeout_pauses_a_repeat_rotation_and_resumes_promptly_on_activity",
+        "idle_timeout_zero_never_pauses",
+        "a_relationship_with_no_activity_baseline_yet_is_never_paused",
+        "send_failure_applies_a_bounded_jittered_backoff_before_retrying",
+        "observe_activity_records_first_observation_and_only_changed_samples",
+        "a_pre_m5_relationship_without_activity_deserializes_to_none"
+      ],
+      "integration": [
+        "one_relationships_failure_does_not_block_another_in_the_same_cycle"
+      ],
+      "docker": [
+        "m5_inactivity: real kernel peers complete two rotation cycles on schedule with the idle timeout active, unthrottled by healthy keepalive traffic; A-C rotates independently (fair scheduling). A genuinely idle real-kernel tunnel is not producible with this codebase's current uniform, non-per-peer keepalive interval -- that half is covered by the unit tests above, which simulate sampled counters directly"
+      ],
+      "status": "m5-idle-pause-and-fair-scheduling-verified-partial-real-kernel"
     },
     {
       "design_case": 14,
