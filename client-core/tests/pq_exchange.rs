@@ -112,7 +112,10 @@ fn drive(
     // pq_sync::sync drives every visible relationship; watch this pair's
     // outcome via the state it leaves behind rather than its own return
     // value, since a completed relationship simply stops needing action.
-    pq_sync::sync(transport, store, state, installer, &mut rng, now, 300).unwrap();
+    pq_sync::sync(
+        transport, store, state, installer, &mut rng, now, 300, 0, None,
+    )
+    .unwrap();
     if state.relationships[&other].confirmed.is_some()
         && state.relationships[&other].pending.is_none()
     {

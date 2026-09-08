@@ -464,6 +464,8 @@ fn pq_dev_rotate(
             &mut rng,
             now,
             rotation_interval,
+            0,
+            None,
         )?;
         if let Some(relationship) = state.relationships.get(&other_id) {
             if let Some(confirmed) = &relationship.confirmed {

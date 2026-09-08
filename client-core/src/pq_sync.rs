@@ -22,7 +22,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
-use wireguard_control::{InterfaceName, Key};
+use wireguard_control::{Device, InterfaceName, Key};
 
 pub type Page = StatePage<Peer, Cidr>;
 
@@ -209,6 +209,22 @@ fn exchange_for(exchanges: &[Exchange], self_id: Number, other: Number) -> Optio
 /// can fetch the peer directory once, build a real `Installer` from it
 /// (which needs each peer's endpoint/keepalive/allowed IP), then reconcile
 /// -- without a second network round trip of its own.
+///
+/// One relationship's failure (an observation conflict, an engine error, a
+/// storage error, or a transport error sending the outbox message) is
+/// logged and this loop moves on to the next peer instead of aborting the
+/// whole cycle: other peers must remain independent, and idle peers must
+/// not restart a daemon or block others (design 5.12). A transport send
+/// failure also records a bounded jittered backoff via
+/// `EndpointState::note_send_failure` so the retry does not hammer
+/// immediately next cycle.
+///
+/// `device`, when `Some`, is used to sample each peer's current WireGuard
+/// byte counters (via `EndpointState::observe_activity`) before
+/// reconciling, so `idle_timeout` can pause a repeat rotation for a
+/// genuinely inactive tunnel. `None` skips activity sampling entirely
+/// (matching pre-M5 behavior) -- used by callers with no real kernel
+/// `Device` to sample (M3's dev harness and tests).
 #[allow(clippy::too_many_arguments)]
 pub fn apply(
     peers: &[PeerState<Peer>],
@@ -220,6 +236,8 @@ pub fn apply(
     rng: &mut impl Random,
     now: u64,
     rotation_interval: u64,
+    idle_timeout: u64,
+    device: Option<&Device>,
 ) -> anyhow::Result<()> {
     let self_id = state.peer_id;
     let server_id = state.server_id;
@@ -237,24 +255,77 @@ pub fn apply(
         let Some(advertised) = &entry.pq else {
             continue;
         };
-        state.observe_remote(other, &advertised.bundle, advertised.lifecycle.clone())?;
+        if let Err(error) =
+            state.observe_remote(other, &advertised.bundle, advertised.lifecycle.clone())
+        {
+            log::warn!(
+                "observing peer {}'s advertised PQ bundle: {error}",
+                other.get()
+            );
+            continue;
+        }
+
+        if let Some(device) = device {
+            let counters = device
+                .peers
+                .iter()
+                .find(|p| p.config.public_key.to_base64() == entry.peer.public_key)
+                .map(|p| (p.stats.rx_bytes, p.stats.tx_bytes));
+            if let Some((rx_bytes, tx_bytes)) = counters {
+                if let Err(error) = state.observe_activity(other, now, rx_bytes, tx_bytes) {
+                    log::warn!("sampling tunnel activity for peer {}: {error}", other.get());
+                }
+            }
+        }
 
         let exchange = exchange_for(exchanges, self_id, other);
-        let action = state.reconcile(other, exchange, now, rotation_interval, 0, installer, rng)?;
-        store
-            .save(state)
-            .context("persisting PQ state before acting")?;
+        let action = match state.reconcile(
+            other,
+            exchange,
+            now,
+            rotation_interval,
+            idle_timeout,
+            installer,
+            rng,
+        ) {
+            Ok(action) => action,
+            Err(error) => {
+                log::warn!(
+                    "advancing the PQ exchange with peer {}: {error}",
+                    other.get()
+                );
+                continue;
+            },
+        };
+        if let Err(error) = store.save(state) {
+            log::warn!(
+                "persisting PQ state before acting on peer {}: {error}",
+                other.get()
+            );
+            continue;
+        }
 
         if let Action::Send(message) = action {
-            transport
-                .put_handshake(other, message.message_type, &message)
-                .map_err(|e| match e {
+            if let Err(error) = transport.put_handshake(other, message.message_type, &message) {
+                let error = match error {
                     TransportError::Conflict => anyhow::anyhow!(
                         "stale visibility revision while submitting a phase message"
                     ),
                     TransportError::Other(error) => error,
-                })
-                .context("submitting a signed phase message")?;
+                };
+                log::warn!(
+                    "submitting a signed phase message to peer {}: {error}",
+                    other.get()
+                );
+                if let Err(error) = state.note_send_failure(other, now, rng) {
+                    log::warn!("recording a send failure for peer {}: {error}", other.get());
+                } else if let Err(error) = store.save(state) {
+                    log::warn!(
+                        "persisting the retry backoff for peer {}: {error}",
+                        other.get()
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -264,6 +335,7 @@ pub fn apply(
 /// the fetched peer directory for anything else (M3's tests and dev
 /// harness); the real production path calls `fetch_state`/`apply`
 /// separately instead.
+#[allow(clippy::too_many_arguments)]
 pub fn sync(
     transport: &impl Transport,
     store: &mut Store,
@@ -272,6 +344,8 @@ pub fn sync(
     rng: &mut impl Random,
     now: u64,
     rotation_interval: u64,
+    idle_timeout: u64,
+    device: Option<&Device>,
 ) -> anyhow::Result<()> {
     let (peers, exchanges) = fetch_state(transport)?;
     apply(
@@ -284,5 +358,160 @@ pub fn sync(
         rng,
         now,
         rotation_interval,
+        idle_timeout,
+        device,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innernet_pq::{
+        api::{AdvertisedBundle, Lifecycle},
+        crypto::SystemRandom,
+        engine::FakeInstaller,
+        protocol::{Bundle, Number},
+        state::{Enrollment, Identity, ManagementLink, Policy},
+    };
+    use innernet_shared::PeerContents;
+    use std::cell::RefCell;
+
+    fn peer_state(id: u64, server_id: u64) -> (EndpointState, Bundle) {
+        let identity = Identity::generate(
+            Binary([id as u8; 32]),
+            Number::new(1).unwrap(),
+            &mut SystemRandom,
+        )
+        .unwrap();
+        let bundle = identity.bundle.clone();
+        let state = EndpointState {
+            network_id: Binary([9; 16]),
+            peer_id: Number::new(id).unwrap(),
+            server_id: Number::new(server_id).unwrap(),
+            server_public_key: Binary([1; 32]),
+            policy: Policy::Strict,
+            registration: Registration {
+                expected_revision: None,
+                pq_version: 1,
+                lifecycle: Lifecycle::Enabled,
+                bundle: bundle.clone(),
+                emergency: false,
+            },
+            identity,
+            enrollment: Enrollment::Advertised,
+            management: ManagementLink::generate(&mut SystemRandom).unwrap(),
+            relationships: BTreeMap::new(),
+        };
+        (state, bundle)
+    }
+
+    fn peer_entry(id: i64, ip: &str, bundle: Bundle) -> PeerState<Peer> {
+        PeerState {
+            peer: Peer {
+                id,
+                contents: PeerContents {
+                    name: "peer".parse().unwrap(),
+                    ip: ip.parse().unwrap(),
+                    cidr_id: 1,
+                    public_key: Key(bundle.wg_public_key.0).to_base64(),
+                    endpoint: None,
+                    persistent_keepalive_interval: None,
+                    is_admin: false,
+                    is_disabled: false,
+                    is_redeemed: true,
+                    invite_expires: None,
+                    candidates: vec![],
+                },
+            },
+            is_server: false,
+            pq: Some(AdvertisedBundle {
+                pq_version: 1,
+                lifecycle: Lifecycle::Enabled,
+                bundle,
+            }),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        sent: RefCell<Vec<Number>>,
+    }
+    impl Transport for RecordingTransport {
+        fn get_state(&self, _cursor: Option<&str>) -> Result<Page, TransportError> {
+            unreachable!("this test calls apply() directly with pre-fetched pages")
+        }
+        fn put_handshake(
+            &self,
+            other: Number,
+            _phase: u8,
+            _message: &Message,
+        ) -> Result<Exchange, TransportError> {
+            self.sent.borrow_mut().push(other);
+            Err(TransportError::Other(anyhow::anyhow!(
+                "test transport never actually delivers"
+            )))
+        }
+    }
+
+    #[test]
+    fn one_relationships_failure_does_not_block_another_in_the_same_cycle() {
+        let (mut state, _own_bundle) = peer_state(2, 1);
+        let (_, bundle_b) = peer_state(3, 1);
+        let (_, bundle_c) = peer_state(4, 1);
+        let b_id = Number::new(3).unwrap();
+        let c_id = Number::new(4).unwrap();
+
+        state
+            .observe_remote(b_id, &bundle_b, Lifecycle::Enabled)
+            .unwrap();
+        state
+            .observe_remote(c_id, &bundle_c, Lifecycle::Enabled)
+            .unwrap();
+
+        // Corrupt B's cached revision so this cycle's advertised bundle (an
+        // older revision) triggers a real observe_remote Conflict for B
+        // specifically, while C stays healthy.
+        state
+            .relationships
+            .get_mut(&b_id)
+            .unwrap()
+            .remote
+            .bundle_revision = Number::new(5).unwrap();
+
+        let peers = vec![
+            peer_entry(3, "10.0.0.3", bundle_b),
+            peer_entry(4, "10.0.0.4", bundle_c),
+        ];
+        let exchanges = vec![];
+        let transport = RecordingTransport::default();
+        let mut installer = FakeInstaller::default();
+        let mut rng = SystemRandom;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("state"), true).unwrap();
+
+        apply(
+            &peers,
+            &exchanges,
+            &transport,
+            &mut store,
+            &mut state,
+            &mut installer,
+            &mut rng,
+            0,
+            300,
+            0,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            state.relationships[&b_id].pending.is_none(),
+            "B's observe_remote conflict must not create a pending exchange"
+        );
+        assert_eq!(
+            *transport.sent.borrow(),
+            vec![c_id],
+            "only C's healthy relationship should have attempted to send"
+        );
+    }
 }

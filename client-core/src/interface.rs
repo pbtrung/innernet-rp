@@ -420,6 +420,8 @@ pub fn fetch(
             &mut rng,
             now,
             pq.pq_psk_rotation_interval,
+            0,
+            None,
         )
         .context("advancing PQ data-peer exchanges")?;
         pq_install::reconcile_gate(*interface, network_opts.backend, &state, &peers);
