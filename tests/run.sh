@@ -22,7 +22,14 @@ case "${1:-unit}" in
   aarch64)
     bash tests/docker/scenarios/aarch64_checks.sh
     ;;
-  docker-faults|compatibility|load)
+  docker-faults)
+    bash tests/docker/scenarios/m9_faults.sh
+    ;;
+  compatibility)
+    echo "Suite 'compatibility' is explicitly not applicable: this project has no old/new binary compatibility requirement (M6's scope decision)." >&2
+    exit 2
+    ;;
+  load)
     echo "Suite '$1' is not implemented yet; this is not a passing/skipped result." >&2
     exit 2
     ;;

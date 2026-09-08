@@ -1,0 +1,84 @@
+# M9 scenario: real response-level fault injection (design cases 4/5/7's
+# still-open real-kernel half) with real kernel peers. Same one-server/
+# three-data-peer topology M4 uses (A-B is the pair under fault, C is
+# testing.md's cooperating "A-C traffic/progress control"), reused because
+# the fault-injection relay only needs to sit in front of one peer's own
+# traffic -- see fault_proxy.py and peer-entrypoint-m9-fault.sh.
+services:
+  server:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    networks:
+      pq_m9:
+        ipv4_address: 10.91.0.2
+    volumes:
+      - server_config:/etc/innernet-server
+      - server_data:/var/lib/innernet-server
+      - invites:/invites
+      - ./scenarios/server-entrypoint-m9.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  peer-a:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m9:
+        ipv4_address: 10.91.0.3
+    volumes:
+      - peer_a_config:/etc/innernet
+      - peer_a_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m9.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-a"]
+
+  peer-b:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m9:
+        ipv4_address: 10.91.0.4
+    environment:
+      - FAULT_MODE=${FAULT_MODE:-}
+      - FAULT_MATCH=${FAULT_MATCH:-}
+      - FAULT_COUNT=${FAULT_COUNT:-1}
+    volumes:
+      - peer_b_config:/etc/innernet
+      - peer_b_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/fault_proxy.py:/fault_proxy.py:ro
+      - ./scenarios/peer-entrypoint-m9-fault.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-b"]
+
+  peer-c:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m9:
+        ipv4_address: 10.91.0.5
+    volumes:
+      - peer_c_config:/etc/innernet
+      - peer_c_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m9.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-c"]
+
+networks:
+  pq_m9:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.91.0.0/24
+
+volumes:
+  server_config:
+  server_data:
+  peer_a_config:
+  peer_a_data:
+  peer_b_config:
+  peer_b_data:
+  peer_c_config:
+  peer_c_data:
+  invites:
