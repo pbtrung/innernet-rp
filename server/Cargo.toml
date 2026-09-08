@@ -32,6 +32,11 @@ selinux = ["innernet-shared/selinux"]
 # API/session/db path without a real socket, root, or kernel WireGuard.
 # Never enabled in a normal build.
 test-harness = ["dep:tempfile"]
+# M3 Docker/dev-only: makes `serve` actually populate the PQ mailbox service
+# (Context.pq), which the real serve() never does otherwise -- production
+# activation stays refused regardless of any flag. Never enabled in a
+# normal build.
+pq-dev-harness = []
 
 [dependencies]
 anyhow = "1.0.104"

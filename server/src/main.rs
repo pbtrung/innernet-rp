@@ -159,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     pretty_env_logger::init();
     let opts = Opts::parse();
+    #[cfg(not(feature = "pq-dev-harness"))]
     opts.pq.production_ready()?;
 
     if unsafe { libc::getuid() } != 0 && !matches!(opts.command, Command::Completions { .. }) {

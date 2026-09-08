@@ -1,0 +1,62 @@
+# M3 scenario: one server, two data peers, each driving a real PQ rotation
+# against the other via the hidden pq-dev-harness subcommand (fake kernel
+# installer only -- M3 explicitly does not touch real WireGuard state; that
+# is M4's job). Separate network/addresses from M2's scenario so both can
+# coexist.
+services:
+  server:
+    image: innernet-pq-runtime:m3
+    cap_add: [NET_ADMIN]
+    networks:
+      pq_m3:
+        ipv4_address: 10.89.0.2
+    volumes:
+      - server_config:/etc/innernet-server
+      - server_data:/var/lib/innernet-server
+      - invites:/invites
+      - ./scenarios/server-entrypoint-m3.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  peer-a:
+    image: innernet-pq-runtime:m3
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m3:
+        ipv4_address: 10.89.0.3
+    volumes:
+      - peer_a_config:/etc/innernet
+      - peer_a_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m3.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-a", "3"]
+
+  peer-b:
+    image: innernet-pq-runtime:m3
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m3:
+        ipv4_address: 10.89.0.4
+    volumes:
+      - peer_b_config:/etc/innernet
+      - peer_b_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m3.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-b", "2"]
+
+networks:
+  pq_m3:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.89.0.0/24
+
+volumes:
+  server_config:
+  server_data:
+  peer_a_config:
+  peer_a_data:
+  peer_b_config:
+  peer_b_data:
+  invites:

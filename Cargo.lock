@@ -825,6 +825,7 @@ dependencies = [
  "dialoguer",
  "indoc",
  "innernet-client-core",
+ "innernet-pq",
  "innernet-shared",
  "log",
  "regex",

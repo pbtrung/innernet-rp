@@ -12,6 +12,7 @@ case "${1:-unit}" in
     ;;
   docker-smoke)
     bash tests/docker/scenarios/m2_management.sh
+    bash tests/docker/scenarios/m3_exchange.sh
     ;;
   docker-faults|compatibility|load)
     echo "Suite '$1' is not implemented yet; this is not a passing/skipped result." >&2

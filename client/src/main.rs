@@ -273,6 +273,21 @@ enum Command {
         #[clap(value_enum)]
         shell: clap_complete::Shell,
     },
+
+    /// Hidden M3 Docker/dev-only harness: registers a fresh PQ identity and
+    /// drives one data-peer rotation against `other_peer_id` with a fake
+    /// installer (no real WireGuard state), printing the resulting PSK on
+    /// success. Never available outside a `pq-dev-harness` feature build.
+    #[cfg(feature = "pq-dev-harness")]
+    #[clap(hide = true)]
+    PqDevRotate {
+        interface: Interface,
+        other_peer_id: i64,
+        #[clap(long, default_value = "30")]
+        timeout_secs: u64,
+        #[clap(long, default_value = "5")]
+        rotation_interval: u64,
+    },
 }
 
 fn install(
@@ -399,6 +414,112 @@ fn install(
         );
     }
     Ok(())
+}
+
+#[cfg(feature = "pq-dev-harness")]
+fn pq_dev_rotate(
+    opts: &Opts,
+    interface: &InterfaceName,
+    other_peer_id: i64,
+    timeout_secs: u64,
+    rotation_interval: u64,
+) -> Result<(), Error> {
+    use innernet_client_core::pq_sync;
+    use innernet_pq::{
+        api::{Lifecycle, Registration, StatePage},
+        crypto::SystemRandom,
+        engine::FakeInstaller,
+        protocol::{Binary, Number},
+        state::{EndpointState, Enrollment, Identity, ManagementLink, Policy},
+        store::Store,
+    };
+    use std::{collections::BTreeMap, time::Instant};
+
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config.server);
+    let public_key =
+        wireguard_control::Key::from_base64(&config.interface.private_key)?.get_public();
+
+    // Discover our own peer id, the server's id, and the network id from the
+    // opt-in PQ state response, before this side has ever registered a bundle.
+    let page: StatePage<Peer, Cidr> = rest_client.http("GET", "/user/state?pq_version=1")?;
+    let me = page
+        .peers
+        .iter()
+        .find(|p| p.peer.public_key == public_key.to_base64())
+        .ok_or_else(|| anyhow!("could not find this peer's own entry in the visible state"))?;
+    let server_entry = page
+        .peers
+        .iter()
+        .find(|p| p.is_server)
+        .ok_or_else(|| anyhow!("could not find the server's entry in the visible state"))?;
+    let self_id = Number::new(me.peer.id as u64).map_err(|_| anyhow!("invalid self peer id"))?;
+    let server_id =
+        Number::new(server_entry.peer.id as u64).map_err(|_| anyhow!("invalid server peer id"))?;
+    let other_id =
+        Number::new(other_peer_id as u64).map_err(|_| anyhow!("invalid other peer id"))?;
+
+    let mut rng = SystemRandom;
+    let identity = Identity::generate(
+        Binary(public_key.0),
+        Number::new(1).map_err(|_| anyhow!("invalid revision"))?,
+        &mut rng,
+    )?;
+    let mut state = EndpointState {
+        network_id: page.network_id,
+        peer_id: self_id,
+        server_id,
+        server_public_key: Binary([0; 32]),
+        policy: Policy::Strict,
+        registration: Registration {
+            expected_revision: None,
+            pq_version: 1,
+            lifecycle: Lifecycle::Enabled,
+            bundle: identity.bundle.clone(),
+            emergency: false,
+        },
+        identity,
+        enrollment: Enrollment::Advertised,
+        management: ManagementLink::generate(&mut rng)?,
+        relationships: BTreeMap::new(),
+    };
+    let _: innernet_pq::api::AdvertisedBundle =
+        rest_client.http_form("PUT", "/user/pq-keys", &state.registration)?;
+
+    let mut store = Store::open(
+        &opts.data_dir.join(format!("{interface}.pq-dev-harness")),
+        true,
+    )?;
+    store.save(&state)?;
+    let mut installer = FakeInstaller::default();
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        pq_sync::sync(
+            &rest_client,
+            &mut store,
+            &mut state,
+            &mut installer,
+            &mut rng,
+            now,
+            rotation_interval,
+        )?;
+        if let Some(relationship) = state.relationships.get(&other_id) {
+            if let Some(confirmed) = &relationship.confirmed {
+                let psk: [u8; 32] = *confirmed.psk.0 .0;
+                let hex: String = psk.iter().map(|b| format!("{b:02x}")).collect();
+                println!("PQ_PSK={hex}");
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("PQ rotation with peer {other_peer_id} did not complete within {timeout_secs}s");
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn up(
@@ -1152,7 +1273,13 @@ fn main() {
 }
 
 fn run(opts: &Opts) -> Result<(), Error> {
-    opts.pq.production_ready().map_err(|e| anyhow!(e))?;
+    #[cfg(feature = "pq-dev-harness")]
+    let is_dev_harness = matches!(opts.command, Some(Command::PqDevRotate { .. }));
+    #[cfg(not(feature = "pq-dev-harness"))]
+    let is_dev_harness = false;
+    if !is_dev_harness {
+        opts.pq.production_ready().map_err(|e| anyhow!(e))?;
+    }
     let command = opts.command.clone().unwrap_or(Command::Show {
         short: false,
         tree: false,
@@ -1160,6 +1287,19 @@ fn run(opts: &Opts) -> Result<(), Error> {
     });
 
     match command {
+        #[cfg(feature = "pq-dev-harness")]
+        Command::PqDevRotate {
+            interface,
+            other_peer_id,
+            timeout_secs,
+            rotation_interval,
+        } => pq_dev_rotate(
+            opts,
+            &interface,
+            other_peer_id,
+            timeout_secs,
+            rotation_interval,
+        )?,
         Command::Install {
             invite,
             listen_port,

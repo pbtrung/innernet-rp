@@ -30,6 +30,7 @@ dialoguer.workspace = true
 indoc = "2.0.7"
 innernet-shared = { version = "2.0.0", path = "../shared" }
 innernet-client-core = { version = "2.0.0", path = "../client-core" }
+innernet-pq = { version = "0.1.0", path = "../pq" }
 log = "0.4.34"
 regex = { version = "1.13.1", default-features = false, features = ["std"] }
 ureq = { version = "3.4.1", default-features = false, features = ["json"] }
@@ -37,6 +38,11 @@ wireguard-control = { version = "2.0.0", path = "../wireguard-control" }
 
 [features]
 selinux = ["innernet-shared/selinux"]
+# A hidden, non-interactive subcommand for Docker/M3 evidence: drives one
+# data-peer PQ rotation with a FakeInstaller (no real WireGuard state), the
+# only way to exercise --enable-pq-psk's gated identity/exchange code
+# before M4. Never enabled in a normal build.
+pq-dev-harness = []
 
 [package.metadata.deb]
 assets = [

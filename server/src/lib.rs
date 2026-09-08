@@ -596,13 +596,24 @@ pub async fn serve(
         spawn_hostfile_writer(db.clone(), interface, hosts_opts);
     }
 
+    #[cfg(feature = "pq-dev-harness")]
+    let pq = Some(Arc::new(pq::Service::new(pq::Limits {
+        peer_rate: 1000,
+        peer_burst: 1000,
+        global_rate: 2000,
+        global_burst: 2000,
+        ..Default::default()
+    })?));
+    #[cfg(not(feature = "pq-dev-harness"))]
+    let pq = None;
+
     let context = Context {
         db,
         endpoints,
         interface,
         public_key,
         backend: network.backend,
-        pq: None,
+        pq,
         management: management_psks,
     };
 
