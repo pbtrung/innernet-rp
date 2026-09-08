@@ -1,0 +1,91 @@
+# M9 scenario: design case 10, the trusted-directory limitation. Real
+# kernel peers: peer-attacker registers a real, legitimately-generated PQ
+# bundle (the attacker's own keypair, which it genuinely controls);
+# peer-target installs (becoming visible in the directory -- an
+# unredeemed invite's peer_id is entirely invisible to other peers,
+# confirmed while building this scenario) but never enables PQ, so its
+# own bundle slot stays empty; the server's directory is then made to
+# attribute peer-attacker's real bundle to peer-target's now-visible
+# identity slot; peer-observer enrolls fresh afterward and, on its very
+# first view of the network, sees the substituted directory entry with no
+# way to detect the substitution. See docs/design.md section 7.2 case 10
+# and section 4's trust-model discussion.
+services:
+  server:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    networks:
+      pq_m9d:
+        ipv4_address: 10.94.0.2
+    volumes:
+      - server_config:/etc/innernet-server
+      - server_data:/var/lib/innernet-server
+      - invites:/invites
+      - ./scenarios/server-entrypoint-m9-directory.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  peer-attacker:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m9d:
+        ipv4_address: 10.94.0.3
+    environment:
+      - NET=pqm9d
+    volumes:
+      - peer_attacker_config:/etc/innernet
+      - peer_attacker_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m9.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-attacker"]
+
+  peer-target:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m9d:
+        ipv4_address: 10.94.0.5
+    environment:
+      - NET=pqm9d
+    volumes:
+      - peer_target_config:/etc/innernet
+      - peer_target_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m9-plain.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-target"]
+
+  peer-observer:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m9d:
+        ipv4_address: 10.94.0.4
+    environment:
+      - NET=pqm9d
+    volumes:
+      - peer_observer_config:/etc/innernet
+      - peer_observer_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m9.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-observer"]
+
+networks:
+  pq_m9d:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.94.0.0/24
+
+volumes:
+  server_config:
+  server_data:
+  peer_attacker_config:
+  peer_attacker_data:
+  peer_target_config:
+  peer_target_data:
+  peer_observer_config:
+  peer_observer_data:
+  invites:

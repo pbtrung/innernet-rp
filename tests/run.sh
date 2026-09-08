@@ -24,6 +24,7 @@ case "${1:-unit}" in
     ;;
   docker-faults)
     bash tests/docker/scenarios/m9_faults.sh
+    bash tests/docker/scenarios/m9_directory.sh
     ;;
   compatibility)
     echo "Suite 'compatibility' is explicitly not applicable: this project has no old/new binary compatibility requirement (M6's scope decision)." >&2

@@ -1,6 +1,11 @@
 #!/bin/sh
-# M9 Docker scenario: plain peer side (no fault injection). Installs, then
-# runs real production --enable-pq-psk, same as M4's peers.
+# M9 Docker scenario (design case 10): peer-target's entrypoint. Installs
+# (redeeming its invite, becoming visible to other peers -- an unredeemed
+# invite's peer_id is entirely invisible in the directory, confirmed while
+# building this scenario) but never passes --enable-pq-psk, so it never
+# registers a real PQ bundle of its own. This is exactly the "no real
+# bundle exists yet for this now-visible peer_id" precondition
+# m9_directory.sh needs before substituting one via direct database edit.
 set -eu
 BIN=/work/target/debug/innernet
 NET="${NET:-pqm9}"
@@ -28,10 +33,4 @@ if [ ! -f "/etc/innernet/${NET}.conf" ]; then
     done
 fi
 
-(
-    until ip -4 addr show "$NET" 2>/dev/null | grep -q 'inet '; do sleep 1; done
-    exec python3 -m http.server 8080 >/dev/null 2>&1
-) &
-
-exec "$BIN" up --enable-pq-psk --pq-psk-rotation-interval 10 --daemon --interval 2 \
-    --no-write-hosts "$NET"
+exec "$BIN" up --daemon --interval 2 --no-write-hosts "$NET"
