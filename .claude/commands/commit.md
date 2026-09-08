@@ -7,14 +7,13 @@ description: Commit staged/modified changes with a detailed message and push, no
 ## Steps
 
 1. Run `git status` and `git diff` (and `git diff --staged` if anything is already staged) to see all changes.
-2. Lint, typecheck, and format whatever's actually touched, before staging anything (mirrors `.github/workflows/rust.yml`):
+2. Lint, typecheck, and format whatever's actually touched, before staging anything (this project's own local convention -- there is no CI):
    - Any `*.rs` (or `Cargo.toml`) changed: `cargo +nightly fmt --all`, then
      `cargo clippy --workspace --locked --all-targets -- -D warnings`, then
      `cargo test --workspace --locked`.
-     - CI's `fmt` job runs on the `nightly` toolchain (required for the
-       `imports_granularity = "Crate"` option in `rustfmt.toml`); use
-       `cargo +nightly fmt` if nightly is installed, otherwise plain
-       `cargo fmt` and note that CI may reformat differently.
+     - `imports_granularity = "Crate"` in `rustfmt.toml` requires the
+       `nightly` toolchain; use `cargo +nightly fmt` if nightly is
+       installed, otherwise plain `cargo fmt`.
      - If IPv6-related code changed, also run
        `cargo test --workspace --locked --features v6-test`.
    - If formatting rewrote a file, or any check reports an error, fix it and
