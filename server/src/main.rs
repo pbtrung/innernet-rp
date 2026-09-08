@@ -143,6 +143,12 @@ enum Command {
         adopted_psks: Option<PathBuf>,
     },
 
+    /// Enable post-quantum data-peer PSKs for an existing network. Requires
+    /// `require-management` to have already run for this network, so an
+    /// independent recovery channel exists before any data PSK is
+    /// exchanged.
+    EnablePq { interface: Interface },
+
     /// Generate shell completion scripts
     Completions {
         #[clap(value_enum)]
@@ -215,6 +221,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "    Transfer each peer-<id>.management.json confidentially and out of band, \
                  then restart `serve` to install the traffic policy.",
+            );
+        },
+        Command::EnablePq { interface } => {
+            innernet_server::enable_pq(&interface, &conf)?;
+            println!(
+                "{} post-quantum data-peer PSKs are now enabled for {}.",
+                "[*]".dimmed(),
+                interface
             );
         },
         Command::Completions { shell } => {

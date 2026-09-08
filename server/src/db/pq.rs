@@ -41,6 +41,27 @@ pub fn set_management_ready(conn: &Connection, ready: bool) -> Result<(), Server
     Ok(())
 }
 
+/// Enables the post-quantum data-peer PSK mailbox for this network. Refuses
+/// before the management-only link is already required and ready: real
+/// production activation must never claim strict data-peer protection
+/// without an already-independent recovery channel in place first (design
+/// 5.3/5.10; the milestones.md preamble's "management-link provisioning
+/// moves into M2 so that recovery is available before M4 applies any data
+/// PSK"). `enabled` alone does not make `db::pq::ready()` true: that also
+/// requires a registered, non-disabled server peer.
+pub fn enable(conn: &Connection) -> Result<(), ServerError> {
+    let management_ready: bool = conn.query_row(
+        "SELECT management_ready FROM pq_network WHERE singleton = 1",
+        [],
+        |r| r.get(0),
+    )?;
+    if !management_ready {
+        return Err(ServerError::InvalidQuery);
+    }
+    conn.execute("UPDATE pq_network SET enabled = 1 WHERE singleton = 1", [])?;
+    Ok(())
+}
+
 /// Infer a migrated server role only from both the persisted private-key public
 /// identity and address, never from the numeric peer ID.
 pub fn identify_server(

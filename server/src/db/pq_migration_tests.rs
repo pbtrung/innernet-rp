@@ -124,6 +124,24 @@ fn pq_stable_peer_ids_server_role_and_revision_overflow_fail_closed() {
 }
 
 #[test]
+fn pq_enable_requires_management_ready_first_and_then_makes_ready_true() {
+    let server = crate::test::Server::new().unwrap();
+    let conn = server.db.lock();
+    assert!(!pq::ready(&conn).unwrap());
+    assert!(pq::enable(&conn).is_err());
+    assert!(!pq::ready(&conn).unwrap());
+
+    pq::set_management_ready(&conn, true).unwrap();
+    assert!(!pq::ready(&conn).unwrap()); // enabled is still 0.
+    pq::enable(&conn).unwrap();
+    assert!(pq::ready(&conn).unwrap());
+
+    // Idempotent: enabling again is a safe no-op.
+    pq::enable(&conn).unwrap();
+    assert!(pq::ready(&conn).unwrap());
+}
+
+#[test]
 fn pq_migrated_server_role_uses_identity_not_peer_number() {
     let dir = tempfile::tempdir().unwrap();
     let conn = legacy(&dir.path().join("server-99.db"), 2);

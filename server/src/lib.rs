@@ -323,6 +323,15 @@ pub fn enable_or_disable_peer(
     Ok(())
 }
 
+/// Enables the post-quantum data-peer PSK mailbox (`--enable-pq-psk` support)
+/// for this network. Requires `require-management` to have already run:
+/// `db::pq::enable` refuses otherwise.
+pub fn enable_pq(interface: &InterfaceName, conf: &ServerConfig) -> Result<(), Error> {
+    let conn = open_database_connection(interface, conf)?;
+    db::pq::enable(&conn)?;
+    Ok(())
+}
+
 pub fn add_cidr(
     interface: &InterfaceName,
     conf: &ServerConfig,
@@ -596,6 +605,12 @@ pub async fn serve(
         spawn_hostfile_writer(db.clone(), interface, hosts_opts);
     }
 
+    // Always constructed: `pq_network.enabled` (default 0, set only by
+    // `enable-pq`, itself requiring `require-management` first) is the
+    // actual production gate `db::pq::ready()` checks -- constructing this
+    // service unconditionally only makes that check meaningful for a
+    // network that opts in; it never bypasses it (api::user::capabilities
+    // and api::pq::page both still require db::pq::ready()).
     #[cfg(feature = "pq-dev-harness")]
     let pq = Some(Arc::new(pq::Service::new(pq::Limits {
         peer_rate: 1000,
@@ -605,7 +620,7 @@ pub async fn serve(
         ..Default::default()
     })?));
     #[cfg(not(feature = "pq-dev-harness"))]
-    let pq = None;
+    let pq = Some(Arc::new(pq::Service::new(pq::Limits::default())?));
 
     let context = Context {
         db,

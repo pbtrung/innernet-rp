@@ -173,7 +173,8 @@
         "production_ready_now_accepts_real_activation"
       ],
       "integration": [
-        "pq_api_capability_readiness_and_atomic_registration"
+        "pq_api_capability_readiness_and_atomic_registration",
+        "pq_enable_requires_management_ready_first_and_then_makes_ready_true"
       ],
       "docker": [
         "m4_smoke: --enable-pq-psk activates for real against a production build (no dev-harness feature)"
