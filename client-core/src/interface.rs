@@ -202,7 +202,20 @@ pub fn fetch(
 
     // Restores the management PSK across a restart, before the interface is
     // (re)configured. Never a data-peer PSK: those are unrelated to this link.
-    let management_psk = crate::management::load(data_dir, interface)?.map(|e| *e.psk.bytes());
+    let loaded_management = crate::management::load(data_dir, interface)?;
+    // Fail closed (design case 16's "missing secrets block startup"): if
+    // this network requires management (recorded durably in the interface
+    // config at redemption time) but the private store returned nothing --
+    // lost, corrupted-and-removed, or never adopted -- never silently bring
+    // up an unprotected server link.
+    if config.server.management.is_some() && loaded_management.is_none() {
+        bail!(
+            "this network requires a management link but its private state is missing; \
+             independent recovery is required before {} can start",
+            interface
+        );
+    }
+    let management_psk = loaded_management.map(|e| *e.psk.bytes());
     // Cached peer directory, needed even before the interface exists: the
     // coordination API is reachable only through this very tunnel, so a
     // cold-boot gate restoration cannot fetch a fresh directory and must
