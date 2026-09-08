@@ -333,6 +333,7 @@ fn install(
             nat_opts,
             &interface_name,
             true,
+            &opts.pq,
         )
         .is_ok()
         {
@@ -501,6 +502,7 @@ fn up(
                 nat_opts,
                 &interface,
                 true,
+                &opts.pq,
             )?;
         }
 
@@ -1282,6 +1284,7 @@ fn run(opts: &Opts) -> Result<(), Error> {
                 &nat,
                 &interface,
                 false,
+                &opts.pq,
             )?;
         },
         Command::Up {

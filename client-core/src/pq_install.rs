@@ -12,10 +12,62 @@
 //! instance -- never a stale one carried over from before the rotation.
 use crate::gate;
 use innernet_pq::{
-    crypto::Candidate, engine::Installer, protocol::Bundle, Error as PqError, Result as PqResult,
+    crypto::Candidate, engine::Installer, protocol::Bundle, state::EndpointState, Error as PqError,
+    Result as PqResult,
 };
 use innernet_shared::{peer_allowed_ip, Peer};
-use wireguard_control::{Backend, Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
+use wireguard_control::{
+    AllowedIp, Backend, Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder,
+};
+
+/// Finds the `Peer` directory entry matching a PQ bundle's own WireGuard
+/// public key. Shared by `RealInstaller` and the standalone gate helpers
+/// below, so every kernel/gate action agrees on the same lookup.
+fn find_peer<'a>(peers: &'a [Peer], bundle: &Bundle) -> Option<&'a Peer> {
+    let key = Key(bundle.wg_public_key.0).to_base64();
+    peers.iter().find(|p| p.public_key == key)
+}
+
+/// The allowed IP for every relationship this state knows about, resolved
+/// against `peers` (a cached or freshly fetched directory). Used to seed
+/// the data gate before any peer gets a kernel entry again -- at cold boot
+/// this must rely on a locally cached directory, since the coordination API
+/// is reachable only through the very tunnel being restored.
+pub fn blocked_allowed_ips(state: &EndpointState, peers: &[Peer]) -> Vec<AllowedIp> {
+    state
+        .relationships
+        .values()
+        .filter_map(|relationship| find_peer(peers, &relationship.remote))
+        .map(peer_allowed_ip)
+        .collect()
+}
+
+/// Re-verifies the gate for every already-confirmed, no-pending
+/// relationship: a cold boot closes every gate regardless of prior
+/// confirmation (nftables state does not survive a reboot), and a merely
+/// steady-state relationship never otherwise passes back through
+/// `engine::reconcile`'s `Committed` arm to trigger a release. Reuses
+/// `RealInstaller::handshake_fresh`'s exact kernel-read-and-release logic
+/// rather than duplicating it; safe to call every tick; errors for one
+/// relationship (an unknown peer, an unreachable device) are logged and do
+/// not block reconciling the others, since a closed gate is the fail-closed
+/// default.
+pub fn reconcile_gate(
+    interface: InterfaceName,
+    backend: Backend,
+    state: &EndpointState,
+    peers: &[Peer],
+) {
+    let mut installer = RealInstaller::new(interface, backend, peers);
+    for relationship in state.relationships.values() {
+        if relationship.pending.is_some() || relationship.confirmed.is_none() {
+            continue;
+        }
+        if let Err(error) = installer.handshake_fresh(&relationship.remote) {
+            log::warn!("checking gate release for a confirmed PQ relationship: {error}");
+        }
+    }
+}
 
 /// Borrows the just-fetched peer directory so it never needs a second
 /// network round trip to find a peer's endpoint/keepalive/allowed IP.
@@ -35,11 +87,7 @@ impl<'a> RealInstaller<'a> {
     }
 
     fn find_peer(&self, bundle: &Bundle) -> PqResult<&Peer> {
-        let key = Key(bundle.wg_public_key.0).to_base64();
-        self.peers
-            .iter()
-            .find(|p| p.public_key == key)
-            .ok_or(PqError::Installer)
+        find_peer(self.peers, bundle).ok_or(PqError::Installer)
     }
 }
 

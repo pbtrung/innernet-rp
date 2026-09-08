@@ -18,10 +18,48 @@ use innernet_pq::{
     store::Store,
 };
 use innernet_shared::{Cidr, Peer};
-use std::collections::BTreeMap;
-use wireguard_control::Key;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+use wireguard_control::{InterfaceName, Key};
 
 pub type Page = StatePage<Peer, Cidr>;
+
+/// Where this interface's PQ activation state (identity, management link,
+/// data-peer relationships) is persisted. Distinct from both the client's
+/// management-link store (`crate::management`, `.client-pq`) and M3's dev
+/// harness store (`.pq-dev-harness`), which never runs alongside real
+/// activation.
+pub fn path(data_dir: &Path, interface: &InterfaceName) -> PathBuf {
+    data_dir.join(format!("{interface}.pq"))
+}
+
+/// Opens this interface's PQ activation state, registering a fresh identity
+/// with the server on first-ever activation. Requires the coordination API
+/// to be reachable, so this must run only after the interface is confirmed
+/// up (never called for gate restoration at cold boot, which relies solely
+/// on already-persisted/cached state instead).
+pub fn open_or_register(
+    data_dir: &Path,
+    interface: &InterfaceName,
+    rest_client: &RestClient,
+    own_public_key: Binary<32>,
+    rng: &mut impl Random,
+) -> anyhow::Result<(Store, EndpointState)> {
+    let mut store =
+        Store::open(&path(data_dir, interface), true).context("opening PQ activation state")?;
+    let state = if store.is_fresh() {
+        let state = register(rest_client, own_public_key, rng)?;
+        store
+            .save(&state)
+            .context("persisting freshly registered PQ state")?;
+        state
+    } else {
+        store.load().context("loading PQ activation state")?
+    };
+    Ok((store, state))
+}
 
 pub enum TransportError {
     /// The visibility revision changed mid-walk; restart pagination.

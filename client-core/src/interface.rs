@@ -3,18 +3,30 @@ pub use wireguard_control::InterfaceName;
 
 use crate::{
     data_store::DataStore,
+    gate,
     nat::{self, NatTraverse},
+    pq_install::{self, RealInstaller},
+    pq_sync,
     rest_client::{RestClient, RestError},
     HostsOpts, NatOpts, NetworkOpts, WrappedIoError,
 };
-use anyhow::{bail, Context as _, Error};
+use anyhow::{anyhow, bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
+use innernet_pq::{crypto::SystemRandom, protocol::Binary, store::Store};
 use innernet_shared::{
-    get_local_addrs, update_hosts_file,
+    get_local_addrs,
+    pq::PqOptions,
+    update_hosts_file,
     wg::{self, DeviceExt as _},
     Endpoint, PeerChange, PeerDiff, RedeemContents, State, REDEEM_TRANSITION_WAIT,
 };
-use std::{io, net::SocketAddr, path::Path, thread, time::Instant};
+use std::{
+    io,
+    net::SocketAddr,
+    path::Path,
+    thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 use wireguard_control::{Backend, Device, DeviceUpdate, PeerConfigBuilder};
 
@@ -169,6 +181,7 @@ fn update_keypair(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn fetch(
     config_dir: &Path,
     data_dir: &Path,
@@ -177,6 +190,7 @@ pub fn fetch(
     nat: &NatOpts,
     interface: &InterfaceName,
     bring_up_interface: bool,
+    pq: &PqOptions,
 ) -> Result<(), Error> {
     let config = InterfaceConfig::from_interface(config_dir, interface)?;
     let interface_up = interface_is_up(network_opts.backend, interface);
@@ -184,6 +198,12 @@ pub fn fetch(
     // Restores the management PSK across a restart, before the interface is
     // (re)configured. Never a data-peer PSK: those are unrelated to this link.
     let management_psk = crate::management::load(data_dir, interface)?.map(|e| *e.psk.bytes());
+    // Cached peer directory, needed even before the interface exists: the
+    // coordination API is reachable only through this very tunnel, so a
+    // cold-boot gate restoration cannot fetch a fresh directory and must
+    // rely on what was already cached from the last successful fetch.
+    let mut store = DataStore::open_or_create(data_dir, interface)?;
+    let pq_path = pq_sync::path(data_dir, interface);
 
     if !interface_up {
         if !bring_up_interface {
@@ -191,6 +211,21 @@ pub fn fetch(
                 "Interface is not up. Use 'innernet up {}' instead",
                 interface
             );
+        }
+
+        // Restore the data-traffic gate before any peer (confirmed or not)
+        // gets a kernel entry again: nftables state does not survive a
+        // reboot, so "existing sessions cannot bypass it" requires this to
+        // run before wg::up(), not after. A never-yet-activated interface
+        // (no PQ store on disk) has no relationship to protect yet.
+        if pq.enable_pq_psk && std::fs::symlink_metadata(&pq_path).is_ok() {
+            let mut pq_store =
+                Store::open(&pq_path, false).context("opening PQ activation state")?;
+            let state: innernet_pq::state::EndpointState =
+                pq_store.load().context("loading PQ activation state")?;
+            let blocked = pq_install::blocked_allowed_ips(&state, store.peers());
+            gate::apply_all(interface, &blocked)
+                .map_err(|e| anyhow!("restoring the PQ data-traffic gate on boot: {e}"))?;
         }
 
         log::info!(
@@ -222,7 +257,6 @@ pub fn fetch(
         "fetching state for {} from server...",
         interface.as_str_lossy().yellow()
     );
-    let mut store = DataStore::open_or_create(data_dir, interface)?;
     let rest_client = RestClient::new(&config.server);
     let (State { mut peers, cidrs }, server_is_reachable) = match rest_client
         .http("GET", "/user/state")
@@ -306,6 +340,48 @@ pub fn fetch(
         log::info!("{}", "peers are already up to date".green());
     }
     let interface_updated_time = Instant::now();
+
+    // Peers (including any already-Confirmed PQ relationship's PSK) are now
+    // live; advance every visible PQ relationship by one step against the
+    // real kernel, then re-verify the gate for any already-confirmed,
+    // no-pending relationship (needed even outside an active rotation: a
+    // cold boot closes every gate above, and a merely-confirmed
+    // relationship still needs one fresh post-boot handshake before its
+    // gate reopens, since the gate itself did not survive the reboot).
+    if pq.enable_pq_psk && server_is_reachable {
+        let public_key = wireguard_control::Key::from_base64(&config.interface.private_key)
+            .map_err(|e| anyhow!("parsing this interface's own public key: {e}"))?
+            .get_public();
+        let mut rng = SystemRandom;
+        let (mut pq_store, mut state) = pq_sync::open_or_register(
+            data_dir,
+            interface,
+            &rest_client,
+            Binary(public_key.0),
+            &mut rng,
+        )
+        .context("opening or registering PQ activation state")?;
+        let (pq_peers, exchanges) =
+            pq_sync::fetch_state(&rest_client).context("fetching PQ exchange state")?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut installer = RealInstaller::new(*interface, network_opts.backend, &peers);
+        pq_sync::apply(
+            &pq_peers,
+            &exchanges,
+            &rest_client,
+            &mut pq_store,
+            &mut state,
+            &mut installer,
+            &mut rng,
+            now,
+            pq.pq_psk_rotation_interval,
+        )
+        .context("advancing PQ data-peer exchanges")?;
+        pq_install::reconcile_gate(*interface, network_opts.backend, &state, &peers);
+    }
 
     store
         .update_peers_and_set_cidrs(&peers, cidrs)
