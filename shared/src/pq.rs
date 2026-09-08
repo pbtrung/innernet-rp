@@ -1,7 +1,7 @@
 //! Feature policy is checked before key generation, requests, or kernel changes.
 use clap::Args;
 
-#[derive(Args, Clone, Debug, Default)]
+#[derive(Args, Clone, Debug)]
 pub struct PqOptions {
     /// Enable authenticated post-quantum data PSKs (requires provisioned recovery).
     #[arg(long, global = true)]
@@ -9,6 +9,21 @@ pub struct PqOptions {
     /// Permit entirely legacy peers, but never silently downgrade a PQ relationship.
     #[arg(long, global = true, requires = "enable_pq_psk")]
     pub pq_psk_permissive: bool,
+    /// Target cadence between completed data-peer PSK rotations, in seconds.
+    /// Meaningful only on data clients; the server never reads it. A short
+    /// interval never supersedes pending work: this is a target, not an SLA.
+    #[arg(long, global = true, default_value = "300")]
+    pub pq_psk_rotation_interval: u64,
+}
+
+impl Default for PqOptions {
+    fn default() -> Self {
+        Self {
+            enable_pq_psk: false,
+            pq_psk_permissive: false,
+            pq_psk_rotation_interval: 300,
+        }
+    }
 }
 
 impl PqOptions {
@@ -18,6 +33,11 @@ impl PqOptions {
         }
         if self.enable_pq_psk && !cfg!(target_os = "linux") {
             return Err("PQ PSKs are supported only on Linux");
+        }
+        // A generous bound, not a claim of realistic use: comfortably below
+        // any value that could overflow later monotonic-clock arithmetic.
+        if self.pq_psk_rotation_interval == 0 || self.pq_psk_rotation_interval > u64::MAX / 4 {
+            return Err("--pq-psk-rotation-interval must be positive and non-overflowing");
         }
         Ok(())
     }
@@ -51,5 +71,33 @@ mod tests {
         let enabled =
             Cli::try_parse_from(["test", "--enable-pq-psk", "--pq-psk-permissive"]).unwrap();
         assert!(enabled.pq.production_ready().is_err());
+    }
+
+    #[test]
+    fn rotation_interval_defaults_and_rejects_zero_or_overflow() {
+        let default = Cli::try_parse_from(["test"]).unwrap();
+        assert_eq!(default.pq.pq_psk_rotation_interval, 300);
+        default.pq.validate().unwrap();
+        assert!(
+            Cli::try_parse_from(["test", "--pq-psk-rotation-interval", "0"])
+                .unwrap()
+                .pq
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["test", "--pq-psk-rotation-interval", &u64::MAX.to_string()])
+                .unwrap()
+                .pq
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["test", "--pq-psk-rotation-interval", "1"])
+                .unwrap()
+                .pq
+                .validate()
+                .is_ok()
+        );
     }
 }
