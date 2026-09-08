@@ -197,6 +197,20 @@ pub struct Confirmed {
     pub completed_at: u64,
 }
 
+/// A tunnel-activity baseline (design 5.12): sampled WireGuard byte counters
+/// and when they last showed a change. Absent (`None` on `Relationship`)
+/// means "never sampled yet" -- itself treated as activity, matching
+/// "first observation... counts as activity", so a pre-M5 persisted
+/// relationship (or one whose kernel peer never existed yet) is never
+/// wrongly judged idle.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Activity {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub last_active_at: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Relationship {
@@ -209,6 +223,8 @@ pub struct Relationship {
     pub pending: Option<Pending>,
     pub gated: bool,
     pub status: Status,
+    #[serde(default)]
+    pub activity: Option<Activity>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -352,6 +368,7 @@ impl EndpointState {
                 pending: None,
                 gated: false,
                 status: Status::Advertised,
+                activity: None,
             });
         if !is_new {
             if bundle.bundle_revision < relationship.remote.bundle_revision
@@ -380,6 +397,36 @@ impl EndpointState {
             relationship.pending = None;
         } else if relationship.status == Status::Blocked && !relationship.gated {
             relationship.status = Status::Advertised;
+        }
+        Ok(())
+    }
+
+    /// Samples this relationship's current WireGuard byte counters (design
+    /// 5.12). Activity is "new" whenever the sampled counters differ at all
+    /// from the stored baseline -- covering both a genuine increase and a
+    /// reset-to-a-different-value from peer recreation/interface reset,
+    /// without ever subtracting (sidesteps the underflow concern by never
+    /// computing a delta magnitude, only equality). A first observation
+    /// (no baseline yet) always counts as activity. An unchanged sample
+    /// leaves `last_active_at` untouched.
+    pub fn observe_activity(
+        &mut self,
+        other: Number,
+        now: u64,
+        rx_bytes: u64,
+        tx_bytes: u64,
+    ) -> Result<()> {
+        let relationship = self.relationships.get_mut(&other).ok_or(Error::Invalid)?;
+        let changed = match &relationship.activity {
+            None => true,
+            Some(a) => a.rx_bytes != rx_bytes || a.tx_bytes != tx_bytes,
+        };
+        if changed {
+            relationship.activity = Some(Activity {
+                rx_bytes,
+                tx_bytes,
+                last_active_at: now,
+            });
         }
         Ok(())
     }
@@ -589,6 +636,7 @@ mod tests {
                 pending: Some(dummy_pending(&state.identity.bundle, &old_remote, true)),
                 gated: false,
                 status: Status::Advertised,
+                activity: None,
             },
         );
 
@@ -667,6 +715,7 @@ mod tests {
                 pending: Some(dummy_pending(&state.identity.bundle, &remote, true)),
                 gated: false,
                 status: Status::Confirmed,
+                activity: None,
             },
         );
 
@@ -730,5 +779,79 @@ mod tests {
                 .is_err()
         );
         server.validate().unwrap();
+    }
+
+    #[test]
+    fn observe_activity_records_first_observation_and_only_changed_samples() {
+        let mut state = base_state(2, 1);
+        let other = Number::new(3).unwrap();
+        let remote =
+            Identity::generate(Binary([8; 32]), Number::new(5).unwrap(), &mut SystemRandom)
+                .unwrap()
+                .bundle;
+        state
+            .observe_remote(other, &remote, Lifecycle::Enabled)
+            .unwrap();
+        assert!(state.relationships[&other].activity.is_none());
+
+        // First observation always counts as activity, even a (0, 0) sample.
+        state.observe_activity(other, 100, 0, 0).unwrap();
+        let activity = state.relationships[&other].activity.as_ref().unwrap();
+        assert_eq!((activity.rx_bytes, activity.tx_bytes), (0, 0));
+        assert_eq!(activity.last_active_at, 100);
+
+        // An unchanged sample later leaves the baseline (and its timestamp) alone.
+        state.observe_activity(other, 200, 0, 0).unwrap();
+        assert_eq!(
+            state.relationships[&other]
+                .activity
+                .as_ref()
+                .unwrap()
+                .last_active_at,
+            100
+        );
+
+        // A genuine increase updates both the baseline and the timestamp.
+        state.observe_activity(other, 300, 10, 5).unwrap();
+        let activity = state.relationships[&other].activity.as_ref().unwrap();
+        assert_eq!((activity.rx_bytes, activity.tx_bytes), (10, 5));
+        assert_eq!(activity.last_active_at, 300);
+
+        // A reset to a lower (but different) value also counts as activity,
+        // without ever subtracting.
+        state.observe_activity(other, 400, 2, 1).unwrap();
+        let activity = state.relationships[&other].activity.as_ref().unwrap();
+        assert_eq!((activity.rx_bytes, activity.tx_bytes), (2, 1));
+        assert_eq!(activity.last_active_at, 400);
+
+        assert!(
+            state
+                .observe_activity(Number::new(99).unwrap(), 0, 0, 0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_pre_m5_relationship_without_activity_deserializes_to_none() {
+        let mut state = base_state(2, 1);
+        let other = Number::new(3).unwrap();
+        let remote =
+            Identity::generate(Binary([8; 32]), Number::new(5).unwrap(), &mut SystemRandom)
+                .unwrap()
+                .bundle;
+        state
+            .observe_remote(other, &remote, Lifecycle::Enabled)
+            .unwrap();
+
+        // Simulate a pre-M5 persisted relationship by serializing to a JSON
+        // value and dropping the `activity` field entirely (as a pre-M5
+        // Store's state.json would never have had it), then deserializing.
+        let mut value = serde_json::to_value(&state).unwrap();
+        value["relationships"][&other.get().to_string()]
+            .as_object_mut()
+            .unwrap()
+            .remove("activity");
+        let restored: EndpointState = serde_json::from_value(value).unwrap();
+        assert!(restored.relationships[&other].activity.is_none());
     }
 }
