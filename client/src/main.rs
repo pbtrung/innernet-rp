@@ -282,6 +282,34 @@ enum Command {
     /// state on each is preserved, never reset).
     PqEnable { interface: Interface },
 
+    /// Design 5.10 administrative rotation, step 1: import the server's
+    /// out-of-band transfer artifact (from `stage-management-rotation`) as
+    /// a staged rotation candidate, without touching the currently active,
+    /// live management secret.
+    StageManagement {
+        interface: Interface,
+
+        /// Path to the peer-<id>.management.rotation.json artifact,
+        /// transferred confidentially and out of band.
+        artifact: PathBuf,
+    },
+
+    /// Design 5.10 step 2: replace the live management secret with the
+    /// staged one, pushing it into the live kernel server-peer entry
+    /// immediately. Run this only after the server side has also applied
+    /// its half of the rotation.
+    ApplyManagement { interface: Interface },
+
+    /// Design 5.10 step 3: discard the superseded management secret once
+    /// a real fresh handshake and authenticated request have confirmed the
+    /// newly applied one works.
+    ConfirmManagement { interface: Interface },
+
+    /// Design 5.10 step 4: restore the management secret that was active
+    /// before the rotation attempt began, pushing it back into the live
+    /// kernel server-peer entry immediately.
+    RollbackManagement { interface: Interface },
+
     /// Generate shell completion scripts
     Completions {
         #[clap(value_enum)]
@@ -567,6 +595,74 @@ fn pq_enable(opts: &Opts, interface: &InterfaceName) -> Result<(), Error> {
 
     println!(
         "{} post-quantum data PSKs are re-enabling for {} with a fresh identity; every relationship must re-confirm.",
+        "[*]".dimmed(),
+        interface
+    );
+    Ok(())
+}
+
+/// Design 5.10 step 1 (client side): imports the server's out-of-band
+/// transfer artifact as a staged rotation candidate, without touching the
+/// currently active, live management secret.
+fn stage_management(opts: &Opts, interface: &InterfaceName, artifact: &Path) -> Result<(), Error> {
+    let contents = innernet_shared::private_file::read(artifact, true)?;
+    let provisioning: innernet_shared::management::Provisioning =
+        serde_json::from_str(&contents)
+            .map_err(|_| anyhow!("invalid management transfer artifact; contents omitted"))?;
+    innernet_client_core::management::stage(&opts.data_dir, interface, &provisioning.enrollment)?;
+    println!(
+        "{} a rotation candidate is staged for {}. Run `apply-management` once the server side \
+         has applied it too.",
+        "[*]".dimmed(),
+        interface
+    );
+    Ok(())
+}
+
+/// Design 5.10 step 2: promotes the staged candidate into the active
+/// secret, pushing it into the live kernel server-peer entry immediately.
+fn apply_management(opts: &Opts, interface: &InterfaceName) -> Result<(), Error> {
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    innernet_client_core::management::apply_active(
+        &opts.data_dir,
+        interface,
+        &opts.network,
+        &config.server.public_key,
+    )?;
+    println!(
+        "{} the staged secret is now active for {}; verify a fresh handshake and authenticated \
+         request before confirming.",
+        "[*]".dimmed(),
+        interface
+    );
+    Ok(())
+}
+
+/// Design 5.10 step 3: discards the superseded secret once an operator has
+/// verified the newly applied one actually works.
+fn confirm_management(opts: &Opts, interface: &InterfaceName) -> Result<(), Error> {
+    innernet_client_core::management::confirm(&opts.data_dir, interface)?;
+    println!(
+        "{} the superseded management secret for {} has been discarded.",
+        "[*]".dimmed(),
+        interface
+    );
+    Ok(())
+}
+
+/// Design 5.10 step 4's "restore old to both": restores the secret that
+/// was active before the rotation attempt began, pushing it back into the
+/// live kernel server-peer entry immediately.
+fn rollback_management(opts: &Opts, interface: &InterfaceName) -> Result<(), Error> {
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    innernet_client_core::management::rollback(
+        &opts.data_dir,
+        interface,
+        &opts.network,
+        &config.server.public_key,
+    )?;
+    println!(
+        "{} {} was rolled back to its pre-rotation management secret.",
         "[*]".dimmed(),
         interface
     );
@@ -1361,6 +1457,13 @@ fn run(opts: &Opts) -> Result<(), Error> {
         } => install(opts, &hosts, &install_opts, &nat, &invite, listen_port)?,
         Command::PqDisable { interface } => pq_disable(opts, &interface)?,
         Command::PqEnable { interface } => pq_enable(opts, &interface)?,
+        Command::StageManagement {
+            interface,
+            artifact,
+        } => stage_management(opts, &interface, &artifact)?,
+        Command::ApplyManagement { interface } => apply_management(opts, &interface)?,
+        Command::ConfirmManagement { interface } => confirm_management(opts, &interface)?,
+        Command::RollbackManagement { interface } => rollback_management(opts, &interface)?,
         Command::Show {
             short,
             tree,

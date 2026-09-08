@@ -829,6 +829,7 @@ dependencies = [
  "innernet-shared",
  "log",
  "regex",
+ "serde_json",
  "ureq",
  "wireguard-control",
 ]
