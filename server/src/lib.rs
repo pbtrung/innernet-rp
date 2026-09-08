@@ -383,6 +383,19 @@ fn push_management_psk_to_kernel(
     peer: &DatabasePeer,
 ) -> Result<(), Error> {
     if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
+        let key = Key::from_base64(&peer.public_key)?;
+        // Force a fresh handshake -- design 5.10 step 2's "remove old
+        // sessions". A `wg set` PSK change alone never tears down an
+        // already-established session (WireGuard only mixes the PSK into
+        // the *next* handshake), so without this a rotation would
+        // silently keep encrypting traffic under the superseded secret
+        // for up to REJECT_AFTER_TIME (~180s). manager.peer_config builds
+        // a complete config from the database record, so nothing is lost
+        // by removing first.
+        DeviceUpdate::new()
+            .remove_peer_by_key(&key)
+            .apply(interface, network.backend)
+            .map_err(|_| ServerError::WireGuard)?;
         let peer_config = manager.peer_config(peer)?;
         DeviceUpdate::new()
             .add_peer(peer_config)

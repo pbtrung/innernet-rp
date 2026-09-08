@@ -9,7 +9,7 @@ use innernet_pq::store::Store;
 use innernet_shared::{management::Enrollment, NetworkOpts};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use wireguard_control::{DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
+use wireguard_control::{Device, DeviceUpdate, InterfaceName, Key, PeerConfigBuilder};
 
 pub fn path(data_dir: &Path, interface: &InterfaceName) -> PathBuf {
     data_dir.join(format!("{interface}.client-pq"))
@@ -105,6 +105,17 @@ pub fn load(data_dir: &Path, interface: &InterfaceName) -> Result<Option<Enrollm
     Ok(read_state(data_dir, interface)?.map(|state| state.active))
 }
 
+/// Pushes a new PSK into the live kernel peer entry and removes any
+/// existing session -- design 5.10 step 2's "replace peer config both
+/// sides with new PSK, remove old sessions". A `wg set` PSK change alone
+/// never tears down an already-established session (WireGuard only mixes
+/// the PSK into the *next* handshake), so without this a rotation would
+/// silently keep encrypting traffic under the superseded secret for up to
+/// REJECT_AFTER_TIME (~180s) after "apply" claims to have taken effect.
+/// Removing a peer drops every attribute the kernel held for it, so the
+/// existing endpoint/allowed-ips/keepalive are read back first and carried
+/// forward into the re-added entry -- otherwise the server link would come
+/// back reachable-nowhere.
 fn push_active_to_kernel(
     interface: &InterfaceName,
     network_opts: &NetworkOpts,
@@ -113,7 +124,30 @@ fn push_active_to_kernel(
 ) -> Result<()> {
     let key =
         Key::from_base64(server_public_key).map_err(|_| anyhow!("invalid server public key"))?;
-    let peer_config = PeerConfigBuilder::new(&key).set_preshared_key(Key(*enrollment.psk.bytes()));
+    let device = Device::get(interface, network_opts.backend)
+        .context("reading the current kernel interface state")?;
+    let existing = device.peers.iter().find(|p| p.config.public_key == key);
+
+    let mut peer_config =
+        PeerConfigBuilder::new(&key).set_preshared_key(Key(*enrollment.psk.bytes()));
+    if let Some(existing) = existing {
+        if let Some(endpoint) = existing.config.endpoint {
+            peer_config = peer_config.set_endpoint(endpoint);
+        }
+        if let Some(keepalive) = existing.config.persistent_keepalive_interval {
+            peer_config = peer_config.set_persistent_keepalive_interval(keepalive);
+        }
+        if !existing.config.allowed_ips.is_empty() {
+            peer_config = peer_config.replace_allowed_ips();
+            for ip in &existing.config.allowed_ips {
+                peer_config = peer_config.add_allowed_ip(ip.address, ip.cidr);
+            }
+        }
+        DeviceUpdate::new()
+            .remove_peer_by_key(&key)
+            .apply(interface, network_opts.backend)
+            .context("removing the superseded session from the kernel")?;
+    }
     DeviceUpdate::new()
         .add_peer(peer_config)
         .apply(interface, network_opts.backend)

@@ -1,0 +1,61 @@
+# M7 scenario: real management-PSK administrative rotation (design 5.10)
+# with real kernel peers. Same one-server/two-data-peer topology M2 uses for
+# management-link provisioning; M7 reuses it because rotation is the same
+# link's lifecycle continuing, not a new one.
+services:
+  server:
+    image: innernet-pq-runtime:m7
+    cap_add: [NET_ADMIN]
+    networks:
+      pq_m7:
+        ipv4_address: 10.95.0.2
+    volumes:
+      - server_config:/etc/innernet-server
+      - server_data:/var/lib/innernet-server
+      - invites:/invites
+      - ./scenarios/server-entrypoint-m7.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  peer-a:
+    image: innernet-pq-runtime:m7
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m7:
+        ipv4_address: 10.95.0.3
+    volumes:
+      - peer_a_config:/etc/innernet
+      - peer_a_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m7.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-a"]
+
+  peer-b:
+    image: innernet-pq-runtime:m7
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m7:
+        ipv4_address: 10.95.0.4
+    volumes:
+      - peer_b_config:/etc/innernet
+      - peer_b_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m7.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-b"]
+
+networks:
+  pq_m7:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.95.0.0/24
+
+volumes:
+  server_config:
+  server_data:
+  peer_a_config:
+  peer_a_data:
+  peer_b_config:
+  peer_b_data:
+  invites:
