@@ -9,12 +9,15 @@ fn coverage_manifest_has_all_cases_and_resolves_unit_test_names() {
         include_str!("harness.rs"),
         include_str!("native_interop.rs"),
         include_str!("store.rs"),
+        include_str!("schedule.rs"),
         include_str!("../src/state.rs"),
+        include_str!("../src/engine.rs"),
         include_str!("../../server/src/api/pq_tests.rs"),
         include_str!("../../server/src/db/pq_migration_tests.rs"),
         include_str!("../../server/src/management.rs"),
         include_str!("../../server/src/gate.rs"),
         include_str!("../../client-core/src/management.rs"),
+        include_str!("../../client-core/tests/pq_exchange.rs"),
         include_str!("../../shared/src/pq.rs"),
     ]
     .concat();

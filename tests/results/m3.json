@@ -1,0 +1,38 @@
+{
+  "milestone": 3,
+  "revision": "the commit introducing this record",
+  "date": "2026-09-07",
+  "kernel": "Linux 7.2.2-1-cachyos x86_64",
+  "rust": "1.98.1",
+  "leancrypto": "1.8.0-1",
+  "openssl": "3.6.4-1",
+  "sqlite": "3.53.4-1",
+  "docker": "29.7.2",
+  "container_base": "archlinux@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a",
+  "package_snapshot": "2026/09/07",
+  "schema": 3,
+  "checks": [
+    {"command": "cargo fmt --all", "result": "passed; stable fallback because nightly is unavailable"},
+    {"command": "cargo clippy --workspace --locked --all-targets -- -D warnings", "result": "passed (default build)"},
+    {"command": "cargo clippy --workspace --locked --all-targets --features pq-dev-harness,test-harness -- -D warnings", "result": "passed (dev-harness build)"},
+    {"command": "cargo test --workspace --locked", "result": "all suites passed (pq 4+11+1+12+2 incl. 300-schedule property test, server 53 passed/1 explicitly ignored, client-core 6+1 real-API integration test, shared 6, wireguard-control 12 passed/1 explicitly ignored)"},
+    {"command": "bash tests/run.sh unit", "result": "passed"},
+    {"command": "bash tests/run.sh integration", "result": "passed"},
+    {"command": "bash tests/run.sh docker-smoke (m2_management.sh + m3_exchange.sh)", "result": "passed: M2 scenario unaffected; M3's two independent containers converge on one candidate through the real mailbox API"}
+  ],
+  "docker_scenario": {
+    "topology": "1 server + peer-a + peer-b on an isolated internal bridge, real crypto/binaries built with the pq-dev-harness feature, fake kernel installer only",
+    "bugs_found_and_fixed_by_this_milestone": [
+      "engine.rs's per-message absorb loop couldn't find the counterparty's final message once Exchange::compact() cleared it on a terminal record, so a side that fell one poll behind would never observe completion -- fixed by adopting the exchange's own still-present terminal Decision wholesale once terminal, instead of replaying individual messages",
+      "the durable-send retry check trusted a locally-optimistic terminal decision as proof of durability, letting a side falsely declare victory when its own final message (e.g. its Confirmed receipt) was the one actually lost -- fixed by keying trust off the server's own reported Exchange.decision, which can only reach a terminal phase once every required message was truly processed"
+    ]
+  },
+  "limitations": [
+    "Real WireGuard installation/handshake observation is not implemented (FakeInstaller only); that is M4's job",
+    "The Docker scenario exercises one rotation with a freshly generated identity per container; re-rotation of the *same* established identity producing a different candidate is covered by pq/src/engine.rs's own unit tests, not through real containers",
+    "Proactive client-initiated Abort is not implemented (the engine only observes one, whether peer-signed or TTL-expired); sending one is policy/M6 territory",
+    "The tunnel-inactivity/idle-timeout pause scheduling that will reuse this driver loop is M5",
+    "--pq-psk-rotation-interval is validated and consumed by the engine, but no CLI path yet threads a live client's flag value into a running up --daemon loop, since that loop's own PQ wiring stays behind --enable-pq-psk's production refusal until M4",
+    "No real-kernel data-traffic gate, data PSK installation, mixed-fleet policy, old/new binary compatibility, aarch64 execution, or external audit claim"
+  ]
+}

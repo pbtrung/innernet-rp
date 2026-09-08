@@ -274,3 +274,103 @@ path does; data-peer identity/bundle generation and the exchange/rotation
 loop remain gated behind `--enable-pq-psk`'s existing production refusal,
 unchanged from M1; and the full 5-peer/9-scenario Docker fault apparatus
 from `docs/testing.md` section 4 is M4+ work, not attempted here.
+
+## M3 — Durable exchange and confirmation loop
+
+The server side needed no new work: M1's mailbox API already implements
+registration, the signed phase-message handshake, and versioned paginated
+state in full. M3 adds the client-side decision engine and driver loop that
+actually walk that API, plus a real `--pq-psk-rotation-interval` (default
+300 seconds) client-only flag added to `PqOptions` (validated non-zero and
+non-overflowing; the server flattens it too but never reads it).
+
+`pq/src/engine.rs`'s `EndpointState::reconcile` is a pure function — no
+network or kernel I/O beyond a new `Installer` trait — deciding, for one
+data-peer relationship, what to do this cycle: initiate a rotation once due
+(lower peer ID only, never superseding pending work), respond to a fresh
+proposal, build/send the next phase message, install then send `Installed`
+once committed (responder first, reusing `Decision.installed[]`'s already-
+encoded ordering), confirm a handshake and send `Confirmed`, or finalize
+into `Relationship.confirmed` once complete. Per M3's own mandate ("model a
+successful PSK installer/handshake observer... without changing real
+WireGuard state"), `FakeInstaller` records calls instead of touching
+WireGuard; M4 supplies a real implementation without changing the engine.
+A single uniform `durably_sent` retry check (checked against the *server's*
+reported record, never this side's own possibly-ahead local mirror of it)
+replaces per-phase retry logic, including for the final `Confirmed`
+message and for a record already compacted by `Exchange::compact()`.
+
+`client-core/src/pq_sync.rs` walks `GET /user/state?pq_version=1` pages
+(looping on `next_cursor`, restarting on a `409` revision change) and drives
+the engine for every visible data peer, PUTing the resulting signed message
+and persisting state via the existing `Store` before acting. Network access
+sits behind a `Transport` trait so tests substitute an in-process server
+(spoofing per-peer source addresses the way real WireGuard tunnels would)
+without real sockets, root, or a kernel interface; `RestClient` is the
+production implementation. `server::test::Server`, the crate's existing
+in-process API test harness, is now reachable from other crates via a new
+`test-harness` Cargo feature (never enabled in a normal build), so
+`client-core/tests/pq_exchange.rs` can run two independent `EndpointState` +
+driver-loop instances against the real session/API/db path and show they
+converge on one candidate, with a simulated restart (drop the store's
+interface lock, reopen) leaving the durable outcome untouched.
+
+That real-API test, and separately `pq/tests/schedule.rs`'s 300 seeded
+reproducible randomized fault schedules (lost responses, restarts, time
+advances, run over a fast in-crate simulated mailbox), each caught a real
+durability bug that pure single-path unit tests had missed — both
+stemming from `Exchange::compact()` clearing `messages`/`transcript` once
+a record goes terminal, or from a side's own local decision mirror racing
+ahead of what the server actually durably recorded:
+
+- The per-message absorb loop couldn't find the counterparty's final
+  message once compacted, so a side that fell one poll behind would never
+  observe completion. Fixed by adopting the exchange's own still-present
+  terminal `Decision` wholesale instead of replaying individual messages
+  once terminal.
+- The retry check itself had a symmetric gap: it trusted a *locally*-
+  optimistic terminal decision as proof of durability, but a side's own
+  final message (e.g. its `Confirmed` receipt) can be exactly the one
+  that got lost, letting that side falsely declare victory. Fixed by
+  keying "is this terminal record trustworthy" off the server's own
+  reported `Exchange.decision`, which can only reach a terminal phase
+  once every required message was truly processed.
+
+M3's Docker evidence needed a bypass M2 never did (real identity
+generation and a real exchange both require `--enable-pq-psk`, which stays
+gated in the shipped CLI). Both `client`/`server` gained a `pq-dev-harness`
+Cargo feature (off by default, never in a normal build): under it, `serve()`
+actually populates `Context.pq` (which the real `serve()` otherwise always
+leaves `None`, regardless of any flag) and skips the production refusal
+entirely; the client gains one hidden, non-interactive subcommand
+(`pq-dev-rotate <interface> <other-peer-id>`) that generates an identity,
+registers it, and drives the same real `pq_sync` loop with a
+`FakeInstaller` until convergence, printing the resulting PSK — bypassing
+the refusal only for that specific subcommand. `tests/docker/
+scenarios/m3_exchange.sh` runs two real containers through the real
+mailbox API (with a fake installer; M3 never touches real WireGuard state)
+and asserts they converge on the same candidate; wired into
+`bash tests/run.sh docker-smoke` alongside M2's scenario.
+
+Tested on Linux x86_64, Arch Linux, 2026-09-07, Docker 29.7.2:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --workspace --locked` | all suites pass (pq: 4+11+1+12+2, including the 300-schedule property test; server: 53 + 1 explicitly ignored; client-core: 6 + 1 real-API integration test; shared: 6; wireguard-control: 12 + 1 explicitly ignored) |
+| `cargo clippy --workspace --locked --all-targets -- -D warnings` (default, and again with `--features pq-dev-harness,test-harness`) | passed both ways |
+| `bash tests/run.sh unit` / `integration` | passed |
+| `bash tests/run.sh docker-smoke` (`scenarios/m2_management.sh` + `scenarios/m3_exchange.sh`) | passed: M2's scenario unaffected; M3's two independent containers converge on one candidate through the real API |
+
+Explicitly out of scope for M3: real WireGuard installation/handshake
+observation (M4's job — `FakeInstaller` only); a second real rotation for
+the *same* established identity through Docker (the `pq-dev-rotate`
+harness always generates a fresh identity per invocation; re-rotation of
+an established relationship is already rigorously covered by
+`pq/src/engine.rs`'s own unit tests, just not through real containers);
+proactive client-initiated `Abort` (the engine only observes one, whether
+peer-signed or TTL-expired — sending one is policy/M6 territory); the idle-
+timeout/inactivity pause scheduling that reuses this driver loop (M5); and
+`--pq-psk-rotation-interval` is validated and consumed by the engine, but
+no CLI path yet threads a live client's flag value all the way into a
+running `up --daemon` loop, since that loop's own PQ wiring stays behind
+`--enable-pq-psk`'s production refusal until M4.
