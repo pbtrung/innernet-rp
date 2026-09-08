@@ -236,7 +236,7 @@
         "pq_migrated_server_role_uses_identity_not_peer_number"
       ],
       "docker": [],
-      "status": "m1-schema-only-not-binary-compatibility"
+      "status": "m1-schema-only-old-new-binary-compatibility-not-a-project-goal"
     },
     {
       "design_case": 18,

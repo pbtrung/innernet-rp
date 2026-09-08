@@ -160,7 +160,7 @@ mailbox shared directly between client processes.
 | `peer-c` | Cooperating data peer | Unaffected A–C traffic/progress control |
 | `peer-m` | Valid identity, no visibility of B | Cross-CIDR and authorization adversary |
 | `peer-x` | Authorized synthetic sender | Malformed signed input and flood source |
-| `legacy-peer` | Optional pinned old binary | Mixed-fleet profile |
+| `peer-legacy` | Fully-capable binary, PQ never enabled | Mixed-fleet profile |
 
 An isolated Docker bridge supplies the outer IP/UDP transport for WireGuard.
 The coordination API must be reached through each client's real server-link
@@ -283,7 +283,7 @@ and snapshots local to the protected run unless explicitly sanitized.
    band. No mailbox request rotates or repairs this same management key.
 9. **Adversarial/full profiles:** execute directory substitution as an
    expected threat-model limitation, the quantitative design case 14 flood
-   target, real legacy/schema transitions, and both architecture profiles.
+   target, real database schema transitions, and both architecture profiles.
 
 For deterministic Docker scenarios, use 1-second polls and a documented
 shortened rotation interval, separate from production defaults. Pause
@@ -309,7 +309,7 @@ when unit tests cover the corresponding decisions.
 | 13 | Virtual-time cadence, counters and fairness | Real keepalive-only and inactive tunnels with A–C control |
 | 14 | Admission-budget and capacity-reservation boundaries | Measured offered load, RSS, p99 and admitted-peer progress |
 | 15, 16 | Lifecycle/policy and secret-selection decisions | Enrollment, restart, operator keys and admin recovery |
-| 17 | Version/policy dispatch | Exact old/new binaries and schema round trips |
+| 17 | Version/policy dispatch | Database schema round trips (no old/new binary requirement) |
 | 18 | Architecture-independent vectors | Target runtime packages and real target-kernel execution |
 
 Every pull request runs unit and persistence/API suites plus Docker smoke

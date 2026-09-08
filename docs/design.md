@@ -680,9 +680,12 @@ compatibility and admission limits.
     migration, reboot, and successful/failed administrative rotation using
     independent access. Data mismatch leaves API reachable; missing secrets
     block startup and general application/transit traffic is denied.
-17. **Real compatibility:** execute old/new client/server and database
-    upgrade/rollback/re-upgrade cases in section 10 with recorded versions;
-    deserialization tests alone do not establish compatibility.
+17. **Database migration:** execute the database upgrade/rollback/
+    re-upgrade cases in section 10 with recorded versions; deserialization
+    tests alone do not establish compatibility. This project has no old/
+    new client-server binary compatibility requirement -- it is a new,
+    independent design/app/binary, not a fork retaining wire compatibility
+    with upstream innernet releases.
 18. **Platforms:** run crypto, durability, gate, and WireGuard checks on
     Linux x86_64/aarch64 with system libraries; preserve non-Linux legacy
     builds with PQ disabled.
@@ -784,9 +787,12 @@ combiner/state machine and validates the 300-second rotation, 900-second
 inactivity threshold, 600-second prepare TTL, and service/load budgets.
 These are validation tasks, not undecided signing policy or a vendoring option.
 
-Select and record the supported innernet baseline commit and legacy binary
-versions before implementation. M0 establishes build/test infrastructure
-explicitly and records restored baseline code and its adaptations.
+Select and record the innernet baseline commit this project was derived
+from before implementation, as a historical/derivation record only -- not
+a compatibility commitment. This is a new, independent design/app/binary
+with no obligation to interoperate with old upstream innernet releases.
+M0 establishes build/test infrastructure explicitly and records restored
+baseline code and its adaptations.
 
 Migrations must be atomic/versioned with tested backup/restore and an explicit
 compatibility matrix. New code rejects unknown newer schemas before any
@@ -804,10 +810,10 @@ management configuration through a coordinated rollback. Never restore old
 exchange counters while endpoints keep the same bundle IDs; retire/re-enroll
 affected identities as necessary.
 
-Test old client/new server (PQ off and explicitly permissive), new client/old
-server (PQ off/permissive/strict), and new/new combinations, plus database
-new-to-old-to-new transitions and rejected unsupported rollbacks. Distinguish
-wire compatibility, local policy, runtime dependencies, and database
-compatibility in release notes. Installation on a never-enabled network
-stays opt-in; strict enablement and management provisioning are explicit
-behavior changes, not a claim of a behavior-free migration.
+Test new/new combinations across PQ off/permissive/strict, plus database
+new-to-old-to-new transitions (between this project's own releases) and
+rejected unsupported rollbacks. Distinguish local policy, runtime
+dependencies, and database compatibility in release notes. Installation on
+a never-enabled network stays opt-in; strict enablement and management
+provisioning are explicit behavior changes, not a claim of a behavior-free
+migration.

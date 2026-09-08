@@ -1,0 +1,84 @@
+# M6 scenario: real mixed-fleet policy (strict/permissive/legacy) with
+# real kernel peers, on a network that does require management (needed for
+# --enable-pq-psk) and has PQ enabled. peer-legacy is a fully capable
+# binary that simply never passes --enable-pq-psk -- it correctly adopts
+# the management-link PSK like any other peer, so this isolates the
+# strict/permissive legacy-eligibility question from anything else. From
+# the PQ engine's perspective this exercises the exact same code path a
+# peer that has never advertised a PQ bundle would, since legacy
+# eligibility only ever checks bundle presence, never why a peer's bundle
+# is absent. This project has no old/new binary compatibility requirement
+# -- it is a new, independent design, not a fork of upstream innernet.
+services:
+  server:
+    image: innernet-pq-runtime:m6
+    cap_add: [NET_ADMIN]
+    networks:
+      pq_m6:
+        ipv4_address: 10.93.0.2
+    volumes:
+      - server_config:/etc/innernet-server
+      - server_data:/var/lib/innernet-server
+      - invites:/invites
+      - ./scenarios/server-entrypoint-m6.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  peer-legacy:
+    image: innernet-pq-runtime:m6
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m6:
+        ipv4_address: 10.93.0.3
+    volumes:
+      - peer_legacy_config:/etc/innernet
+      - peer_legacy_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m6-legacy.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-legacy"]
+
+  peer-permissive:
+    image: innernet-pq-runtime:m6
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m6:
+        ipv4_address: 10.93.0.4
+    volumes:
+      - peer_permissive_config:/etc/innernet
+      - peer_permissive_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m6-new.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-permissive", "--pq-psk-permissive"]
+
+  peer-strict:
+    image: innernet-pq-runtime:m6
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m6:
+        ipv4_address: 10.93.0.5
+    volumes:
+      - peer_strict_config:/etc/innernet
+      - peer_strict_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m6-new.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-strict", ""]
+
+networks:
+  pq_m6:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.93.0.0/24
+
+volumes:
+  server_config:
+  server_data:
+  peer_legacy_config:
+  peer_legacy_data:
+  peer_permissive_config:
+  peer_permissive_data:
+  peer_strict_config:
+  peer_strict_data:
+  invites:

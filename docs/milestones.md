@@ -21,9 +21,12 @@ API. No milestone claims uninterrupted two-party PSK installation.
 
 ## M0 — Baseline, crypto integration, and protocol fixtures
 
-- Record the innernet baseline commit, supported legacy binary/schema
-  versions, implementation toolchain, and test/build entry points. Establish
-  the harness rather than assuming pre-reset files exist in this checkout.
+- Record the innernet baseline commit this project was derived from, as a
+  historical/derivation record, along with implementation toolchain and
+  test/build entry points. Establish the harness rather than assuming
+  pre-reset files exist in this checkout. This is a new, independent
+  design/app/binary with no old/new binary compatibility requirement
+  against upstream innernet releases.
 - Establish the unit framework, virtual clocks, scripted transport/storage/
   kernel adapters, canonical fixtures, and design-case coverage manifest
   from testing sections 1–2. Define the suite runner contracts before later
@@ -94,10 +97,9 @@ are recorded. Neither production interfaces nor their PSKs are modified.
 **Acceptance:** API/schema tests cover all three keys, partial registration,
 non-consuming fetches, duplicate/lost responses, phase conflicts, stale
 receipts, authorization changes between pages, expiry races, tombstones,
-and resource admission. Old-shaped records still deserialize, but this
-alone does not claim old/new binary compatibility. With enablement absent
-on a never-enabled interface, no keys or PQ traffic are generated and no
-WireGuard behavior changes.
+and resource admission. Old-shaped records still deserialize. With
+enablement absent on a never-enabled interface, no keys or PQ traffic are
+generated and no WireGuard behavior changes.
 
 ## M2 — Durable identity and management-link provisioning
 
@@ -231,14 +233,15 @@ within shared resource budgets.
 - Legacy transition requires explicit authorization on both endpoints and
   matching restoration of the operator PSK, or explicitly authorized zero
   PSK. Remote strict peers remain blocked; local opt-out cannot force them.
-- Execute actual old/new client/server binaries with PQ off/permissive/strict
-  combinations, checking response parsing, optional capability discovery,
-  unavailable endpoints, and expected policy refusals, not just
-  deserialization tests.
 
-**Acceptance:** design cases 15 and the wire-policy portion of 17 pass.
-Reports distinguish supported legacy interoperation from expected strict
-refusal, and configured/advertised/confirmed protection states are accurate.
+This project has no old/new client-server binary compatibility requirement:
+it is a new, independent design/app/binary, not a fork retaining wire
+compatibility with upstream innernet releases. "Legacy" in this milestone
+means a peer that has never advertised a PQ bundle, not an old binary.
+
+**Acceptance:** design case 15 passes. Reports distinguish permissive
+legacy exemption from expected strict refusal, and configured/advertised/
+confirmed protection states are accurate.
 
 ## M7 — Management PSK rotation and operational recovery
 

@@ -9,10 +9,12 @@ is `PRAGMA user_version = 2`. Netlink API adaptations are taken from the later
 or crypto is included. Hyper 1 and ureq 3 replace obsolete HTTP interfaces.
 Unknown newer database schemas are rejected before writes.
 
-This records the legacy baseline, not completed old/new compatibility.
-Actual legacy process interoperability belongs to M6; no old binary is
-authorized to open a migrated live database. Retain a stopped-server backup
-with matching endpoint configuration before migration. Stale replay-state
+This records the historical baseline this project was derived from, not a
+compatibility commitment; this is a new, independent design/app/binary
+with no old/new binary compatibility requirement against upstream innernet
+releases. No old binary of this project's own prior releases is authorized
+to open a migrated live database. Retain a stopped-server backup with
+matching endpoint configuration before migration. Stale replay-state
 restores require retirement/re-enrollment, not reused bundle counters.
 
 Tested on Linux x86_64, Arch Linux, 2026-09-07:
@@ -182,8 +184,8 @@ registration CAS, phase/expiry races over separate database connections,
 lost/duplicate pages and replies, replay tombstones, invalidated sessions,
 streamed body limits/deadlines, retirement, and recovery under exhausted
 record/worker budgets. The policy unit test separately checks inert defaults.
-The coverage manifest labels this API/storage evidence, not kernel protection,
-independent client-process convergence, or old/new binary compatibility.
+The coverage manifest labels this API/storage evidence, not kernel protection
+or independent client-process convergence.
 
 ## M2 — Durable identity and management-link provisioning
 
