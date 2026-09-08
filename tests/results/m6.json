@@ -1,0 +1,33 @@
+{
+  "milestone": 6,
+  "revision": "the commit introducing this record",
+  "date": "2026-09-08",
+  "kernel": "Linux 7.2.2-1-cachyos x86_64",
+  "rust": "1.98.1",
+  "leancrypto": "1.8.0-1",
+  "openssl": "3.6.4-1",
+  "sqlite": "3.53.4-1",
+  "docker": "29.7.2",
+  "container_base": "archlinux@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a",
+  "package_snapshot": "2026/09/07",
+  "schema": 5,
+  "checks": [
+    {"command": "cargo fmt --all", "result": "passed; stable fallback because nightly is unavailable"},
+    {"command": "cargo clippy --workspace --locked --all-targets -- -D warnings", "result": "passed (default build)"},
+    {"command": "cargo clippy --workspace --locked --all-targets --features pq-dev-harness,test-harness -- -D warnings", "result": "passed (dev-harness build)"},
+    {"command": "cargo test --workspace --locked", "result": "all suites passed"},
+    {"command": "bash tests/run.sh unit", "result": "passed"},
+    {"command": "bash tests/run.sh integration", "result": "passed"},
+    {"command": "bash tests/run.sh docker-smoke (m2_management.sh + m3_exchange.sh + m4_smoke.sh + m4_crash.sh + m5_inactivity.sh + m6_policy.sh)", "result": "passed: M2-M5 scenarios unaffected; M6's mixed-fleet policy scenario passes with real kernel peers"}
+  ],
+  "docker_scenario": {
+    "topology": "1 server + peer-legacy + peer-permissive + peer-strict on an isolated internal bridge, require-management network, real production build; peer-legacy never passes --enable-pq-psk, peer-permissive/peer-strict do with --pq-psk-permissive set accordingly",
+    "real_kernel_finding": "an earlier attempt to exercise real old/new binary compatibility (a genuinely separate pre-Rosenpass binary built via git worktree from the pinned baseline commit e922387122874c8182abab5b1c1e3eed2da1ba7f) succeeded on a plain network but failed on a require-management network: M2's server-side management-link PSK provisioning is unconditional for every enabled peer, and the old binary has no code to read or adopt the invite's management field, so the resulting PSK mismatch made WireGuard silently drop the handshake. This project has no old/new binary compatibility requirement, so that scenario was removed rather than carried forward; the kept scenario instead exercises strict/permissive legacy-eligibility with peer-legacy as a fully-capable current binary that simply never enables PQ",
+    "assertions": "permissive peer stays reachable with the bundle-less legacy peer; strict peer stays blocked with the same peer, not a crash or a hang; the ordinary (non-PQ) sync loop keeps progressing for the legacy peer throughout; permissive and strict (both PQ-capable) fully confirm real PQ with each other and converge on matching PSKs"
+  },
+  "limitations": [
+    "bilateral downgrade's coordinated two-sided handshake is not implemented: it needs a new wire-protocol message, a genuine protocol addition rather than a wiring gap. Local explicit disable (this interface's own PQ posture, with its own operator PSK preserved untouched) is implemented and tested via EndpointState::disable and the pq-disable/pq-enable CLI commands",
+    "old/new binary compatibility is explicitly not a project goal: this is a new, independent design/app/binary, not a fork retaining wire compatibility with upstream innernet releases",
+    "aarch64 execution or external audit claim is out of scope for this record"
+  ]
+}

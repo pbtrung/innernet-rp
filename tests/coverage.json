@@ -194,16 +194,21 @@
       "design_case": 15,
       "unit": [
         "enablement_is_opt_in_and_permissive_requires_it",
-        "production_ready_now_accepts_real_activation"
+        "production_ready_now_accepts_real_activation",
+        "legacy_eligible_only_for_permissive_bundle_less_never_confirmed_peers",
+        "explicit_disable_retains_recovery_state_and_re_enable_never_resets_it",
+        "retiring_never_starts_a_new_exchange",
+        "a_bundle_less_peer_is_never_touched_by_the_engine_or_installer"
       ],
       "integration": [
         "pq_api_capability_readiness_and_atomic_registration",
         "pq_enable_requires_management_ready_first_and_then_makes_ready_true"
       ],
       "docker": [
-        "m4_smoke: --enable-pq-psk activates for real against a production build (no dev-harness feature)"
+        "m4_smoke: --enable-pq-psk activates for real against a production build (no dev-harness feature)",
+        "m6_policy: real kernel peers -- permissive peer stays reachable with a bundle-less legacy peer, strict peer stays blocked with the same peer (not a crash or a hang), the ordinary sync loop keeps progressing for the legacy peer, and permissive/strict still fully confirm real PQ with each other"
       ],
-      "status": "m4-production-activation-lifted-and-gate-verified"
+      "status": "m6-policy-and-lifecycle-verified-with-real-kernel"
     },
     {
       "design_case": 16,

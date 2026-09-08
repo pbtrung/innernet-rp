@@ -620,3 +620,110 @@ control this codebase does not yet have — covered at the engine
 unit-test level instead, as described above); the numeric 300s/900s
 rotation/idle defaults are not re-validated here (M9's job); and mixed
 strict/permissive/legacy scheduling interactions stay M6 territory.
+
+## M6 — Mixed-fleet policy and explicit lifecycle transitions
+
+M6 finishes the strict/permissive policy semantics M1 introduced as inert
+CLI flags, adds durable explicit disable/re-enable lifecycle transitions,
+and closes the milestone with real Docker evidence. Before this milestone,
+`pq::state::Policy` was written (always hardcoded to `Strict`) but never
+read, `Relationship.prior_pq` was written but never read, and a peer with
+no PQ bundle never got a `Relationship` at all — meaning permissive mode's
+entire reason to exist (legacy pass-through for a peer that never had PQ)
+was unimplemented, not just untested.
+
+`pq_sync::open_or_register` now sets `state.policy` from the live
+`--pq-psk-permissive` flag on every call. Legacy eligibility is computed,
+not stored: a new `pq_install::legacy_eligible` returns true exactly when
+policy is `Permissive`, no bundle is currently advertised, and the peer's
+relationship (if any) never reached `prior_pq`. `prior_pq`, not
+`confirmed.is_some()`, is the right signal because `confirmed` can be
+transiently cleared (e.g. by `emergency_retire`) while `prior_pq` never
+is. `client-core::interface`'s proactive-gating loop now iterates
+`pq_peers` (not the ordinary peer list) so `entry.pq.is_some()` is
+available, and explicitly releases (never gates) a legacy-eligible peer
+instead of blocking it — the fix that makes permissive mode's legacy
+exemption real rather than a flag with no effect. Toggling the flag can
+never retroactively legalize legacy treatment for a relationship that
+ever confirmed PQ, since eligibility is gated on `prior_pq` history, not
+current policy.
+
+Explicit disable reuses `Enrollment::Retiring`, already declared and
+already unused for this purpose. A new `EndpointState::disable()` — an
+ordinary administrative action, distinct from `emergency_retire`'s
+lost/corrupt-local-state handling — sets `registration.lifecycle =
+Retired`, `enrollment = Retiring`, and clears every relationship's
+`pending`, while retaining `confirmed`/sequence/`prior_pq` state rather
+than clearing it, matching "retain recovery/replay state until
+retirement is durable". `EndpointState::reconcile` gains one
+short-circuit: while `enrollment == Retiring`, never start a new
+exchange. `interface::fetch()`'s gating step becomes retirement-aware:
+while retiring/retired, every relationship is gated immediately,
+including ones already confirmed — closing the application-traffic gate
+is exactly "drain... while gated". A new `pq_sync::submit_pending_
+registration` runs on every cycle while `enrollment` is `Registering` or
+`Retiring`, posting to `/user/pq-keys` (or `/user/pq-keys?retire=1` for
+retirement) and calling the already-implemented, previously-unused
+`accept_registration` to verify the response and advance `enrollment`.
+Explicit re-enable reuses the already-implemented, already-tested
+`replace()` (a fresh identity, `Enrollment::Registering`, every
+relationship blocked pending re-confirmation) — `prior_pq`/sequence
+counters on existing relationships survive `replace()` untouched. Both
+are wired to new CLI commands, `innernet pq-disable <interface>` and
+`innernet pq-enable <interface>`.
+
+Bilateral downgrade (a coordinated, both-sides-authorized restoration of
+a matching legacy/zero operator PSK) is explicitly out of scope for this
+pass: it requires a new wire-protocol message, a genuine protocol
+addition rather than a wiring gap like everything else in this
+milestone. Local explicit disable (this interface's own PQ posture, with
+its own operator PSK preserved untouched) is implemented and tested; the
+coordinated two-sided handshake is documented as deferred.
+
+Building the M6 Docker scenarios, the plan originally called for
+executing a genuinely separate old binary (built via `git worktree` from
+this repository's pinned pre-Rosenpass baseline commit,
+`e922387122874c8182abab5b1c1e3eed2da1ba7f`) against the current server, to
+demonstrate real old/new wire compatibility. That investigation
+succeeded technically — the old binary redeemed its invitation and
+brought up a real WireGuard tunnel against the new server on a plain
+(no-management) network — but also surfaced a genuine, unrelated
+constraint: on a `require-management` network, M2's server-side
+management-link PSK provisioning is unconditional for every enabled
+peer, and the pre-Rosenpass binary has no code to read or adopt the
+invite's `management` field, so the resulting PSK mismatch made
+WireGuard silently drop the handshake. Given that finding, the user
+decided this project has no old/new binary compatibility requirement — it
+is a new, independent design/app/binary, not a fork retaining wire
+compatibility with upstream innernet releases — so that scenario and its
+supporting Dockerfile/compose/entrypoint files were removed rather than
+carried forward. `tests/docker/scenarios/m6_policy.sh` (design case 15)
+was kept: `peer-legacy` is a fully-capable current binary that simply
+never passes `--enable-pq-psk`, which exercises the exact same
+legacy-eligibility code path a truly incapable peer would (bundle
+presence is the only thing the engine ever checks, never why a bundle is
+absent), with real kernel peers on a `require-management`,
+PQ-enabled network. It confirms: a permissive peer stays reachable with
+the bundle-less legacy peer; a strict peer stays blocked with the same
+peer (not a crash or a hang); the ordinary (non-PQ) sync loop keeps
+progressing for the legacy peer throughout; and permissive/strict (both
+PQ-capable) still fully confirm real PQ with each other, converging on
+matching PSKs.
+
+Tested on Linux x86_64, Arch Linux, 2026-09-08, Docker 29.7.2:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --workspace --locked` | all suites pass |
+| `cargo clippy --workspace --locked --all-targets -- -D warnings` (default, and again with `--features pq-dev-harness,test-harness`) | passed both ways |
+| `bash tests/run.sh unit` / `integration` | passed |
+| `bash tests/run.sh docker-smoke` (`m2_management.sh` + `m3_exchange.sh` + `m4_smoke.sh` + `m4_crash.sh` + `m5_inactivity.sh` + `m6_policy.sh`) | passed: M2-M5 scenarios unaffected; M6's mixed-fleet policy scenario passes with real kernel peers |
+
+Explicitly out of scope for M6: bilateral downgrade's coordinated
+two-sided handshake (needs a new wire-protocol message — a genuine
+protocol addition, not a wiring gap); and old/new binary compatibility,
+which is not a project goal (this is a new, independent design/app/
+binary, not a fork of upstream innernet). This completes the milestones
+requested in "implement M3-M6"; M7-M9 (management PSK rotation,
+cross-platform build profiles, and the full security/fault/load review)
+are not part of this pass.
