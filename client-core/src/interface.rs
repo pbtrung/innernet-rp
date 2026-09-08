@@ -13,6 +13,7 @@ use crate::{
 use anyhow::{anyhow, bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
 use innernet_pq::{
+    api::Lifecycle,
     crypto::SystemRandom,
     protocol::{Binary, Number},
     store::Store,
@@ -314,7 +315,7 @@ pub fn fetch(
             .map_err(|e| anyhow!("parsing this interface's own public key: {e}"))?
             .get_public();
         let mut rng = SystemRandom;
-        let (pq_store, state) = pq_sync::open_or_register(
+        let (mut pq_store, mut state) = pq_sync::open_or_register(
             data_dir,
             interface,
             &rest_client,
@@ -323,6 +324,17 @@ pub fn fetch(
             &mut rng,
         )
         .context("opening or registering PQ activation state")?;
+
+        // A pending explicit disable/re-enable (registration.lifecycle
+        // changed by `disable`/`replace` on a previous cycle, or by the
+        // CLI's pq-disable/pq-enable commands) still needs submitting to
+        // the server; a failure here is not fatal to this cycle, matching
+        // the fault-tolerant discipline `pq_sync::apply` already follows.
+        if let Err(error) = pq_sync::submit_pending_registration(&rest_client, &mut state) {
+            log::warn!("submitting a pending PQ registration change: {error}");
+        } else if let Err(error) = pq_store.save(&state) {
+            log::warn!("persisting PQ registration state: {error}");
+        }
 
         // Fetched here (not later, alongside `apply`) so this gating pass
         // can see each peer's current bundle presence -- required to tell
@@ -333,6 +345,13 @@ pub fn fetch(
         // fetch per cycle.
         let (pq_peers, exchanges) =
             pq_sync::fetch_state(&rest_client).context("fetching PQ exchange state")?;
+
+        // While this interface is explicitly disabled/disabling, every
+        // relationship is gated unconditionally, including ones already
+        // confirmed -- "drain... while gated" (design 5.11). reconcile_gate
+        // (below) is itself retirement-aware so it never re-opens what this
+        // pass just closed.
+        let retiring = state.registration.lifecycle == Lifecycle::Retired;
 
         let mut to_gate = Vec::new();
         let mut to_release = Vec::new();
@@ -351,13 +370,15 @@ pub fn fetch(
                 continue;
             }
             let relationship = state.relationships.get(&id);
-            if relationship.and_then(|r| r.confirmed.as_ref()).is_some() {
-                // Already confirmed; reconcile_gate (below, after peers are
-                // live) re-verifies it, never this proactive pass.
+            let confirmed = relationship.and_then(|r| r.confirmed.as_ref()).is_some();
+            if confirmed && !retiring {
+                // Already confirmed and not retiring; reconcile_gate (below,
+                // after peers are live) re-verifies it, never this
+                // proactive pass.
                 continue;
             }
             let allowed_ip = peer_allowed_ip(&entry.peer);
-            if pq_install::legacy_eligible(&state, id, entry.pq.is_some()) {
+            if !retiring && pq_install::legacy_eligible(&state, id, entry.pq.is_some()) {
                 to_release.push(allowed_ip);
             } else {
                 to_gate.push(allowed_ip);

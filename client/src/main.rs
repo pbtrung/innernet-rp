@@ -268,6 +268,20 @@ enum Command {
         sub_opts: OverridePeerEndpointOpts,
     },
 
+    /// Explicitly disable post-quantum data PSKs for this interface
+    /// (design 5.11): gates every data-peer relationship, clears in-flight
+    /// exchanges, and durably publishes the retirement to the server. Never
+    /// touches the coordination-server management link. Durable and
+    /// explicit -- simply omitting --enable-pq-psk on a later run cannot
+    /// bypass this.
+    PqDisable { interface: Interface },
+
+    /// Explicitly re-enable post-quantum data PSKs for an interface
+    /// previously disabled with `pq-disable`, generating a fresh identity
+    /// (every relationship re-confirms from scratch; prior_pq/sequence
+    /// state on each is preserved, never reset).
+    PqEnable { interface: Interface },
+
     /// Generate shell completion scripts
     Completions {
         #[clap(value_enum)]
@@ -480,6 +494,83 @@ fn pq_dev_rotate(
         }
         thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Explicit administrative disable (design 5.11): gates every relationship
+/// immediately, explicitly retires any in-flight exchange (design 5.11's
+/// "drain... or explicitly retire it" alternative to a full background
+/// drain), and submits the retirement to the server right away rather than
+/// waiting for a `fetch`/`up --daemon` cycle to notice it -- though
+/// `interface::fetch()` also retries this submission on every subsequent
+/// cycle if this one-shot attempt fails.
+fn pq_disable(opts: &Opts, interface: &InterfaceName) -> Result<(), Error> {
+    use innernet_client_core::pq_sync;
+    use innernet_pq::store::Store;
+
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config.server);
+    let path = pq_sync::path(&opts.data_dir, interface);
+    let mut store = Store::open(&path, false).map_err(|e| {
+        anyhow!("opening PQ activation state for {interface} (was --enable-pq-psk ever used?): {e}")
+    })?;
+    let mut state: innernet_pq::state::EndpointState = store.load()?;
+    state.disable()?;
+    store.save(&state)?;
+
+    if let Err(e) = pq_sync::submit_pending_registration(&rest_client, &mut state) {
+        log::warn!(
+            "submitting the disable registration now (a later fetch/up cycle will retry): {e}"
+        );
+    } else {
+        store.save(&state)?;
+    }
+
+    println!(
+        "{} post-quantum data PSKs are disabling for {}: every relationship is now gated and retiring.",
+        "[*]".dimmed(),
+        interface
+    );
+    Ok(())
+}
+
+/// Explicit re-enable (design 5.11): generates a fresh identity and calls
+/// the existing `EndpointState::replace` -- every relationship re-confirms
+/// from scratch under the new identity, but its `prior_pq`/sequence state
+/// is preserved untouched (never reset under an old bundle).
+fn pq_enable(opts: &Opts, interface: &InterfaceName) -> Result<(), Error> {
+    use innernet_client_core::pq_sync;
+    use innernet_pq::{crypto::SystemRandom, protocol::Binary, state::Identity, store::Store};
+
+    let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
+    let rest_client = RestClient::new(&config.server);
+    let path = pq_sync::path(&opts.data_dir, interface);
+    let mut store = Store::open(&path, false).map_err(|e| {
+        anyhow!("opening PQ activation state for {interface} (was --enable-pq-psk ever used?): {e}")
+    })?;
+    let mut state: innernet_pq::state::EndpointState = store.load()?;
+
+    let mut rng = SystemRandom;
+    let public_key =
+        wireguard_control::Key::from_base64(&config.interface.private_key)?.get_public();
+    let next_revision = state.identity.bundle.bundle_revision.next()?;
+    let fresh = Identity::generate(Binary(public_key.0), next_revision, &mut rng)?;
+    state.replace(fresh)?;
+    store.save(&state)?;
+
+    if let Err(e) = pq_sync::submit_pending_registration(&rest_client, &mut state) {
+        log::warn!(
+            "submitting the re-enable registration now (a later fetch/up cycle will retry): {e}"
+        );
+    } else {
+        store.save(&state)?;
+    }
+
+    println!(
+        "{} post-quantum data PSKs are re-enabling for {} with a fresh identity; every relationship must re-confirm.",
+        "[*]".dimmed(),
+        interface
+    );
+    Ok(())
 }
 
 fn up(
@@ -1268,6 +1359,8 @@ fn run(opts: &Opts) -> Result<(), Error> {
             install_opts,
             nat,
         } => install(opts, &hosts, &install_opts, &nat, &invite, listen_port)?,
+        Command::PqDisable { interface } => pq_disable(opts, &interface)?,
+        Command::PqEnable { interface } => pq_enable(opts, &interface)?,
         Command::Show {
             short,
             tree,

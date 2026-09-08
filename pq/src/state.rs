@@ -431,6 +431,38 @@ impl EndpointState {
         Ok(())
     }
 
+    /// Explicit administrative disable (design 5.11): unlike
+    /// `emergency_retire`, this is an ordinary action over locally-trusted
+    /// state, not a response to lost/corrupt keys, so it must *retain*
+    /// `confirmed`/sequence/`prior_pq` state rather than discard it --
+    /// "retain recovery/replay state until retirement is durable". Each
+    /// relationship's in-flight `pending` exchange is explicitly retired
+    /// (design 5.11's "drain... or explicitly retire it", the latter
+    /// alternative), not drained to completion. The caller submits this
+    /// retirement (`pq_sync::submit_pending_registration`); once the
+    /// server confirms it, `enrollment` advances past `Retiring` via
+    /// `accept_registration`. A later `replace` with a fresh identity is
+    /// how this interface re-enables.
+    pub fn disable(&mut self) -> Result<()> {
+        if self.enrollment == Enrollment::Retiring
+            || self.registration.lifecycle == Lifecycle::Retired
+        {
+            return Err(Error::Conflict);
+        }
+        self.registration = Registration {
+            expected_revision: Some(self.identity.bundle.bundle_revision),
+            pq_version: 1,
+            lifecycle: Lifecycle::Retired,
+            bundle: self.identity.bundle.clone(),
+            emergency: false,
+        };
+        self.enrollment = Enrollment::Retiring;
+        for r in self.relationships.values_mut() {
+            r.pending = None;
+        }
+        Ok(())
+    }
+
     /// Local escape hatch for lost private keys/replay state or a stale
     /// restored backup: block every relationship and discard its recovery
     /// secrets, never resuming them under a later identity. The caller
@@ -747,6 +779,83 @@ mod tests {
         .unwrap();
         state.replace(fresh).unwrap();
         assert_eq!(state.enrollment, Enrollment::Registering);
+    }
+
+    #[test]
+    fn explicit_disable_retains_recovery_state_and_re_enable_never_resets_it() {
+        let mut state = base_state(2, 1);
+        let other = Number::new(3).unwrap();
+        let old_revision = state.identity.bundle.bundle_revision;
+        let remote =
+            Identity::generate(Binary([8; 32]), Number::new(5).unwrap(), &mut SystemRandom)
+                .unwrap()
+                .bundle;
+        let confirmed = Confirmed {
+            local_bundle_id: Binary([0; 16]),
+            remote_bundle_id: Binary([0; 16]),
+            sequence: Number::new(4).unwrap(),
+            exchange_id: Binary([0; 16]),
+            transcript_hash: Binary([0; 32]),
+            psk: StoredSecret(Secret::from_bytes([9; 32])),
+            completed_at: 100,
+        };
+        state.relationships.insert(
+            other,
+            Relationship {
+                remote: remote.clone(),
+                sequence: Number::new(4).unwrap(),
+                prior_pq: true,
+                operator_psk_id: Binary([0; 16]),
+                operator_psk: StoredSecret(Secret::from_bytes([0; 32])),
+                confirmed: Some(confirmed),
+                pending: Some(dummy_pending(&state.identity.bundle, &remote, true)),
+                gated: false,
+                status: Status::Confirmed,
+                activity: None,
+            },
+        );
+
+        state.disable().unwrap();
+        assert_eq!(state.enrollment, Enrollment::Retiring);
+        assert_eq!(state.registration.lifecycle, Lifecycle::Retired);
+        assert!(!state.registration.emergency); // ordinary disable, not lost-key emergency.
+        let relationship = &state.relationships[&other];
+        assert!(relationship.pending.is_none()); // explicitly retired, not drained.
+        // Unlike emergency_retire, disable retains recovery/replay state
+        // until retirement is durable: confirmed/prior_pq/sequence/gated/
+        // status are all untouched.
+        assert!(relationship.confirmed.is_some());
+        assert!(relationship.prior_pq);
+        assert!(!relationship.gated);
+        assert_eq!(relationship.status, Status::Confirmed);
+        assert_eq!(relationship.sequence, Number::new(4).unwrap());
+
+        // Disabling again (or an already-retired lifecycle) is rejected,
+        // not silently repeated.
+        assert!(state.disable().is_err());
+
+        let retired = AdvertisedBundle {
+            pq_version: 1,
+            lifecycle: Lifecycle::Retired,
+            bundle: state.registration.bundle.clone(),
+        };
+        state.accept_registration(&retired).unwrap();
+        assert_eq!(state.enrollment, Enrollment::Retired);
+
+        // Re-enable: a fresh identity via the existing `replace`, which
+        // never resets this relationship's sequence/prior_pq.
+        let fresh = Identity::generate(
+            Binary([7; 32]),
+            old_revision.next().unwrap(),
+            &mut SystemRandom,
+        )
+        .unwrap();
+        state.replace(fresh).unwrap();
+        assert_eq!(state.enrollment, Enrollment::Registering);
+        let relationship = &state.relationships[&other];
+        assert_eq!(relationship.sequence, Number::new(4).unwrap());
+        assert!(relationship.prior_pq);
+        assert!(relationship.gated); // replace blocks pending re-confirmation.
     }
 
     #[test]

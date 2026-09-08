@@ -12,6 +12,7 @@
 //! instance -- never a stale one carried over from before the rotation.
 use crate::gate;
 use innernet_pq::{
+    api::Lifecycle,
     crypto::Candidate,
     engine::Installer,
     protocol::{Bundle, Number},
@@ -77,6 +78,11 @@ pub fn reconcile_gate(
     state: &EndpointState,
     peers: &[Peer],
 ) {
+    if state.registration.lifecycle == Lifecycle::Retired {
+        // Disabling/disabled: interface::fetch()'s proactive pass just
+        // gated every relationship unconditionally; never reopen one here.
+        return;
+    }
     let mut installer = RealInstaller::new(interface, backend, peers);
     for relationship in state.relationships.values() {
         if relationship.pending.is_some() || relationship.confirmed.is_none() {

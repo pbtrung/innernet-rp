@@ -8,7 +8,9 @@ use crate::{
     api::Exchange,
     crypto::{self, Candidate, HybridPublic, Random},
     protocol::{Binary, Bundle, Decision, Kind, Message, Number, Phase, Transcript},
-    state::{CandidateSecrets, Confirmed, EndpointState, Pending, Status, StoredSecret},
+    state::{
+        CandidateSecrets, Confirmed, EndpointState, Enrollment, Pending, Status, StoredSecret,
+    },
 };
 
 /// Installs a candidate PSK and observes a fresh authenticated handshake.
@@ -109,6 +111,16 @@ impl EndpointState {
             return Ok(Action::None);
         }
         let remote_bundle = relationship.remote.clone();
+
+        // Explicit disable (design 5.11) clears every pending exchange
+        // immediately and never starts a new one; this is what actually
+        // stops new work while draining/retiring, since `disable()`
+        // deliberately leaves `gated`/`status` untouched (see its doc
+        // comment) so recovery/replay state stays intact until the
+        // retirement itself is durable.
+        if self.enrollment == Enrollment::Retiring {
+            return Ok(Action::None);
+        }
 
         if relationship.pending.is_none() {
             if initiator {
@@ -819,6 +831,24 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(action, Action::Send(_)));
+    }
+
+    #[test]
+    fn retiring_never_starts_a_new_exchange() {
+        let (mut a, _) = peer(2, 1);
+        let (_, bundle_b) = peer(3, 1);
+        let b_id = Number::new(3).unwrap();
+        a.observe_remote(b_id, &bundle_b, Lifecycle::Enabled)
+            .unwrap();
+        let mut rng = SystemRandom;
+        let mut installer_a = FakeInstaller::default();
+
+        a.enrollment = crate::state::Enrollment::Retiring;
+        let action = a
+            .reconcile(b_id, None, 0, 300, 0, &mut installer_a, &mut rng)
+            .unwrap();
+        assert_eq!(action, Action::None);
+        assert!(a.relationships[&b_id].pending.is_none());
     }
 
     #[test]

@@ -180,6 +180,38 @@ pub fn register(
     Ok(state)
 }
 
+/// Submits `state.registration` while a change (explicit disable via
+/// `EndpointState::disable`, or re-enable via `EndpointState::replace`) is
+/// still pending confirmation, advancing `enrollment` once the server's
+/// response confirms it via `accept_registration`. A no-op once `enrollment`
+/// has already settled to `Advertised`/`Retired`. A retirement (`lifecycle
+/// == Retired`) must hit `?retire=1`; any other pending registration hits
+/// the plain path -- the server rejects a mismatch between the two
+/// (`server/src/api/pq.rs`'s `register` handler).
+pub fn submit_pending_registration(
+    rest_client: &RestClient,
+    state: &mut EndpointState,
+) -> anyhow::Result<()> {
+    if !matches!(
+        state.enrollment,
+        Enrollment::Registering | Enrollment::Retiring
+    ) {
+        return Ok(());
+    }
+    let path = if state.registration.lifecycle == Lifecycle::Retired {
+        "/user/pq-keys?retire=1"
+    } else {
+        "/user/pq-keys"
+    };
+    let response: AdvertisedBundle = rest_client
+        .http_form("PUT", path, &state.registration)
+        .context("submitting a changed PQ registration")?;
+    state
+        .accept_registration(&response)
+        .context("the server's response did not match the submitted registration")?;
+    Ok(())
+}
+
 /// Walks every page, restarting from the top if the visibility revision
 /// changes mid-walk.
 pub fn fetch_state(
