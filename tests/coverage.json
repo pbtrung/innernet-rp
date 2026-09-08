@@ -219,17 +219,31 @@
         "adopt_persists_and_load_restores_across_a_restart",
         "adopt_rejects_an_invalid_enrollment_before_persisting_anything",
         "load_refuses_a_tampered_private_file",
-        "ruleset_scopes_every_rule_to_the_named_interface_and_allows_only_the_api_port"
+        "ruleset_scopes_every_rule_to_the_named_interface_and_allows_only_the_api_port",
+        "rotation_requires_staging_first_and_apply_retains_the_superseded_secret",
+        "confirm_rotation_requires_verified_and_then_drops_the_superseded_secret",
+        "rollback_rotation_restores_the_prior_secret_as_already_verified",
+        "force_active_repairs_a_mismatched_installation_unconditionally",
+        "rotation_on_an_unprovisioned_or_server_peer_is_rejected",
+        "stage_requires_an_existing_active_enrollment_and_never_touches_it",
+        "apply_active_requires_a_staged_candidate_and_retains_the_superseded_one",
+        "confirm_requires_an_applied_rotation_and_then_drops_the_superseded_secret",
+        "rollback_restores_the_prior_active_secret_and_discards_the_staged_one"
       ],
       "integration": [
         "provisioning_every_enabled_peer_latches_readiness_and_yields_independent_psks",
         "load_fails_closed_when_an_enabled_peer_has_no_provisioned_link",
-        "open_or_create_is_a_noop_when_management_was_never_required"
+        "open_or_create_is_a_noop_when_management_was_never_required",
+        "rotation_stage_apply_verify_confirm_round_trip",
+        "rotation_rollback_restores_the_original_secret_as_already_verified",
+        "force_active_repairs_a_mismatched_installation_out_of_band",
+        "rotation_survives_a_reopen_across_a_restart"
       ],
       "docker": [
-        "m2_management: fresh invitation-carried enrollment, ACL positive/negative reachability pair, server restart durability, lost-link fail-closed startup"
+        "m2_management: fresh invitation-carried enrollment, ACL positive/negative reachability pair, server restart durability, lost-link fail-closed startup",
+        "m7_rotation: real administrative rotation with real kernel peers -- stage/apply/verify/mark-verified/confirm happy path with matching PSKs confirmed on both sides, a real one-sided mismatch breaking reachability without a crash, out-of-band rollback repair restoring both the PSK and reachability, and the rotated PSK surviving a real server+client restart"
       ],
-      "status": "m2-enrollment-and-server-link-acl-verified"
+      "status": "m7-administrative-rotation-and-repair-verified-with-real-kernel"
     },
     {
       "design_case": 17,

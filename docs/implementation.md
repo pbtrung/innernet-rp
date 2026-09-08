@@ -723,7 +723,126 @@ Explicitly out of scope for M6: bilateral downgrade's coordinated
 two-sided handshake (needs a new wire-protocol message — a genuine
 protocol addition, not a wiring gap); and old/new binary compatibility,
 which is not a project goal (this is a new, independent design/app/
-binary, not a fork of upstream innernet). This completes the milestones
-requested in "implement M3-M6"; M7-M9 (management PSK rotation,
-cross-platform build profiles, and the full security/fault/load review)
-are not part of this pass.
+binary, not a fork of upstream innernet). This closed the milestones
+requested in "implement M3-M6"; the user then asked for all remaining
+milestones, continued below starting with M7.
+
+## M7 — Management PSK rotation and operational recovery
+
+M7 turns M2's working-but-static management-link provisioning into a
+real administrative rotation/recovery capability (design 5.10, design
+case 16): independent-access staging, coordinated replacement,
+fresh-handshake/API verification, and removal of superseded secrets only
+after confirmation. Automatic rotation stays explicitly out of scope for
+v1 -- every primitive below is operator/script-driven via
+`--independent-admin-access`, never triggered by the pq mailbox or a
+background timer.
+
+Research before implementation found `ManagementLink.verified`/
+`Manager::mark_verified` were dead code (present since M2, never called
+from anywhere), and `ServerState::provision` was create-once and
+idempotent with no rotation primitive at all. `pq::state::ManagementLink`
+gained `staged`/`previous: Option<StagedLink>` fields
+(`#[serde(default)]`, so old persisted state still loads) and five new
+methods matching design 5.10's four steps plus its out-of-band repair
+path: `stage_rotation` (durably stages a candidate without touching the
+live secret; idempotent like `provision`), `apply_rotation` (promotes
+staged to active, retains the superseded secret, marks the link
+unverified), `confirm_rotation` (discards the superseded secret --
+**requires `verified == true` first**, finally giving `mark_verified` a
+real purpose), `rollback_rotation` (restores the pre-rotation secret,
+marked already-verified), and `force_active` (unconditional out-of-band
+repair for a mismatched installation, independent of the other side's
+cooperation). `provision_id` is regenerated freely on each transition
+since nothing anywhere ever compares it -- confirmed by grep before
+relying on that assumption, and pinned down by a unit test. Matching
+`ServerState`/`Manager` wrapper methods persist through the existing
+`Store` save-fails-rolls-back-in-memory-state pattern `mark_verified`
+already used. New server CLI: `stage-management-rotation`,
+`apply-management-rotation`, `mark-management-verified`,
+`confirm-management-rotation`, `rollback-management-rotation`,
+`repair-management`, all `--independent-admin-access` gated and
+`--name`-peer-selecting; `apply`/`rollback`/`repair` push the resulting
+secret into the live kernel peer entry immediately via `DeviceUpdate`,
+matching `add_peer`'s existing direct-kernel-touch pattern (independent
+of whether `serve` is running as a long-lived process).
+
+Client side: the bare `Enrollment` `client-core::management` used to
+persist became a `ManagementState{active, staged, previous}` wrapper at
+the same file path (private, local-only, non-wire state -- no
+compatibility burden). New `stage`/`apply_active`/`confirm`/`rollback`
+mirror the server-side state machine. All reads/writes go through one
+`Store` instance per operation (`read_state` for read-only callers,
+`update_state` for a load-mutate-save cycle): `Store`'s
+generation/digest CAS guard is populated only by a `load` on that same
+instance, so an earlier draft that split a read and a later
+separately-opened write always looked like a conflicting external
+change and had to be restructured before the unit tests would pass.
+New client CLI: `stage-management`, `apply-management`,
+`confirm-management`, `rollback-management`, mirroring
+`pq-disable`/`pq-enable`'s style.
+
+A real, previously-existing fail-open gap was found and fixed:
+`client-core::interface::fetch()` read `config.server.management.
+is_some()` (the durable "this network requires management" signal set
+at redemption) nowhere -- it just used whatever `crate::management::
+load(...)` returned, silently bringing up an *unprotected* server link
+if the private store was lost or corrupted-and-removed while the
+network still required management. `fetch()` now bails in that case,
+matching design case 16's "missing secrets block startup ... denied."
+
+Building the Docker scenario surfaced a second real, previously-existing
+gap: `wg set`-ing a new PSK onto an already-established peer entry never
+tears down the existing session -- WireGuard only mixes the PSK into the
+*next* handshake -- so a rotation's "apply" step was silently leaving
+traffic encrypted under the superseded secret for up to
+REJECT_AFTER_TIME (~180s). Both `client-core::management::
+push_active_to_kernel` and `server::push_management_psk_to_kernel` now
+remove the peer (reading back its existing endpoint/allowed-ips/
+keepalive first, since removal drops them) and re-add it whole,
+matching design 5.10 step 2's explicit "remove old sessions" -- not
+just a config update.
+
+`tests/docker/docker-compose.m7.yml` reuses M2's one-server/two-data-
+peer `require-management` topology (rotation is the same link's
+lifecycle continuing, not a new one). `m7_rotation.sh`: peer-a exercises
+the full happy path (stage -> apply on both sides -> a real fresh
+handshake and authenticated request succeed on the rotated secret ->
+mark-verified -> confirm), then a server+peer-a restart proves the
+rotated (not the original) secret is what survives. peer-b exercises the
+failure/repair path: stage+apply on the server only creates a real
+one-sided PSK mismatch; the link breaks (not a crash or a hang, matching
+peer-b's own daemon log: "Could not connect to the innernet server,
+proceeding with cached state instead"); `rollback-management-rotation`
+repairs it out of band without needing peer-b's cooperation, since
+peer-b's client was never touched and so never left "old" in the first
+place. A real, previously-existing test-script bug was found and fixed
+along the way: identifying `wg show dump` rows by endpoint IP breaks
+after a remove-then-re-add, since the endpoint resets to `(none)` until
+a fresh handshake arrives -- rows must be matched by public key instead.
+
+The test environment repeatedly killed long-running automated Docker
+runs for memory pressure during this milestone's work, before a single
+uninterrupted end-to-end run could be captured. Every individual
+assertion in the scenario -- independent PSKs, the full rotation round
+trip with matching PSKs confirmed on both sides, the real one-sided
+mismatch breaking reachability without a crash, rollback repair
+restoring both the PSK and reachability, and the rotated PSK surviving
+a real restart -- was nonetheless independently confirmed against real
+containers and a real kernel, via a combination of full scenario runs
+(which completed most steps before an interruption) and targeted manual
+step-by-step verification for the remainder.
+
+Tested on Linux x86_64, Arch Linux, 2026-09-08, Docker 29.7.2:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --workspace --locked` | all suites pass |
+| `cargo clippy --workspace --locked --all-targets -- -D warnings` (default, and again with `--features pq-dev-harness,test-harness`) | passed both ways |
+| `bash tests/run.sh unit` / `integration` | passed |
+| `bash tests/docker/scenarios/m7_rotation.sh` | every individual assertion confirmed passing via a combination of full runs and manual step-by-step verification (see above); no assertion failed on its merits |
+
+Explicitly out of scope for M7: automatic/mailbox-driven rotation
+(design 5.10 is explicit that this is not part of v1); this project has
+no old/new binary compatibility requirement, so no legacy-binary
+rotation interop was tested (consistent with M6's scope decision).

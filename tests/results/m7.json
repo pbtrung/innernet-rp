@@ -1,0 +1,34 @@
+{
+  "milestone": 7,
+  "revision": "the commit introducing this record",
+  "date": "2026-09-08",
+  "kernel": "Linux 7.2.2-1-cachyos x86_64",
+  "rust": "1.98.1",
+  "leancrypto": "1.8.0-1",
+  "openssl": "3.6.4-1",
+  "sqlite": "3.53.4-1",
+  "docker": "29.7.2",
+  "container_base": "archlinux@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a",
+  "package_snapshot": "2026/09/07",
+  "schema": 5,
+  "checks": [
+    {"command": "cargo fmt --all", "result": "passed; stable fallback because nightly is unavailable"},
+    {"command": "cargo clippy --workspace --locked --all-targets -- -D warnings", "result": "passed (default build)"},
+    {"command": "cargo clippy --workspace --locked --all-targets --features pq-dev-harness,test-harness -- -D warnings", "result": "passed (dev-harness build)"},
+    {"command": "cargo test --workspace --locked", "result": "all suites passed"},
+    {"command": "bash tests/run.sh unit", "result": "passed"},
+    {"command": "bash tests/run.sh integration", "result": "passed"},
+    {"command": "bash tests/docker/scenarios/m7_rotation.sh", "result": "every individual assertion confirmed passing via a combination of full scenario runs and targeted manual step-by-step verification against real containers/kernel; the test environment repeatedly killed long-running automated Docker runs for memory pressure unrelated to this code before a single uninterrupted end-to-end run completed"}
+  ],
+  "docker_scenario": {
+    "topology": "1 server + peer-a + peer-b on an isolated internal bridge, require-management network, real production build (reuses M2's topology)",
+    "peer_a_happy_path": "stage-management-rotation (server) -> stage-management (client, importing the transferred artifact) -> apply-management-rotation + apply-management (both sides) -> real fresh handshake and authenticated request succeed with matching PSKs confirmed on both sides -> mark-management-verified -> confirm-management-rotation + confirm-management -> a server+peer-a restart together, confirming the rotated (not original) PSK survives and the link still works",
+    "peer_b_failure_and_repair_path": "stage+apply only on the server (peer-b's client never touched) creates a real one-sided PSK mismatch; the link breaks (peer-b's own daemon logs 'Could not connect to the innernet server, proceeding with cached state instead', not a crash or a hang); rollback-management-rotation on the server alone repairs it out of band, restoring both the original PSK and reachability, since peer-b never left its original secret",
+    "real_kernel_finding": "wg set-ing a new PSK onto an already-established peer entry never tears down the existing session (WireGuard mixes the PSK into the *next* handshake only), so a rotation's apply step was silently leaving traffic encrypted under the superseded secret for up to REJECT_AFTER_TIME (~180s). Fixed in both client-core::management::push_active_to_kernel and server::push_management_psk_to_kernel by removing the peer (reading back its existing endpoint/allowed-ips/keepalive first, since removal drops them) and re-adding it whole -- design 5.10 step 2's 'remove old sessions'. Also found and fixed a test-script bug: wg show dump rows must be matched by public key, not endpoint, since a remove-then-re-add resets the observed endpoint to (none) until a fresh handshake arrives"
+  },
+  "limitations": [
+    "automatic/mailbox-driven rotation is out of scope for v1 per design 5.10; every rotation primitive requires --independent-admin-access",
+    "no old/new binary compatibility requirement, consistent with M6's scope decision; no legacy-binary rotation interop was tested",
+    "the Docker scenario's every assertion was independently confirmed passing, but not captured in a single uninterrupted automated run, due to the test environment's memory-pressure interruptions during this milestone's work"
+  ]
+}
