@@ -27,6 +27,7 @@ use std::{
     ops::Deref,
     path::{Path, PathBuf},
     sync::Arc,
+    thread,
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -168,6 +169,26 @@ impl ServerConfig {
     }
 }
 
+/// A one-shot `Device::get(...).is_ok()` check can't distinguish "the
+/// interface genuinely doesn't exist yet" (the intentional skip this
+/// guards) from "it exists but this one netlink read raced against
+/// concurrent kernel interface activity and lost". A few retries resolve
+/// the latter, transient case while still skipping cleanly when the
+/// interface really isn't up (tests, or a network that has never been
+/// served).
+fn kernel_interface_ready(interface: &InterfaceName, backend: Backend) -> bool {
+    const ATTEMPTS: u32 = 5;
+    for attempt in 0..ATTEMPTS {
+        if Device::get(interface, backend).is_ok() {
+            return true;
+        }
+        if attempt + 1 < ATTEMPTS {
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    false
+}
+
 fn open_database_connection(
     interface: &InterfaceName,
     conf: &ServerConfig,
@@ -216,7 +237,7 @@ pub fn add_peer(
             .map(|manager| manager.provision_new_peer(peer.id, &conn))
             .transpose()?;
 
-        if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
+        if cfg!(not(test)) && kernel_interface_ready(interface, network.backend) {
             // Update the current WireGuard interface with the new peers.
             let peer_config = match &manager {
                 Some(manager) => manager.peer_config(&peer)?,
@@ -382,7 +403,7 @@ fn push_management_psk_to_kernel(
     manager: &management::Manager,
     peer: &DatabasePeer,
 ) -> Result<(), Error> {
-    if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
+    if cfg!(not(test)) && kernel_interface_ready(interface, network.backend) {
         let key = Key::from_base64(&peer.public_key)?;
         // Force a fresh handshake -- design 5.10 step 2's "remove old
         // sessions". A `wg set` PSK change alone never tears down an

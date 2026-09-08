@@ -1,0 +1,91 @@
+# M9 scenario: design case 14, the quantitative flood/load target. Real
+# kernel peers, a real running server under a real resource limit
+# (2 vCPU / 2 GiB, matching the design's exact budget), a real sustained
+# write-attempt flood via client-core/examples/pq_load_harness.rs, real
+# concurrent honest exchange progress, and a real ordinary state-fetch
+# latency sample -- all measured, not simulated.
+services:
+  server:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    cpus: 2.0
+    mem_limit: 2g
+    networks:
+      pq_m9l:
+        ipv4_address: 10.85.0.2
+    volumes:
+      - server_config:/etc/innernet-server
+      - server_data:/var/lib/innernet-server
+      - invites:/invites
+      - ./scenarios/server-entrypoint-m9-load.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  peer-load:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m9l:
+        ipv4_address: 10.85.0.3
+    environment:
+      - NET=pqm9l
+    volumes:
+      - peer_load_config:/etc/innernet
+      - peer_load_data:/var/lib/innernet
+      - invites:/invites
+      # Never enables PQ on its own: the load harness (m9_load.sh) owns
+      # this interface's one and only PQ registration directly, so
+      # nothing else concurrently registers/rotates it out from under
+      # the flood.
+      - ./scenarios/peer-entrypoint-m9-plain.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-load"]
+
+  peer-honest-a:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m9l:
+        ipv4_address: 10.85.0.4
+    environment:
+      - NET=pqm9l
+    volumes:
+      - peer_honest_a_config:/etc/innernet
+      - peer_honest_a_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m9.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-honest-a"]
+
+  peer-honest-b:
+    image: innernet-pq-runtime:m9
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m9l:
+        ipv4_address: 10.85.0.5
+    environment:
+      - NET=pqm9l
+    volumes:
+      - peer_honest_b_config:/etc/innernet
+      - peer_honest_b_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m9.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-honest-b"]
+
+networks:
+  pq_m9l:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.85.0.0/24
+
+volumes:
+  server_config:
+  server_data:
+  peer_load_config:
+  peer_load_data:
+  peer_honest_a_config:
+  peer_honest_a_data:
+  peer_honest_b_config:
+  peer_honest_b_data:
+  invites:
