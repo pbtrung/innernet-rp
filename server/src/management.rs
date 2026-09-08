@@ -102,6 +102,95 @@ impl Manager {
         Ok(())
     }
 
+    /// Design 5.10 administrative rotation, driven entirely by an operator
+    /// or script passing `--independent-admin-access` -- never by the pq
+    /// mailbox or a background timer. Each step persists durably before
+    /// taking effect; a failed save rolls the in-memory link back so a
+    /// caller never observes state the store didn't actually keep.
+    fn rotate<F>(&mut self, id: i64, action: F) -> Result<(), ServerError>
+    where
+        F: FnOnce(&mut innernet_pq::state::ServerState, Number) -> innernet_pq::Result<()>,
+    {
+        let number = Number::new(id as u64)?;
+        let before = self.state.links.get(&number).cloned();
+        action(&mut self.state, number).map_err(|_| ServerError::Unavailable)?;
+        if self.store.save(&self.state).is_err() {
+            match before {
+                Some(before) => {
+                    self.state.links.insert(number, before);
+                },
+                None => {
+                    self.state.links.remove(&number);
+                },
+            }
+            return Err(ServerError::Unavailable);
+        }
+        Ok(())
+    }
+
+    /// Stages a rotation candidate for one peer without touching the
+    /// currently active, live secret (design 5.10 step 1).
+    pub fn stage_rotation(
+        &mut self,
+        id: i64,
+        adopted: Option<Secret<32>>,
+    ) -> Result<Enrollment, ServerError> {
+        self.rotate(id, |state, peer| {
+            state
+                .stage_rotation(peer, adopted, &mut SystemRandom)
+                .map(|_| ())
+        })?;
+        self.staged_enrollment(id)
+    }
+
+    /// Replaces the live secret with the staged one, retaining the
+    /// superseded secret until confirmed or rolled back (design 5.10 step 2).
+    pub fn apply_rotation(&mut self, id: i64) -> Result<(), ServerError> {
+        self.rotate(id, |state, peer| state.apply_rotation(peer).map(|_| ()))
+    }
+
+    /// Discards the superseded secret once an operator has verified the
+    /// newly applied one actually works (design 5.10 step 3). Requires
+    /// `mark_verified` to have already run for this peer.
+    pub fn confirm_rotation(&mut self, id: i64) -> Result<(), ServerError> {
+        self.rotate(id, |state, peer| state.confirm_rotation(peer).map(|_| ()))
+    }
+
+    /// Restores the secret that was active before the rotation attempt
+    /// began (design 5.10 step 4's "restore old to both").
+    pub fn rollback_rotation(&mut self, id: i64) -> Result<(), ServerError> {
+        self.rotate(id, |state, peer| state.rollback_rotation(peer).map(|_| ()))
+    }
+
+    /// Out-of-band repair for a mismatched installation: forces this side's
+    /// active secret to an explicitly chosen value, independent of the
+    /// other side's cooperation.
+    pub fn force_active(&mut self, id: i64, secret: Secret<32>) -> Result<(), ServerError> {
+        self.rotate(id, |state, peer| {
+            state
+                .force_active(peer, secret, &mut SystemRandom)
+                .map(|_| ())
+        })
+    }
+
+    /// The staged rotation candidate as a transferable enrollment artifact,
+    /// for out-of-band delivery to the affected peer.
+    pub fn staged_enrollment(&self, peer: i64) -> Result<Enrollment, ServerError> {
+        let link = self
+            .state
+            .links
+            .get(&Number::new(peer as u64)?)
+            .ok_or(ServerError::Unavailable)?;
+        let staged = link.staged.as_ref().ok_or(ServerError::Unavailable)?;
+        Ok(Enrollment {
+            network_id: self.state.network_id.0,
+            provision_id: staged.provision_id.0,
+            peer_id: peer,
+            server_id: self.state.server_id.get() as i64,
+            psk: SecretKey::from_bytes(*staged.psk.0 .0).map_err(|_| ServerError::Unavailable)?,
+        })
+    }
+
     /// Short-lived handle for administrative commands (`add-peer`,
     /// `enable-peer`) that run independently of a long-lived `serve` process.
     /// Returns `None` when this network has never required management, so
@@ -375,5 +464,112 @@ mod tests {
         }
         assert!(!management_ready(&conn));
         assert!(Manager::load(server.conf(), &server.interface(), &config, &conn).is_err());
+    }
+
+    /// Provisions every enabled peer (`load`'s fail-closed check otherwise
+    /// refuses to reopen), returning the first peer's ID for rotation ops.
+    fn manager_with_one_provisioned_peer(server: &Server) -> (Manager, i64) {
+        let conn = server.db();
+        let conn = conn.lock();
+        let config = require_management(server);
+        let enabled_ids: Vec<i64> = DatabasePeer::list(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|p| !p.is_disabled && !db::pq::is_server(&conn, p.id).unwrap())
+            .map(|p| p.id)
+            .collect();
+        let mut manager =
+            Manager::open_or_create(server.conf(), &server.interface(), &config, &conn)
+                .unwrap()
+                .unwrap();
+        for id in &enabled_ids {
+            manager.provision_new_peer(*id, &conn).unwrap();
+        }
+        (manager, enabled_ids[0])
+    }
+
+    #[test]
+    fn rotation_stage_apply_verify_confirm_round_trip() {
+        let server = Server::new().unwrap();
+        let (mut manager, peer_id) = manager_with_one_provisioned_peer(&server);
+        let original_psk = manager.state.links[&Number::new(peer_id as u64).unwrap()]
+            .psk
+            .clone();
+
+        let staged = manager.stage_rotation(peer_id, None).unwrap();
+        // Staging never changes the live secret used to build kernel config.
+        assert!(manager.state.links[&Number::new(peer_id as u64).unwrap()]
+            .psk
+            .0
+            .same(&original_psk.0));
+        assert!(!staged.psk.bytes().iter().all(|b| *b == 0));
+
+        // Confirming before applying, or before verifying, is refused.
+        assert!(manager.confirm_rotation(peer_id).is_err());
+        manager.apply_rotation(peer_id).unwrap();
+        assert!(!manager.state.links[&Number::new(peer_id as u64).unwrap()]
+            .psk
+            .0
+            .same(&original_psk.0));
+        assert!(manager.confirm_rotation(peer_id).is_err());
+
+        manager.mark_verified(peer_id).unwrap();
+        manager.confirm_rotation(peer_id).unwrap();
+        assert!(manager.state.links[&Number::new(peer_id as u64).unwrap()]
+            .previous
+            .is_none());
+    }
+
+    #[test]
+    fn rotation_rollback_restores_the_original_secret_as_already_verified() {
+        let server = Server::new().unwrap();
+        let (mut manager, peer_id) = manager_with_one_provisioned_peer(&server);
+        let original_psk = manager.state.links[&Number::new(peer_id as u64).unwrap()]
+            .psk
+            .clone();
+
+        manager.stage_rotation(peer_id, None).unwrap();
+        manager.apply_rotation(peer_id).unwrap();
+        manager.rollback_rotation(peer_id).unwrap();
+        let link = &manager.state.links[&Number::new(peer_id as u64).unwrap()];
+        assert!(link.psk.0.same(&original_psk.0));
+        assert!(link.verified);
+    }
+
+    #[test]
+    fn force_active_repairs_a_mismatched_installation_out_of_band() {
+        let server = Server::new().unwrap();
+        let (mut manager, peer_id) = manager_with_one_provisioned_peer(&server);
+        let forced = Secret::from_bytes([77; 32]);
+        manager
+            .force_active(peer_id, Secret::from_bytes([77; 32]))
+            .unwrap();
+        let link = &manager.state.links[&Number::new(peer_id as u64).unwrap()];
+        assert!(link.psk.0.same(&forced));
+        assert!(!link.verified);
+        assert!(link.staged.is_none());
+        assert!(link.previous.is_none());
+    }
+
+    #[test]
+    fn rotation_survives_a_reopen_across_a_restart() {
+        let server = Server::new().unwrap();
+        let (mut manager, peer_id) = manager_with_one_provisioned_peer(&server);
+        manager.stage_rotation(peer_id, None).unwrap();
+        manager.apply_rotation(peer_id).unwrap();
+        let rotated_psk = manager.state.links[&Number::new(peer_id as u64).unwrap()]
+            .psk
+            .clone();
+        drop(manager);
+
+        let config = require_management(&server);
+        let conn = server.db();
+        let conn = conn.lock();
+        let reopened = Manager::load(server.conf(), &server.interface(), &config, &conn)
+            .unwrap()
+            .unwrap();
+        let link = &reopened.state.links[&Number::new(peer_id as u64).unwrap()];
+        assert!(link.psk.0.same(&rotated_psk.0));
+        assert!(link.previous.is_some()); // not yet confirmed, survives the reopen too.
     }
 }
