@@ -83,12 +83,14 @@ impl EndpointState {
     /// Advances one data-peer relationship by exactly the durable steps that
     /// are ready this cycle. The caller must persist this state before
     /// acting on the returned `Action`.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconcile(
         &mut self,
         other: Number,
         remote: Option<&Exchange>,
         now: u64,
         rotation_interval: u64,
+        idle_timeout: u64,
         installer: &mut impl Installer,
         rng: &mut impl Random,
     ) -> Result<Action> {
@@ -111,9 +113,21 @@ impl EndpointState {
         if relationship.pending.is_none() {
             if initiator {
                 let due = match &relationship.confirmed {
-                    None => true,
+                    None => true, // Initial exchanges never pause (design 5.12).
                     Some(confirmed) => {
-                        now.saturating_sub(confirmed.completed_at) >= rotation_interval
+                        let interval_elapsed =
+                            now.saturating_sub(confirmed.completed_at) >= rotation_interval;
+                        // idle_timeout == 0 disables pausing; a relationship
+                        // with no activity baseline yet has never had a
+                        // chance to prove itself idle, so it is never paused
+                        // either (matching "first observation counts as
+                        // activity" -- the caller samples counters via
+                        // observe_activity before calling reconcile).
+                        let idle_paused = idle_timeout != 0
+                            && relationship.activity.as_ref().is_some_and(|a| {
+                                now.saturating_sub(a.last_active_at) >= idle_timeout
+                            });
+                        interval_elapsed && !idle_paused
                     },
                 };
                 if !due {
@@ -252,6 +266,7 @@ impl EndpointState {
         // (which durably_sent consults) is trustworthy proof of receipt.
         if pending.decision.phase != Phase::Aborted
             && !durably_sent(remote, pending, self_id)
+            && pending.next_retry_at <= now
             && let Some(last) = pending.outbox.last()
         {
             return Ok(Action::Send(Box::new(last.clone())));
@@ -275,6 +290,8 @@ impl EndpointState {
                     )?;
                     pending.decision.advance(Kind::Commit, true)?;
                     pending.outbox.push(message.clone());
+                    pending.attempts = 0;
+                    pending.next_retry_at = 0;
                     Ok(Action::Send(Box::new(message)))
                 } else {
                     Ok(Action::None) // responder already replied; waiting for commit.
@@ -300,6 +317,8 @@ impl EndpointState {
                             .decision
                             .advance(Kind::Installed, sender_is_initiator)?;
                         pending.outbox.push(message.clone());
+                        pending.attempts = 0;
+                        pending.next_retry_at = 0;
                         return Ok(Action::Send(Box::new(message)));
                     }
                     return Ok(Action::None); // initiator waits for the responder's install receipt.
@@ -323,6 +342,8 @@ impl EndpointState {
                             .decision
                             .advance(Kind::Confirmed, sender_is_initiator)?;
                         pending.outbox.push(message.clone());
+                        pending.attempts = 0;
+                        pending.next_retry_at = 0;
                         return Ok(Action::Send(Box::new(message)));
                     }
                     return Ok(Action::None);
@@ -345,6 +366,28 @@ impl EndpointState {
                 Ok(Action::Complete)
             },
         }
+    }
+
+    /// Records that sending `pending.outbox`'s last message for this
+    /// relationship failed, applying a bounded jittered backoff (1-60s,
+    /// doubling per consecutive attempt) before `reconcile`'s retry check
+    /// will attempt it again -- design 5.12's "bounded jittered backoff...
+    /// checked by the existing sync scheduler", finally reading the
+    /// `attempts`/`next_retry_at` fields `Pending` has carried since M2.
+    pub fn note_send_failure(
+        &mut self,
+        other: Number,
+        now: u64,
+        rng: &mut impl Random,
+    ) -> Result<()> {
+        let relationship = self.relationships.get_mut(&other).ok_or(Error::Invalid)?;
+        let pending = relationship.pending.as_mut().ok_or(Error::Invalid)?;
+        pending.attempts = pending.attempts.saturating_add(1);
+        let cap: u64 = 60;
+        let bound = cap.min(1u64.checked_shl(pending.attempts.min(6)).unwrap_or(cap));
+        let jitter = u64::from(crypto::random::<1>(rng)?.0[0]) % bound;
+        pending.next_retry_at = now.saturating_add((jitter + 1).min(cap));
+        Ok(())
     }
 }
 
@@ -468,6 +511,7 @@ mod tests {
                         exchange.as_ref(),
                         now,
                         rotation_interval,
+                        0,
                         installer_a,
                         rng,
                     )
@@ -484,6 +528,7 @@ mod tests {
                         exchange.as_ref(),
                         now,
                         rotation_interval,
+                        0,
                         installer_b,
                         rng,
                     )
@@ -584,7 +629,7 @@ mod tests {
         );
 
         let action = a
-            .reconcile(b_id, None, completed_at, 300, &mut installer_a, &mut rng)
+            .reconcile(b_id, None, completed_at, 300, 0, &mut installer_a, &mut rng)
             .unwrap();
         assert_eq!(action, Action::None);
         let action = a
@@ -593,6 +638,7 @@ mod tests {
                 None,
                 completed_at + 299,
                 300,
+                0,
                 &mut installer_a,
                 &mut rng,
             )
@@ -604,6 +650,222 @@ mod tests {
                 None,
                 completed_at + 300,
                 300,
+                0,
+                &mut installer_a,
+                &mut rng,
+            )
+            .unwrap();
+        assert!(matches!(action, Action::Send(_)));
+    }
+
+    #[test]
+    fn idle_timeout_pauses_a_repeat_rotation_and_resumes_promptly_on_activity() {
+        let (mut a, bundle_a) = peer(2, 1);
+        let (mut b, bundle_b) = peer(3, 1);
+        let a_id = Number::new(2).unwrap();
+        let b_id = Number::new(3).unwrap();
+        a.observe_remote(b_id, &bundle_b, Lifecycle::Enabled)
+            .unwrap();
+        b.observe_remote(a_id, &bundle_a, Lifecycle::Enabled)
+            .unwrap();
+        let mut rng = SystemRandom;
+        let mut installer_a = FakeInstaller::default();
+        let mut installer_b = FakeInstaller::default();
+        let completed_at = converge(
+            Peers {
+                a: &mut a,
+                b: &mut b,
+                a_id,
+                b_id,
+                installer_a: &mut installer_a,
+                installer_b: &mut installer_b,
+            },
+            0,
+            300,
+            &mut rng,
+        );
+
+        // A real driver samples real kernel counters; a fixed baseline is
+        // enough here to exercise the gate itself.
+        a.observe_activity(b_id, completed_at, 100, 100).unwrap();
+
+        // Well past the rotation interval, but no new activity since: paused.
+        let action = a
+            .reconcile(
+                b_id,
+                None,
+                completed_at + 1000,
+                300,
+                900,
+                &mut installer_a,
+                &mut rng,
+            )
+            .unwrap();
+        assert_eq!(action, Action::None);
+
+        // An unchanged sample leaves the baseline untouched: still paused.
+        a.observe_activity(b_id, completed_at + 1000, 100, 100)
+            .unwrap();
+        let action = a
+            .reconcile(
+                b_id,
+                None,
+                completed_at + 1000,
+                300,
+                900,
+                &mut installer_a,
+                &mut rng,
+            )
+            .unwrap();
+        assert_eq!(action, Action::None);
+
+        // New activity arrives: resumes promptly, on this very poll, without
+        // waiting another full rotation interval.
+        a.observe_activity(b_id, completed_at + 1001, 150, 150)
+            .unwrap();
+        let action = a
+            .reconcile(
+                b_id,
+                None,
+                completed_at + 1001,
+                300,
+                900,
+                &mut installer_a,
+                &mut rng,
+            )
+            .unwrap();
+        assert!(matches!(action, Action::Send(_)));
+    }
+
+    #[test]
+    fn idle_timeout_zero_never_pauses() {
+        let (mut a, bundle_a) = peer(2, 1);
+        let (mut b, bundle_b) = peer(3, 1);
+        let a_id = Number::new(2).unwrap();
+        let b_id = Number::new(3).unwrap();
+        a.observe_remote(b_id, &bundle_b, Lifecycle::Enabled)
+            .unwrap();
+        b.observe_remote(a_id, &bundle_a, Lifecycle::Enabled)
+            .unwrap();
+        let mut rng = SystemRandom;
+        let mut installer_a = FakeInstaller::default();
+        let mut installer_b = FakeInstaller::default();
+        let completed_at = converge(
+            Peers {
+                a: &mut a,
+                b: &mut b,
+                a_id,
+                b_id,
+                installer_a: &mut installer_a,
+                installer_b: &mut installer_b,
+            },
+            0,
+            300,
+            &mut rng,
+        );
+        a.observe_activity(b_id, completed_at, 100, 100).unwrap();
+
+        let action = a
+            .reconcile(
+                b_id,
+                None,
+                completed_at + 1000,
+                300,
+                0,
+                &mut installer_a,
+                &mut rng,
+            )
+            .unwrap();
+        assert!(matches!(action, Action::Send(_)));
+    }
+
+    #[test]
+    fn a_relationship_with_no_activity_baseline_yet_is_never_paused() {
+        let (mut a, bundle_a) = peer(2, 1);
+        let (mut b, bundle_b) = peer(3, 1);
+        let a_id = Number::new(2).unwrap();
+        let b_id = Number::new(3).unwrap();
+        a.observe_remote(b_id, &bundle_b, Lifecycle::Enabled)
+            .unwrap();
+        b.observe_remote(a_id, &bundle_a, Lifecycle::Enabled)
+            .unwrap();
+        let mut rng = SystemRandom;
+        let mut installer_a = FakeInstaller::default();
+        let mut installer_b = FakeInstaller::default();
+        let completed_at = converge(
+            Peers {
+                a: &mut a,
+                b: &mut b,
+                a_id,
+                b_id,
+                installer_a: &mut installer_a,
+                installer_b: &mut installer_b,
+            },
+            0,
+            300,
+            &mut rng,
+        );
+        assert!(a.relationships[&b_id].activity.is_none());
+
+        let action = a
+            .reconcile(
+                b_id,
+                None,
+                completed_at + 1000,
+                300,
+                900,
+                &mut installer_a,
+                &mut rng,
+            )
+            .unwrap();
+        assert!(matches!(action, Action::Send(_)));
+    }
+
+    #[test]
+    fn send_failure_applies_a_bounded_jittered_backoff_before_retrying() {
+        let (mut a, _) = peer(2, 1);
+        let (_, bundle_b) = peer(3, 1);
+        let b_id = Number::new(3).unwrap();
+        a.observe_remote(b_id, &bundle_b, Lifecycle::Enabled)
+            .unwrap();
+        let mut rng = SystemRandom;
+        let mut installer_a = FakeInstaller::default();
+
+        let action = a
+            .reconcile(b_id, None, 0, 300, 0, &mut installer_a, &mut rng)
+            .unwrap();
+        assert!(matches!(action, Action::Send(_)));
+
+        a.note_send_failure(b_id, 0, &mut rng).unwrap();
+        let next_retry_at = a.relationships[&b_id]
+            .pending
+            .as_ref()
+            .unwrap()
+            .next_retry_at;
+        assert!((1..=60).contains(&next_retry_at));
+
+        // Before the backoff elapses, the retry is suppressed.
+        let action = a
+            .reconcile(
+                b_id,
+                None,
+                next_retry_at - 1,
+                300,
+                0,
+                &mut installer_a,
+                &mut rng,
+            )
+            .unwrap();
+        assert_eq!(action, Action::None);
+
+        // Once next_retry_at passes, the retry proceeds again.
+        let action = a
+            .reconcile(
+                b_id,
+                None,
+                next_retry_at,
+                300,
+                0,
                 &mut installer_a,
                 &mut rng,
             )
@@ -627,20 +889,44 @@ mod tests {
 
         // A proposes; B has not replied yet.
         let propose = a
-            .reconcile(b_id, None, 0, 300, &mut installer_a, &mut rng)
+            .reconcile(b_id, None, 0, 300, 0, &mut installer_a, &mut rng)
             .unwrap();
         let exchange = apply(None, &propose, &a, b_id);
         let ready = b
-            .reconcile(a_id, exchange.as_ref(), 0, 300, &mut installer_b, &mut rng)
+            .reconcile(
+                a_id,
+                exchange.as_ref(),
+                0,
+                300,
+                0,
+                &mut installer_b,
+                &mut rng,
+            )
             .unwrap();
         let exchange = apply(exchange, &ready, &b, a_id);
 
         // Feed the exact same snapshot (B's ready already recorded) to A twice.
         let first = a
-            .reconcile(b_id, exchange.as_ref(), 0, 300, &mut installer_a, &mut rng)
+            .reconcile(
+                b_id,
+                exchange.as_ref(),
+                0,
+                300,
+                0,
+                &mut installer_a,
+                &mut rng,
+            )
             .unwrap();
         let second = a
-            .reconcile(b_id, exchange.as_ref(), 0, 300, &mut installer_a, &mut rng)
+            .reconcile(
+                b_id,
+                exchange.as_ref(),
+                0,
+                300,
+                0,
+                &mut installer_a,
+                &mut rng,
+            )
             .unwrap();
         assert_eq!(first, second);
         assert!(matches!(first, Action::Send(_)));
@@ -666,7 +952,7 @@ mod tests {
         let mut installer_a = FakeInstaller::default();
 
         let propose = a
-            .reconcile(b_id, None, 0, 300, &mut installer_a, &mut rng)
+            .reconcile(b_id, None, 0, 300, 0, &mut installer_a, &mut rng)
             .unwrap();
         let mut exchange = apply(None, &propose, &a, b_id).unwrap();
         // The server's sweep expired this before B replied; no signed abort exists.
@@ -674,7 +960,15 @@ mod tests {
         assert_eq!(exchange.decision.phase, Phase::Aborted);
 
         let action = a
-            .reconcile(b_id, Some(&exchange), 700, 300, &mut installer_a, &mut rng)
+            .reconcile(
+                b_id,
+                Some(&exchange),
+                700,
+                300,
+                0,
+                &mut installer_a,
+                &mut rng,
+            )
             .unwrap();
         assert_eq!(action, Action::None);
         assert!(a.relationships[&b_id].pending.is_none());

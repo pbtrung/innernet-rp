@@ -240,7 +240,7 @@ pub fn apply(
         state.observe_remote(other, &advertised.bundle, advertised.lifecycle.clone())?;
 
         let exchange = exchange_for(exchanges, self_id, other);
-        let action = state.reconcile(other, exchange, now, rotation_interval, installer, rng)?;
+        let action = state.reconcile(other, exchange, now, rotation_interval, 0, installer, rng)?;
         store
             .save(state)
             .context("persisting PQ state before acting")?;

@@ -179,6 +179,7 @@ fn run_schedule(seed: u64, rotation_interval: u64) {
                         exchange.as_ref(),
                         now,
                         rotation_interval,
+                        0,
                         &mut installer_a,
                         &mut rng,
                     )
@@ -192,6 +193,7 @@ fn run_schedule(seed: u64, rotation_interval: u64) {
                         exchange.as_ref(),
                         now,
                         rotation_interval,
+                        0,
                         &mut installer_b,
                         &mut rng,
                     )
@@ -204,6 +206,7 @@ fn run_schedule(seed: u64, rotation_interval: u64) {
                     exchange.as_ref(),
                     now,
                     rotation_interval,
+                    0,
                     &mut installer_a,
                     &mut rng,
                 )
@@ -216,6 +219,7 @@ fn run_schedule(seed: u64, rotation_interval: u64) {
                     exchange.as_ref(),
                     now,
                     rotation_interval,
+                    0,
                     &mut installer_b,
                     &mut rng,
                 )
