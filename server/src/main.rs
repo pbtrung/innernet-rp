@@ -7,9 +7,11 @@ use innernet_shared::{
 use std::{env, path::PathBuf};
 
 use innernet_server::{
-    add_cidr, add_peer, delete_cidr, enable_or_disable_peer,
+    add_cidr, add_peer, apply_management_rotation, confirm_management_rotation, delete_cidr,
+    enable_or_disable_peer,
     initialize::{self, InitializeOpts},
-    rename_cidr, rename_peer, serve, uninstall, ServerConfig,
+    mark_management_verified, rename_cidr, rename_peer, repair_management,
+    rollback_management_rotation, serve, stage_management_rotation, uninstall, ServerConfig,
 };
 use innernet_shared::Interface;
 
@@ -149,6 +151,98 @@ enum Command {
     /// exchanged.
     EnablePq { interface: Interface },
 
+    /// Design 5.10 administrative rotation, step 1: stage a new management
+    /// secret for one peer without touching the currently active, live one.
+    /// Exports a transfer artifact for the client-side `stage-management`
+    /// command; never automatic, never mailbox-driven.
+    StageManagementRotation {
+        interface: Interface,
+
+        /// Name of the peer whose management link is being rotated.
+        #[clap(long)]
+        name: innernet_shared::Hostname,
+
+        /// Confirms this is being run over an access path independent of
+        /// the affected tunnel (console, separate management network).
+        #[clap(long)]
+        independent_admin_access: bool,
+
+        /// Optional JSON file mapping peer IDs to an already-trusted PSK to
+        /// adopt instead of generating a fresh random one.
+        #[clap(long)]
+        adopted_psks: Option<PathBuf>,
+    },
+
+    /// Design 5.10 step 2: replace the live secret with the staged one,
+    /// pushing it into the live kernel peer entry immediately. The
+    /// superseded secret is retained until `confirm-management-rotation`.
+    ApplyManagementRotation {
+        interface: Interface,
+
+        #[clap(long)]
+        name: innernet_shared::Hostname,
+
+        #[clap(long)]
+        independent_admin_access: bool,
+    },
+
+    /// Marks a peer's currently active management secret as verified
+    /// (a real fresh handshake and authenticated API request succeeded),
+    /// which `confirm-management-rotation` requires before it will discard
+    /// the superseded secret.
+    MarkManagementVerified {
+        interface: Interface,
+
+        #[clap(long)]
+        name: innernet_shared::Hostname,
+
+        #[clap(long)]
+        independent_admin_access: bool,
+    },
+
+    /// Design 5.10 step 3: discard the superseded secret. Requires the
+    /// currently active secret to already be marked verified.
+    ConfirmManagementRotation {
+        interface: Interface,
+
+        #[clap(long)]
+        name: innernet_shared::Hostname,
+
+        #[clap(long)]
+        independent_admin_access: bool,
+    },
+
+    /// Design 5.10 step 4: restore the secret that was active before the
+    /// rotation attempt began, pushing it back into the live kernel peer
+    /// entry immediately.
+    RollbackManagementRotation {
+        interface: Interface,
+
+        #[clap(long)]
+        name: innernet_shared::Hostname,
+
+        #[clap(long)]
+        independent_admin_access: bool,
+    },
+
+    /// Out-of-band repair for a mismatched installation: forces this side's
+    /// active management secret to an explicitly provided value,
+    /// independent of the other side's cooperation or any in-progress
+    /// staged rotation.
+    RepairManagement {
+        interface: Interface,
+
+        #[clap(long)]
+        name: innernet_shared::Hostname,
+
+        #[clap(long)]
+        independent_admin_access: bool,
+
+        /// JSON file mapping peer IDs to the trusted PSK to force.
+        #[clap(long)]
+        adopted_psks: PathBuf,
+    },
+
     /// Generate shell completion scripts
     Completions {
         #[clap(value_enum)]
@@ -229,6 +323,111 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{} post-quantum data-peer PSKs are now enabled for {}.",
                 "[*]".dimmed(),
                 interface
+            );
+        },
+        Command::StageManagementRotation {
+            interface,
+            name,
+            independent_admin_access,
+            adopted_psks,
+        } => {
+            let path = stage_management_rotation(
+                &interface,
+                &conf,
+                &name,
+                independent_admin_access,
+                adopted_psks.as_deref(),
+            )?;
+            println!(
+                "{} a rotation candidate is staged for peer '{}'.",
+                "[*]".dimmed(),
+                name
+            );
+            println!(
+                "    Transfer artifact written to {}; deliver it confidentially and out of \
+                 band, then run `stage-management` on that peer before applying.",
+                path.display()
+            );
+        },
+        Command::ApplyManagementRotation {
+            interface,
+            name,
+            independent_admin_access,
+        } => {
+            apply_management_rotation(
+                &interface,
+                &conf,
+                &name,
+                independent_admin_access,
+                opts.network,
+            )?;
+            println!(
+                "{} the staged secret is now active for peer '{}'; verify a fresh handshake \
+                 and authenticated request before confirming.",
+                "[*]".dimmed(),
+                name
+            );
+        },
+        Command::MarkManagementVerified {
+            interface,
+            name,
+            independent_admin_access,
+        } => {
+            mark_management_verified(&interface, &conf, &name, independent_admin_access)?;
+            println!(
+                "{} peer '{}''s active management secret is marked verified.",
+                "[*]".dimmed(),
+                name
+            );
+        },
+        Command::ConfirmManagementRotation {
+            interface,
+            name,
+            independent_admin_access,
+        } => {
+            confirm_management_rotation(&interface, &conf, &name, independent_admin_access)?;
+            println!(
+                "{} the superseded secret for peer '{}' has been discarded.",
+                "[*]".dimmed(),
+                name
+            );
+        },
+        Command::RollbackManagementRotation {
+            interface,
+            name,
+            independent_admin_access,
+        } => {
+            rollback_management_rotation(
+                &interface,
+                &conf,
+                &name,
+                independent_admin_access,
+                opts.network,
+            )?;
+            println!(
+                "{} peer '{}' was rolled back to its pre-rotation secret.",
+                "[*]".dimmed(),
+                name
+            );
+        },
+        Command::RepairManagement {
+            interface,
+            name,
+            independent_admin_access,
+            adopted_psks,
+        } => {
+            repair_management(
+                &interface,
+                &conf,
+                &name,
+                independent_admin_access,
+                &adopted_psks,
+                opts.network,
+            )?;
+            println!(
+                "{} peer '{}''s management secret was forced to the provided value.",
+                "[*]".dimmed(),
+                name
             );
         },
         Command::Completions { shell } => {

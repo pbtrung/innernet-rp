@@ -191,6 +191,17 @@ impl Manager {
         })
     }
 
+    /// Writes a `Provisioning` transfer artifact into this manager's private
+    /// store directory, the same confidential-export mechanism `prepare`
+    /// uses for fresh enrollment. `store` itself stays private to this
+    /// module; this is the one sanctioned way callers elsewhere in the
+    /// crate can produce an out-of-band artifact.
+    pub fn export_artifact(&self, filename: &str, artifact: &Provisioning) -> Result<()> {
+        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(artifact)?);
+        self.store.export(filename, &bytes)?;
+        Ok(())
+    }
+
     /// Short-lived handle for administrative commands (`add-peer`,
     /// `enable-peer`) that run independently of a long-lived `serve` process.
     /// Returns `None` when this network has never required management, so
@@ -262,6 +273,14 @@ impl Manager {
 /// Prepares durable secrets and migration artifacts without touching interfaces.
 /// The operator must transfer each artifact confidentially through independent
 /// admin access before restarting either end with management protection.
+/// Reads the shared adoption-file format (a JSON map of peer ID to a
+/// trusted PSK) used by both fresh provisioning (`prepare`) and rotation
+/// staging/repair, so an operator only needs to learn one file shape.
+pub fn read_adopted_psks(path: &Path) -> Result<BTreeMap<Number, SecretKey>> {
+    serde_json::from_str(&innernet_shared::private_file::read(path, true)?)
+        .map_err(|_| anyhow::anyhow!("invalid private PSK adoption file; contents omitted"))
+}
+
 pub fn prepare(
     conf: &ServerConfig,
     interface: &InterfaceName,
@@ -275,11 +294,9 @@ pub fn prepare(
     let conn = open_database_connection(interface, conf)?;
     let public = Key::from_base64(&config.private_key)?.get_public();
     let server = db::pq::identify_server(&conn, &public.to_base64(), config.address)?;
-    let adopted: BTreeMap<Number, SecretKey> = if let Some(path) = adopted {
-        serde_json::from_str(&innernet_shared::private_file::read(path, true)?)
-            .map_err(|_| anyhow::anyhow!("invalid private PSK adoption file; contents omitted"))?
-    } else {
-        BTreeMap::new()
+    let adopted: BTreeMap<Number, SecretKey> = match adopted {
+        Some(path) => read_adopted_psks(path)?,
+        None => BTreeMap::new(),
     };
     let path = Manager::path(conf, interface);
     let mut state = ServerState {

@@ -6,9 +6,11 @@ use dialoguer::Confirm;
 use http_body_util::BodyExt;
 use hyper::{http, Request, Response};
 use indoc::printdoc;
+use innernet_pq::{crypto::Secret, protocol::Number};
 use innernet_shared::{
     get_local_addrs,
     interface_config::{InterfaceInfo, PeerInvitation, ServerInfo},
+    management::Provisioning,
     prompts, update_hosts_file, wg, AddCidrOpts, AddPeerOpts, CidrTree, DeleteCidrOpts,
     EnableDisablePeerOpts, Endpoint, Error, HostsOpts, Interface, IoErrorContext, NetworkOpts,
     PeerContents, RenameCidrOpts, RenamePeerOpts, INNERNET_PUBKEY_HEADER,
@@ -330,6 +332,201 @@ pub fn enable_pq(interface: &InterfaceName, conf: &ServerConfig) -> Result<(), E
     let conn = open_database_connection(interface, conf)?;
     db::pq::enable(&conn)?;
     Ok(())
+}
+
+fn find_peer_by_name(
+    conn: &Connection,
+    name: &innernet_shared::Hostname,
+) -> Result<DatabasePeer, Error> {
+    DatabasePeer::list(conn)?
+        .into_iter()
+        .find(|p| &p.name == name)
+        .ok_or_else(|| anyhow!("peer '{}' does not exist", name))
+}
+
+fn adopted_secret_for(
+    adopted_psks: Option<&Path>,
+    peer_id: i64,
+) -> Result<Option<Secret<32>>, Error> {
+    let Some(path) = adopted_psks else {
+        return Ok(None);
+    };
+    let table = management::read_adopted_psks(path)?;
+    Ok(table
+        .get(&Number::new(peer_id as u64)?)
+        .map(|s| Secret::from_bytes(*s.bytes())))
+}
+
+fn required_management(
+    conf: &ServerConfig,
+    interface: &InterfaceName,
+    config: &ConfigFile,
+    conn: &Connection,
+    independent_admin_access: bool,
+) -> Result<management::Manager, Error> {
+    if !independent_admin_access {
+        bail!("independent authenticated administrative access is required");
+    }
+    management::Manager::open_or_create(conf, interface, config, conn)?
+        .ok_or_else(|| anyhow!("management was never required for this network"))
+}
+
+/// Pushes a peer's currently active management secret into the live kernel
+/// peer entry immediately (design 5.10's "replace peer config both sides"),
+/// independent of whether a long-lived `serve` process is running --
+/// matching `add_peer`/`enable_or_disable_peer`'s existing direct-kernel
+/// pattern.
+fn push_management_psk_to_kernel(
+    interface: &InterfaceName,
+    network: NetworkOpts,
+    manager: &management::Manager,
+    peer: &DatabasePeer,
+) -> Result<(), Error> {
+    if cfg!(not(test)) && Device::get(interface, network.backend).is_ok() {
+        let peer_config = manager.peer_config(peer)?;
+        DeviceUpdate::new()
+            .add_peer(peer_config)
+            .apply(interface, network.backend)
+            .map_err(|_| ServerError::WireGuard)?;
+    }
+    Ok(())
+}
+
+/// Design 5.10 step 1: stage a rotation candidate for one peer without
+/// touching the currently active, live secret. Returns the path the
+/// transfer artifact was written to, for out-of-band delivery.
+pub fn stage_management_rotation(
+    interface: &InterfaceName,
+    conf: &ServerConfig,
+    name: &innernet_shared::Hostname,
+    independent_admin_access: bool,
+    adopted_psks: Option<&Path>,
+) -> Result<PathBuf, Error> {
+    let config = ConfigFile::from_file(conf.config_path(interface))?;
+    let conn = open_database_connection(interface, conf)?;
+    let peer = find_peer_by_name(&conn, name)?;
+    let mut manager =
+        required_management(conf, interface, &config, &conn, independent_admin_access)?;
+    let adopted = adopted_secret_for(adopted_psks, peer.id)?;
+    manager
+        .stage_rotation(peer.id, adopted)
+        .map_err(|_| anyhow!("failed to stage a rotation candidate for '{}'", name))?;
+    let enrollment = manager
+        .staged_enrollment(peer.id)
+        .map_err(|_| anyhow!("failed to export the staged enrollment for '{}'", name))?;
+    let public = Key::from_base64(&config.private_key)?.get_public();
+    let artifact = Provisioning {
+        server_public_key: public.to_base64(),
+        peer_address: peer.ip,
+        enrollment,
+    };
+    let filename = format!("peer-{}.management.rotation.json", peer.id);
+    manager.export_artifact(&filename, &artifact)?;
+    Ok(management::Manager::path(conf, interface).join(filename))
+}
+
+/// Design 5.10 step 2: replace the live secret with the staged one.
+pub fn apply_management_rotation(
+    interface: &InterfaceName,
+    conf: &ServerConfig,
+    name: &innernet_shared::Hostname,
+    independent_admin_access: bool,
+    network: NetworkOpts,
+) -> Result<(), Error> {
+    let config = ConfigFile::from_file(conf.config_path(interface))?;
+    let conn = open_database_connection(interface, conf)?;
+    let peer = find_peer_by_name(&conn, name)?;
+    let mut manager =
+        required_management(conf, interface, &config, &conn, independent_admin_access)?;
+    manager
+        .apply_rotation(peer.id)
+        .map_err(|_| anyhow!("failed to apply the staged rotation for '{}'", name))?;
+    push_management_psk_to_kernel(interface, network, &manager, &peer)
+}
+
+/// Marks a peer's currently active management secret as verified, which
+/// `confirm_management_rotation` requires before discarding the superseded
+/// secret.
+pub fn mark_management_verified(
+    interface: &InterfaceName,
+    conf: &ServerConfig,
+    name: &innernet_shared::Hostname,
+    independent_admin_access: bool,
+) -> Result<(), Error> {
+    let config = ConfigFile::from_file(conf.config_path(interface))?;
+    let conn = open_database_connection(interface, conf)?;
+    let peer = find_peer_by_name(&conn, name)?;
+    let mut manager =
+        required_management(conf, interface, &config, &conn, independent_admin_access)?;
+    manager
+        .mark_verified(peer.id)
+        .map_err(|_| anyhow!("failed to mark '{}' verified", name))?;
+    Ok(())
+}
+
+/// Design 5.10 step 3: discard the superseded secret. Requires the active
+/// secret to already be marked verified.
+pub fn confirm_management_rotation(
+    interface: &InterfaceName,
+    conf: &ServerConfig,
+    name: &innernet_shared::Hostname,
+    independent_admin_access: bool,
+) -> Result<(), Error> {
+    let config = ConfigFile::from_file(conf.config_path(interface))?;
+    let conn = open_database_connection(interface, conf)?;
+    let peer = find_peer_by_name(&conn, name)?;
+    let mut manager =
+        required_management(conf, interface, &config, &conn, independent_admin_access)?;
+    manager.confirm_rotation(peer.id).map_err(|_| {
+        anyhow!(
+            "failed to confirm the rotation for '{}' -- mark it verified first",
+            name
+        )
+    })?;
+    Ok(())
+}
+
+/// Design 5.10 step 4: restore the secret that was active before the
+/// rotation attempt began.
+pub fn rollback_management_rotation(
+    interface: &InterfaceName,
+    conf: &ServerConfig,
+    name: &innernet_shared::Hostname,
+    independent_admin_access: bool,
+    network: NetworkOpts,
+) -> Result<(), Error> {
+    let config = ConfigFile::from_file(conf.config_path(interface))?;
+    let conn = open_database_connection(interface, conf)?;
+    let peer = find_peer_by_name(&conn, name)?;
+    let mut manager =
+        required_management(conf, interface, &config, &conn, independent_admin_access)?;
+    manager
+        .rollback_rotation(peer.id)
+        .map_err(|_| anyhow!("failed to roll back the rotation for '{}'", name))?;
+    push_management_psk_to_kernel(interface, network, &manager, &peer)
+}
+
+/// Out-of-band repair for a mismatched installation: forces this side's
+/// active management secret to an explicitly provided value.
+pub fn repair_management(
+    interface: &InterfaceName,
+    conf: &ServerConfig,
+    name: &innernet_shared::Hostname,
+    independent_admin_access: bool,
+    adopted_psks: &Path,
+    network: NetworkOpts,
+) -> Result<(), Error> {
+    let config = ConfigFile::from_file(conf.config_path(interface))?;
+    let conn = open_database_connection(interface, conf)?;
+    let peer = find_peer_by_name(&conn, name)?;
+    let mut manager =
+        required_management(conf, interface, &config, &conn, independent_admin_access)?;
+    let secret = adopted_secret_for(Some(adopted_psks), peer.id)?
+        .ok_or_else(|| anyhow!("adoption file has no entry for peer '{}'", name))?;
+    manager
+        .force_active(peer.id, secret)
+        .map_err(|_| anyhow!("failed to force the management secret for '{}'", name))?;
+    push_management_psk_to_kernel(interface, network, &manager, &peer)
 }
 
 pub fn add_cidr(
