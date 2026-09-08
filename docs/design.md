@@ -503,12 +503,13 @@ CPU, database, and API budgets remain constraints.
 
 ### 5.13 Build targets and deployment support
 
-Version 1 targets Linux x86_64/aarch64. M8 builds and executes cryptographic,
-persistence, and WireGuard checks on both with declared system-library
-versions. Dynamic linking requires target runtime packages, not only a
-successful cross-link. Existing non-Linux builds retain legacy behavior and
-reject unsupported PQ options explicitly. Linux-only scope is a project
-choice, not a claim that the libraries cannot support other systems.
+Version 1 targets Linux x86_64/aarch64 only -- this project does not build
+or support macOS, OpenBSD, or any other non-Linux target. M8 builds and
+executes cryptographic, persistence, and WireGuard checks on both
+architectures with declared system-library versions. Dynamic linking
+requires target runtime packages, not only a successful cross-link.
+Linux-only scope is a project choice, not a claim that the libraries
+cannot support other systems.
 
 ### 5.14 Canonical encoding and input validation
 
@@ -687,8 +688,8 @@ compatibility and admission limits.
     independent design/app/binary, not a fork retaining wire compatibility
     with upstream innernet releases.
 18. **Platforms:** run crypto, durability, gate, and WireGuard checks on
-    Linux x86_64/aarch64 with system libraries; preserve non-Linux legacy
-    builds with PQ disabled.
+    Linux x86_64/aarch64 with system libraries. Linux amd64/aarch64 are
+    the only supported targets; there is no non-Linux build.
 
 ### 7.3 Acceptance
 

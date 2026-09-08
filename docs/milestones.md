@@ -269,15 +269,15 @@ from a claim that the management secret can never be changed.
 - Build and execute on Linux x86_64 and aarch64 using the system shared
   libraries/version constraints established in M0. Check actual target
   runtime loading as well as cross-compilation.
-- Establish release/build automation for both architectures and record the
-  exact test environments. Run the crypto, durability, gate, and WireGuard
-  convergence checks under supported emulation or real hardware.
-- Keep legacy non-Linux paths usable with PQ disabled; reject unsupported
-  feature options clearly without pulling mandatory Linux-only runtime
-  requirements into those paths.
+- Record the exact test environments for both architectures. Run the
+  crypto, durability, gate, and WireGuard convergence checks under
+  supported emulation or real hardware.
+- This project supports Linux amd64/aarch64 only. There is no non-Linux
+  build to keep usable -- macOS/OpenBSD code paths have been removed
+  entirely, not preserved behind a feature gate.
 
 **Acceptance:** design case 18 passes on both architectures, and runtime
-package/ABI requirements and non-Linux feature boundaries are recorded.
+package/ABI requirements are recorded.
 
 ## M9 — Security, fault, and load review
 
