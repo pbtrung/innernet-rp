@@ -426,65 +426,22 @@ fn pq_dev_rotate(
 ) -> Result<(), Error> {
     use innernet_client_core::pq_sync;
     use innernet_pq::{
-        api::{Lifecycle, Registration, StatePage},
         crypto::SystemRandom,
         engine::FakeInstaller,
         protocol::{Binary, Number},
-        state::{EndpointState, Enrollment, Identity, ManagementLink, Policy},
         store::Store,
     };
-    use std::{collections::BTreeMap, time::Instant};
+    use std::time::Instant;
 
     let config = InterfaceConfig::from_interface(&opts.config_dir, interface)?;
     let rest_client = RestClient::new(&config.server);
     let public_key =
         wireguard_control::Key::from_base64(&config.interface.private_key)?.get_public();
-
-    // Discover our own peer id, the server's id, and the network id from the
-    // opt-in PQ state response, before this side has ever registered a bundle.
-    let page: StatePage<Peer, Cidr> = rest_client.http("GET", "/user/state?pq_version=1")?;
-    let me = page
-        .peers
-        .iter()
-        .find(|p| p.peer.public_key == public_key.to_base64())
-        .ok_or_else(|| anyhow!("could not find this peer's own entry in the visible state"))?;
-    let server_entry = page
-        .peers
-        .iter()
-        .find(|p| p.is_server)
-        .ok_or_else(|| anyhow!("could not find the server's entry in the visible state"))?;
-    let self_id = Number::new(me.peer.id as u64).map_err(|_| anyhow!("invalid self peer id"))?;
-    let server_id =
-        Number::new(server_entry.peer.id as u64).map_err(|_| anyhow!("invalid server peer id"))?;
     let other_id =
         Number::new(other_peer_id as u64).map_err(|_| anyhow!("invalid other peer id"))?;
 
     let mut rng = SystemRandom;
-    let identity = Identity::generate(
-        Binary(public_key.0),
-        Number::new(1).map_err(|_| anyhow!("invalid revision"))?,
-        &mut rng,
-    )?;
-    let mut state = EndpointState {
-        network_id: page.network_id,
-        peer_id: self_id,
-        server_id,
-        server_public_key: Binary([0; 32]),
-        policy: Policy::Strict,
-        registration: Registration {
-            expected_revision: None,
-            pq_version: 1,
-            lifecycle: Lifecycle::Enabled,
-            bundle: identity.bundle.clone(),
-            emergency: false,
-        },
-        identity,
-        enrollment: Enrollment::Advertised,
-        management: ManagementLink::generate(&mut rng)?,
-        relationships: BTreeMap::new(),
-    };
-    let _: innernet_pq::api::AdvertisedBundle =
-        rest_client.http_form("PUT", "/user/pq-keys", &state.registration)?;
+    let mut state = pq_sync::register(&rest_client, Binary(public_key.0), &mut rng)?;
 
     let mut store = Store::open(
         &opts.data_dir.join(format!("{interface}.pq-dev-harness")),
