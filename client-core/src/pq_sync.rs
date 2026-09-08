@@ -626,4 +626,116 @@ mod tests {
         assert!(transport.sent.borrow().is_empty());
         assert!(installer.installed_psks.is_empty());
     }
+
+    #[test]
+    fn the_pq_mailbox_never_targets_the_management_server_link() {
+        // M7's "mailbox targets exclude the server link": even if the
+        // directory entry for the coordination server were ever
+        // (mis)advertised with a PQ bundle attached, apply()'s `is_server`
+        // and `other == server_id` checks must still refuse to create a
+        // data-peer Relationship for it -- the mailbox never touches the
+        // management link under any circumstance.
+        let (mut state, _own_bundle) = peer_state(2, 1);
+        let server_id = Number::new(1).unwrap();
+        let server_key = KeyPair::generate();
+        let misadvertised_server_bundle = Identity::generate(
+            Binary(server_key.public.0),
+            Number::new(1).unwrap(),
+            &mut SystemRandom,
+        )
+        .unwrap()
+        .bundle;
+
+        let server_entry = PeerState {
+            peer: Peer {
+                id: 1,
+                contents: PeerContents {
+                    name: "server".parse().unwrap(),
+                    ip: "10.0.0.1".parse().unwrap(),
+                    cidr_id: 1,
+                    public_key: server_key.public.to_base64(),
+                    endpoint: None,
+                    persistent_keepalive_interval: None,
+                    is_admin: true,
+                    is_disabled: false,
+                    is_redeemed: true,
+                    invite_expires: None,
+                    candidates: vec![],
+                },
+            },
+            is_server: true,
+            pq: Some(AdvertisedBundle {
+                pq_version: 1,
+                lifecycle: Lifecycle::Enabled,
+                bundle: misadvertised_server_bundle,
+            }),
+        };
+
+        let peers = vec![server_entry];
+        let exchanges = vec![];
+        let transport = RecordingTransport::default();
+        let mut installer = FakeInstaller::default();
+        let mut rng = SystemRandom;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("state"), true).unwrap();
+
+        apply(
+            &peers,
+            &exchanges,
+            &transport,
+            &mut store,
+            &mut state,
+            &mut installer,
+            &mut rng,
+            0,
+            300,
+            0,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !state.relationships.contains_key(&server_id),
+            "a misadvertised PQ bundle on the server's own directory entry \
+             must never create a data-peer relationship for it"
+        );
+        assert!(transport.sent.borrow().is_empty());
+        assert!(installer.installed_psks.is_empty());
+    }
+
+    #[test]
+    fn a_data_peer_relationship_never_touches_the_management_link() {
+        // M7's "client data-key disagreement cannot itself disrupt the
+        // management key": drive a data-peer relationship through several
+        // real state transitions (observe, a corrupted/conflicting
+        // revision, activity sampling) and assert the endpoint's own
+        // management link is byte-identical throughout -- the two are
+        // structurally unrelated fields, but this is the regression that
+        // proves it, not just an inspection.
+        let (mut state, _own_bundle) = peer_state(2, 1);
+        let original_management_psk = state.management.psk.clone();
+        let (_, bundle_b) = peer_state(3, 1);
+        let b_id = Number::new(3).unwrap();
+
+        state
+            .observe_remote(b_id, &bundle_b, Lifecycle::Enabled)
+            .unwrap();
+        assert!(state.management.psk.0.same(&original_management_psk.0));
+
+        // A conflicting/older revision from the same peer is a real error
+        // path, not just the happy path.
+        state
+            .relationships
+            .get_mut(&b_id)
+            .unwrap()
+            .remote
+            .bundle_revision = Number::new(9).unwrap();
+        assert!(state
+            .observe_remote(b_id, &bundle_b, Lifecycle::Enabled)
+            .is_err());
+        assert!(state.management.psk.0.same(&original_management_psk.0));
+
+        state.observe_activity(b_id, 100, 10, 20).unwrap();
+        assert!(state.management.psk.0.same(&original_management_psk.0));
+    }
 }
