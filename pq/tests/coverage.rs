@@ -17,6 +17,8 @@ fn coverage_manifest_has_all_cases_and_resolves_unit_test_names() {
         include_str!("../../server/src/management.rs"),
         include_str!("../../server/src/gate.rs"),
         include_str!("../../client-core/src/management.rs"),
+        include_str!("../../client-core/src/gate.rs"),
+        include_str!("../../client-core/src/pq_install.rs"),
         include_str!("../../client-core/tests/pq_exchange.rs"),
         include_str!("../../shared/src/pq.rs"),
     ]

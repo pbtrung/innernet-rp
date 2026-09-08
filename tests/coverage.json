@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "stage": "M3",
+  "stage": "M4",
   "note": "Test IDs identify implemented checks, not completion of all design-case assertions. Kernel, process, load and architecture evidence are tracked separately.",
   "cases": [
     {
@@ -19,11 +19,17 @@
     {
       "design_case": 2,
       "unit": [
-        "stale_handshake_never_opens_recreated_peer"
+        "stale_handshake_never_opens_recreated_peer",
+        "ruleset_is_address_keyed_and_scoped_to_the_named_interface",
+        "block_and_release_scripts_target_the_right_table_and_sets",
+        "install_recreates_the_peer_with_the_candidate_psk_and_gates_it"
       ],
       "integration": [],
-      "docker": [],
-      "status": "model-only"
+      "docker": [
+        "m4_smoke: application traffic blocked at first activation (checked against a live gate-set snapshot), released only after a real fresh kernel handshake",
+        "m4_crash: a recreated peer starts gated again -- no stale-session bypass through the pre-crash kernel state"
+      ],
+      "status": "m4-gate-and-installer-verified-with-real-kernel"
     },
     {
       "design_case": 3,
@@ -34,9 +40,10 @@
         "independent_processes_converge_through_the_real_api"
       ],
       "docker": [
-        "m3_exchange: two independent containers converge on one candidate through the real API (happy path only; no real kernel PSK/handshake evidence yet, that is M4)"
+        "m3_exchange: two independent containers converge on one candidate through the real API (fake installer)",
+        "m4_smoke: real kernel peers converge on one candidate with matching PSKs, a real fresh handshake, and two rotations producing distinct successive candidates"
       ],
-      "status": "m3-engine-verified-no-real-kernel"
+      "status": "m4-engine-and-real-kernel-verified"
     },
     {
       "design_case": 4,
@@ -51,9 +58,10 @@
         "independent_processes_converge_through_the_real_api"
       ],
       "docker": [
-        "m3_exchange: real cross-container convergence (happy path)"
+        "m3_exchange: real cross-container convergence (happy path)",
+        "m4_crash: a killed-mid-rotation peer, recreated with its volume preserved, converges to one matching candidate with real kernel peers"
       ],
-      "status": "m3-engine-and-real-api-verified"
+      "status": "m4-engine-and-real-kernel-crash-verified-loss-and-replay-not-yet-real-kernel"
     },
     {
       "design_case": 5,
@@ -65,8 +73,10 @@
         "pq_migrations_are_atomic_reopenable_and_reject_newer_without_writes",
         "independent_processes_converge_through_the_real_api"
       ],
-      "docker": [],
-      "status": "m3-engine-restart-verified-no-real-kernel-crash-matrix"
+      "docker": [
+        "m4_crash: peer-b's container is killed outright and recreated with its volume preserved; recovery converges to one matching candidate through real kernel peers"
+      ],
+      "status": "m4-engine-verified-with-a-real-container-crash-not-the-full-install-boundary-matrix"
     },
     {
       "design_case": 6,
@@ -92,8 +102,10 @@
       "integration": [
         "pq_api_durable_duplicate_delivery_tombstones_and_stale_receipts"
       ],
-      "docker": [],
-      "status": "m3-engine-two-rotation-replay-verified"
+      "docker": [
+        "m4_smoke: a second real rotation with real kernel peers produces a distinct candidate matching on both sides; replay/tampering with real kernel peers is not yet implemented (needs test-only fault hooks testing.md section 4.3 describes)"
+      ],
+      "status": "m4-engine-two-rotation-verified-with-real-kernel-tampering-replay-not-yet-real-kernel"
     },
     {
       "design_case": 8,

@@ -1,0 +1,40 @@
+{
+  "milestone": 4,
+  "revision": "the commit introducing this record",
+  "date": "2026-09-08",
+  "kernel": "Linux 7.2.2-1-cachyos x86_64",
+  "rust": "1.98.1",
+  "leancrypto": "1.8.0-1",
+  "openssl": "3.6.4-1",
+  "sqlite": "3.53.4-1",
+  "docker": "29.7.2",
+  "container_base": "archlinux@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a",
+  "package_snapshot": "2026/09/07",
+  "schema": 4,
+  "checks": [
+    {"command": "cargo fmt --all", "result": "passed; stable fallback because nightly is unavailable"},
+    {"command": "cargo clippy --workspace --locked --all-targets -- -D warnings", "result": "passed (default build)"},
+    {"command": "cargo clippy --workspace --locked --all-targets --features pq-dev-harness,test-harness -- -D warnings", "result": "passed (dev-harness build)"},
+    {"command": "cargo test --workspace --locked", "result": "all suites passed (pq 4+11+1+12+2 incl. 300-schedule property test, server 54 passed/1 explicitly ignored, client-core 6+1 real-API integration test, shared 7, wireguard-control 12 passed/1 explicitly ignored)"},
+    {"command": "bash tests/run.sh unit", "result": "passed"},
+    {"command": "bash tests/run.sh integration", "result": "passed"},
+    {"command": "bash tests/run.sh docker-smoke (m2_management.sh + m3_exchange.sh + m4_smoke.sh + m4_crash.sh)", "result": "passed: M2/M3 scenarios unaffected; M4's smoke and crash-restart scenarios both pass with real kernel peers, a real nftables data gate, and a real Installer"}
+  ],
+  "docker_scenario": {
+    "topology": "1 server + peer-a + peer-b + peer-c (testing.md's A-C traffic/progress control) on an isolated internal bridge, real production build (no pq-dev-harness feature), real --enable-pq-psk activation, real kernel WireGuard, real nftables data gate, real Installer",
+    "bugs_found_and_fixed_by_this_milestone": [
+      "a newly-visible peer got ordinary WireGuard connectivity (via the existing non-PQ peer diff) before the PQ engine had even discovered it, leaving a real window with no gate -- fixed by proactively gating every visible, not-yet-confirmed peer before the ordinary DeviceUpdate::apply, instead of only reactively gating once the engine's own Committed-phase install() ran (already too late by then)",
+      "that same proactive-gating step's first version iterated the ordinary peer list without excluding the coordination server's own entry; since the server never has a PQ relationship, it was classified unconfirmed and added to the blocked set, self-blocking the very link the PQ handshake needs to complete and hanging every subsequent request to the server on that interface -- fixed by excluding state.server_id/state.peer_id, the same way pq_sync::apply's own loop already does",
+      "the CLI's top-level error log used anyhow's Display ({}), which shows only a wrapped error's outermost context and hid the actual root cause while diagnosing the bug above -- changed to the alternate Display ({:#}) so the full chain is visible, a real improvement independent of the bug hunt"
+    ]
+  },
+  "limitations": [
+    "testing.md section 4.4 scenario 2 (precise lost-commit-response fault injection) is not implemented: it needs test-only HTTP-level fault hooks (hold/drop a specific response) that section 4.3 describes but this codebase does not yet implement",
+    "testing.md section 4.4 scenario 5 (replay and tampering with real kernel peers) is likewise not implemented for the same reason; the pure-protocol side of loss/replay is already covered by pq/src/engine.rs and pq/tests/schedule.rs's seeded fault schedules from M3",
+    "m4_crash.sh is a coarser, container-level crash/restart check (kill mid-rotation, container recreated with volume preserved), not the exact kernel-install/pre-receipt boundary matrix milestones.md describes (kill before/after kernel install, before the installed receipt specifically)",
+    "testing.md section 4.4 scenario 6 (isolation/mixed strict-permissive-legacy policy) is explicitly M6 territory per milestones.md's own scoping and is not attempted here",
+    "the tunnel-inactivity/idle-timeout pause scheduling that will reuse this driver loop is M5",
+    "management PSK rotation's own full failure/recovery testing is M7; M4 only needs the already-provisioned M2 management link to remain usable, which it does throughout every scenario",
+    "no mixed-fleet/old-new binary compatibility, aarch64 execution, or external audit claim"
+  ]
+}

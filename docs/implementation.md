@@ -374,3 +374,140 @@ timeout/inactivity pause scheduling that reuses this driver loop (M5); and
 no CLI path yet threads a live client's flag value all the way into a
 running `up --daemon` loop, since that loop's own PQ wiring stays behind
 `--enable-pq-psk`'s production refusal until M4.
+
+## M4 — Fail-closed data activation and kernel recovery
+
+M4 is where the feature starts touching real kernel state and becomes a
+real, usable production feature for the first time: a real per-peer Linux
+traffic gate, a real `Installer` that recreates WireGuard peers with the
+candidate PSK and observes genuine kernel handshakes, and — because M2
+(management recovery) and this milestone (the gate) are exactly the two
+preconditions M1-M3's refusal comment named — production `--enable-pq-psk`
+activation itself.
+
+`client-core/src/gate.rs` is a new client-side nftables mechanism, distinct
+from `server/src/gate.rs`'s whole-interface, permanent management-only
+gate: it is per-peer and transient, and matches by *address* (named
+`blocked_v4`/`blocked_v6` sets), not by which kernel peer entry currently
+routes it — so a less-specific route (e.g. a hub peer's `0.0.0.0/0`) cannot
+carry blocked application traffic to a gated peer's address through a
+*different* peer entry while that peer's own `/32`/`/128` route is briefly
+absent for recreation. Two lifecycle tiers match the two real needs:
+`apply_all` is an idempotent destructive recreate, used exactly once per
+cold boot (nftables state does not survive a reboot, so this restores every
+known relationship's gate before any peer gets a kernel entry again);
+`block`/`release` are idempotent additive/element operations for a single
+peer's rotation, never disturbing any other peer's concurrent gate state.
+
+`client-core/src/pq_install.rs`'s `RealInstaller` implements `pq::engine`'s
+`Installer` trait for real kernel state. It is deliberately stateless:
+`engine.rs` already tracks `pending.installed`/`pending.confirmed` durably,
+so `install` is never called twice per rotation and `handshake_fresh` can
+safely read straight from the kernel every call. Freshness is structural,
+not timestamp-compared: `install` always removes then recreates the kernel
+peer entry (as two sequential `DeviceUpdate::apply` calls, since a single
+batched remove+add for the same key cannot be relied on to discard the old
+session), which resets the kernel's `last_handshake_time` to `None`, so any
+`Some(_)` observed afterward is necessarily a handshake under the new
+instance — exactly what milestones.md's "old handshake timestamps... alone
+cannot prove the exchange completed" requires, without storing or comparing
+a timestamp at all. `install` gates the peer before touching the kernel;
+`handshake_fresh` releases that gate as a side effect of returning `true`.
+`reconcile_gate` reuses that same kernel-read-and-release logic to
+re-verify the gate for every already-confirmed, no-pending relationship —
+needed because a merely steady-state relationship never otherwise passes
+back through `engine::reconcile`'s `Committed` arm to trigger a release, so
+a cold boot's gate would otherwise stay closed for it forever.
+
+`client-core/src/pq_sync.rs` splits `sync` into `fetch_state` + `apply` so
+the real production path can fetch the peer directory once, build
+`RealInstaller` from it, then reconcile, without a second network round
+trip; `sync` itself stays a thin wrapper so M3's tests/dev harness keep
+compiling unchanged. `register` extracts the "discover self/server/network
+ids, generate an identity, `PUT /user/pq-keys`" logic that was inline in
+the M3 dev harness, so the real activation path can reuse it.
+
+`client-core::interface::fetch()` now threads a `PqOptions` through and,
+when `--enable-pq-psk` is set, opens (or, on first activation, registers)
+this interface's PQ state *before* the ordinary peer-diff/`DeviceUpdate`
+step and proactively gates every visible, not-yet-confirmed peer at that
+point — closing a real window where a newly-visible peer would otherwise
+get ordinary WireGuard connectivity before the PQ engine had even
+discovered it. Once the interface and ordinary peers are live, it fetches
+PQ exchange state and runs `pq_sync::apply` with a `RealInstaller`, then
+`pq_install::reconcile_gate`. On a cold boot it restores the gate from the
+locally *cached* peer directory (`DataStore`), never a live fetch: the
+coordination API is reachable only through the very tunnel being restored,
+so it cannot be queried yet at that point.
+
+`shared::pq::PqOptions::production_ready()` is now exactly `validate()` —
+the M1-M3 unconditional refusal is lifted. This alone was not sufficient,
+though: the server never had any way to flip `pq_network.enabled`, and
+`Context.pq` was only ever constructed under the `pq-dev-harness` feature,
+so `db::pq::ready()` could never be true outside a dev/test build
+regardless of what a client asked for. `server/src/db/pq.rs` gained
+`enable()` (refusing until `management_ready` is already set — an
+independent recovery channel must exist before any data PSK is exchanged),
+exposed as a new `innernet-server enable-pq <interface>` command;
+`Context.pq` is now always constructed in production too, with the real
+`Limits::default()` M1 already defined (the `pq-dev-harness` feature's
+relaxed test limits are untouched). `pq_network.enabled`, not whether the
+service object exists, remains the actual gate `db::pq::ready()` checks.
+
+Building the M4 Docker scenarios against real Docker/kernel state surfaced
+two further real bugs, both fixed:
+
+- The proactive-gating step described above initially iterated the
+  *ordinary* peer list without excluding the coordination server's own
+  entry. Since the server never has a PQ relationship, it was classified
+  "unconfirmed" and added to the blocked set — self-blocking the very link
+  the PQ handshake needs to complete, hanging every subsequent request to
+  the server on that interface. Fixed by excluding `state.server_id`/
+  `state.peer_id`, the same way `pq_sync::apply`'s own loop already does.
+- The CLI's top-level error log used `{}` (anyhow's `Display`), which shows
+  only a wrapped error's outermost context and hid the actual root cause
+  while diagnosing the bug above. Changed to `{:#}` so the full chain is
+  visible — a real improvement independent of the bug hunt, and itself in
+  the spirit of M4's "fail visibly, not silently" tenet.
+
+`tests/docker/docker-compose.m4.yml` adds a third peer, C, per testing.md's
+A-C traffic/progress control, and uses the plain production runtime image
+(no `pq-dev-harness` feature — `--enable-pq-psk` now works for real).
+`m4_smoke.sh` covers testing.md section 4.4 scenario 1 (smoke/convergence):
+application traffic gated at first activation, checked atomically against
+a live gate-set snapshot rather than raced against a timer (in this
+low-latency Docker network a full propose/ready/commit/install/confirm
+sequence can complete in single-digit seconds, so a naive two-round-trip
+race would sometimes lose the window before ever observing it — when that
+happens the scenario notes it and moves on rather than failing a race it
+did not win); a positive A-C reachability control; two rotations with
+matching/distinct successive PSKs; and A-C staying reachable throughout,
+including through its own independent rotation on the same interval.
+`m4_crash.sh` is a coarser, container-level variant of scenario 3 (install
+crash matrix): it kills peer-b outright mid-rotation, recreates its
+container with its volume preserved, and asserts recovery converges to one
+matching candidate, the recreated peer starts gated again (no stale-session
+bypass), and A-C stays live throughout — it does not target the exact
+kernel-install/pre-receipt boundaries the full matrix describes, which
+needs test-only fault hooks testing.md section 4.3 describes but this
+codebase does not yet implement.
+
+Tested on Linux x86_64, Arch Linux, 2026-09-08, Docker 29.7.2:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --workspace --locked` | all suites pass (pq: 4+11+1+12+2, including the 300-schedule property test; server: 54 + 1 explicitly ignored; client-core: 6 + 1 real-API integration test; shared: 7; wireguard-control: 12 + 1 explicitly ignored) |
+| `cargo clippy --workspace --locked --all-targets -- -D warnings` (default, and again with `--features pq-dev-harness,test-harness`) | passed both ways |
+| `bash tests/run.sh unit` / `integration` | passed |
+| `bash tests/run.sh docker-smoke` (`m2_management.sh` + `m3_exchange.sh` + `m4_smoke.sh` + `m4_crash.sh`) | passed: M2/M3 scenarios unaffected; M4's smoke and crash-restart scenarios both pass with real kernel peers |
+
+Explicitly out of scope for M4: testing.md section 4.4 scenarios 2 and 5
+(precise lost-response and replay/tampering fault injection — both need
+test-only HTTP-level fault hooks section 4.3 describes but this codebase
+does not yet implement; the pure-protocol side of loss/replay is already
+covered by `pq/src/engine.rs` and `pq/tests/schedule.rs`'s seeded fault
+schedules from M3); scenario 6 (isolation/mixed strict-permissive-legacy
+policy — explicitly M6 territory per milestones.md's own scoping); the
+idle-timeout/inactivity pause scheduling that reuses this driver loop (M5);
+and management PSK rotation's own full failure/recovery testing (M7 — M4
+only needs the already-provisioned M2 management link to remain usable).
