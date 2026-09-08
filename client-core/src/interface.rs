@@ -319,36 +319,59 @@ pub fn fetch(
             interface,
             &rest_client,
             Binary(public_key.0),
+            pq.pq_psk_permissive,
             &mut rng,
         )
         .context("opening or registering PQ activation state")?;
 
-        let unconfirmed: Vec<_> = peers
-            .iter()
-            .filter(|peer| {
-                // The coordination server itself is never a PQ data-peer
-                // relationship (pq_sync::apply's own loop excludes it the
-                // same way); including it here would gate the very link
-                // this activation needs to complete over.
-                let Ok(id) = Number::new(peer.id as u64) else {
-                    return false;
-                };
-                if id == state.server_id || id == state.peer_id {
-                    return false;
-                }
-                state
-                    .relationships
-                    .get(&id)
-                    .and_then(|r| r.confirmed.as_ref())
-                    .is_none()
-            })
-            .map(peer_allowed_ip)
-            .collect();
-        if !unconfirmed.is_empty() {
-            gate::block(interface, &unconfirmed)
+        // Fetched here (not later, alongside `apply`) so this gating pass
+        // can see each peer's current bundle presence -- required to tell
+        // a not-yet-confirmed PQ peer (always gated) apart from a
+        // permissive-eligible legacy peer (never gated), which the
+        // ordinary (non-PQ) peer directory alone cannot distinguish.
+        // Reused below for `apply`, so this is still exactly one PQ state
+        // fetch per cycle.
+        let (pq_peers, exchanges) =
+            pq_sync::fetch_state(&rest_client).context("fetching PQ exchange state")?;
+
+        let mut to_gate = Vec::new();
+        let mut to_release = Vec::new();
+        for entry in &pq_peers {
+            if entry.is_server {
+                continue;
+            }
+            // The coordination server itself is never a PQ data-peer
+            // relationship (pq_sync::apply's own loop excludes it the same
+            // way); including it here would gate the very link this
+            // activation needs to complete over.
+            let Ok(id) = Number::new(entry.peer.id as u64) else {
+                continue;
+            };
+            if id == state.server_id || id == state.peer_id {
+                continue;
+            }
+            let relationship = state.relationships.get(&id);
+            if relationship.and_then(|r| r.confirmed.as_ref()).is_some() {
+                // Already confirmed; reconcile_gate (below, after peers are
+                // live) re-verifies it, never this proactive pass.
+                continue;
+            }
+            let allowed_ip = peer_allowed_ip(&entry.peer);
+            if pq_install::legacy_eligible(&state, id, entry.pq.is_some()) {
+                to_release.push(allowed_ip);
+            } else {
+                to_gate.push(allowed_ip);
+            }
+        }
+        if !to_gate.is_empty() {
+            gate::block(interface, &to_gate)
                 .map_err(|e| anyhow!("gating newly visible PQ peers: {e}"))?;
         }
-        Some((pq_store, state, rng))
+        if !to_release.is_empty() {
+            gate::release(interface, &to_release)
+                .map_err(|e| anyhow!("releasing legacy-eligible PQ peers: {e}"))?;
+        }
+        Some((pq_store, state, rng, pq_peers, exchanges))
     } else {
         None
     };
@@ -402,9 +425,7 @@ pub fn fetch(
     // cold boot closes every gate above, and a merely-confirmed
     // relationship still needs one fresh post-boot handshake before its
     // gate reopens, since the gate itself did not survive the reboot).
-    if let Some((mut pq_store, mut state, mut rng)) = pq_activation.take() {
-        let (pq_peers, exchanges) =
-            pq_sync::fetch_state(&rest_client).context("fetching PQ exchange state")?;
+    if let Some((mut pq_store, mut state, mut rng, pq_peers, exchanges)) = pq_activation.take() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

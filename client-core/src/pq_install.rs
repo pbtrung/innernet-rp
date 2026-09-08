@@ -12,8 +12,11 @@
 //! instance -- never a stale one carried over from before the rotation.
 use crate::gate;
 use innernet_pq::{
-    crypto::Candidate, engine::Installer, protocol::Bundle, state::EndpointState, Error as PqError,
-    Result as PqResult,
+    crypto::Candidate,
+    engine::Installer,
+    protocol::{Bundle, Number},
+    state::{EndpointState, Policy},
+    Error as PqError, Result as PqResult,
 };
 use innernet_shared::{peer_allowed_ip, Peer};
 use wireguard_control::{
@@ -40,6 +43,22 @@ pub fn blocked_allowed_ips(state: &EndpointState, peers: &[Peer]) -> Vec<Allowed
         .filter_map(|relationship| find_peer(peers, &relationship.remote))
         .map(peer_allowed_ip)
         .collect()
+}
+
+/// Whether `other` (which currently advertises a PQ bundle iff `has_bundle`)
+/// qualifies for permissive mode's legacy exception (design 5.11): a peer
+/// with no PQ bundle that has never confirmed PQ with this interface.
+/// `prior_pq`, not `confirmed.is_some()`, is the signal that disqualifies a
+/// peer -- it is never cleared by `emergency_retire` the way `confirmed`
+/// is, so a relationship that ever completed PQ can never slide back into
+/// legacy eligibility just because its confirmed state was later reset.
+/// Pure and total: `other` need not have a `Relationship` yet (a peer never
+/// before seen with a bundle has `prior_pq` vacuously false).
+pub fn legacy_eligible(state: &EndpointState, other: Number, has_bundle: bool) -> bool {
+    if state.policy != Policy::Permissive || has_bundle {
+        return false;
+    }
+    !state.relationships.get(&other).is_some_and(|r| r.prior_pq)
 }
 
 /// Re-verifies the gate for every already-confirmed, no-pending
@@ -181,6 +200,35 @@ mod tests {
         }
     }
 
+    fn endpoint_state(policy: Policy) -> EndpointState {
+        use innernet_pq::{
+            api::{Lifecycle, Registration},
+            crypto::SystemRandom,
+            state::{Enrollment, Identity, ManagementLink},
+        };
+        let identity =
+            Identity::generate(Binary([9; 32]), Number::new(1).unwrap(), &mut SystemRandom)
+                .unwrap();
+        EndpointState {
+            network_id: Binary([1; 16]),
+            peer_id: Number::new(2).unwrap(),
+            server_id: Number::new(1).unwrap(),
+            server_public_key: Binary([1; 32]),
+            policy,
+            registration: Registration {
+                expected_revision: None,
+                pq_version: 1,
+                lifecycle: Lifecycle::Enabled,
+                bundle: identity.bundle.clone(),
+                emergency: false,
+            },
+            identity,
+            enrollment: Enrollment::Advertised,
+            management: ManagementLink::generate(&mut SystemRandom).unwrap(),
+            relationships: std::collections::BTreeMap::new(),
+        }
+    }
+
     fn fake_bundle(public_key: &Key) -> Bundle {
         Bundle {
             bundle_id: Binary([1; 16]),
@@ -190,6 +238,77 @@ mod tests {
             pq_x448_public_key: Binary([3; 56]),
             pq_sig_public_key: Binary([4; 67]),
         }
+    }
+
+    fn with_relationship(mut state: EndpointState, other: Number, prior_pq: bool) -> EndpointState {
+        use innernet_pq::{
+            crypto::{Secret, SystemRandom},
+            state::{Identity, Relationship, Status, StoredSecret},
+        };
+        let remote =
+            Identity::generate(Binary([8; 32]), Number::new(1).unwrap(), &mut SystemRandom)
+                .unwrap()
+                .bundle;
+        state.relationships.insert(
+            other,
+            Relationship {
+                remote,
+                sequence: Number::new(1).unwrap(),
+                prior_pq,
+                operator_psk_id: Binary([0; 16]),
+                operator_psk: StoredSecret(Secret::from_bytes([0; 32])),
+                confirmed: None,
+                pending: None,
+                gated: false,
+                status: Status::Advertised,
+                activity: None,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn legacy_eligible_only_for_permissive_bundle_less_never_confirmed_peers() {
+        let other = Number::new(3).unwrap();
+
+        // Strict: never eligible, regardless of bundle presence.
+        assert!(!legacy_eligible(
+            &endpoint_state(Policy::Strict),
+            other,
+            false
+        ));
+        assert!(!legacy_eligible(
+            &endpoint_state(Policy::Strict),
+            other,
+            true
+        ));
+
+        // Permissive, no relationship yet, no bundle: eligible.
+        assert!(legacy_eligible(
+            &endpoint_state(Policy::Permissive),
+            other,
+            false
+        ));
+
+        // Permissive, but the peer currently has a bundle: never eligible --
+        // the exception is only for a peer with no bundle at all.
+        assert!(!legacy_eligible(
+            &endpoint_state(Policy::Permissive),
+            other,
+            true
+        ));
+
+        // Permissive, no bundle now, but this relationship previously
+        // confirmed PQ (prior_pq): never eligible -- must never silently
+        // downgrade a relationship that once succeeded.
+        let state = with_relationship(endpoint_state(Policy::Permissive), other, true);
+        assert!(!legacy_eligible(&state, other, false));
+
+        // Permissive, no bundle now, relationship exists but never
+        // confirmed (e.g. seen a bundle once, then it disappeared before
+        // confirming): still eligible.
+        let state = with_relationship(endpoint_state(Policy::Permissive), other, false);
+        assert!(legacy_eligible(&state, other, false));
     }
 
     /// Exercises real kernel WireGuard peer installation and nft gating.

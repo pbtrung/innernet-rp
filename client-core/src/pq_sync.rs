@@ -40,16 +40,24 @@ pub fn path(data_dir: &Path, interface: &InterfaceName) -> PathBuf {
 /// to be reachable, so this must run only after the interface is confirmed
 /// up (never called for gate restoration at cold boot, which relies solely
 /// on already-persisted/cached state instead).
+///
+/// `permissive` sets `state.policy` from the live `--pq-psk-permissive`
+/// flag on every call, not just at registration -- safe because legacy
+/// eligibility (see `client_core::interface`) is gated on a relationship's
+/// `prior_pq`, never on policy history, so toggling this flag can never
+/// retroactively legalize legacy treatment for a relationship that ever
+/// confirmed PQ.
 pub fn open_or_register(
     data_dir: &Path,
     interface: &InterfaceName,
     rest_client: &RestClient,
     own_public_key: Binary<32>,
+    permissive: bool,
     rng: &mut impl Random,
 ) -> anyhow::Result<(Store, EndpointState)> {
     let mut store =
         Store::open(&path(data_dir, interface), true).context("opening PQ activation state")?;
-    let state = if store.is_fresh() {
+    let mut state = if store.is_fresh() {
         let state = register(rest_client, own_public_key, rng)?;
         store
             .save(&state)
@@ -57,6 +65,11 @@ pub fn open_or_register(
         state
     } else {
         store.load().context("loading PQ activation state")?
+    };
+    state.policy = if permissive {
+        Policy::Permissive
+    } else {
+        Policy::Strict
     };
     Ok((store, state))
 }
