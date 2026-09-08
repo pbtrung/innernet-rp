@@ -304,8 +304,8 @@ package/ABI requirements and non-Linux feature boundaries are recorded.
   tests, and release docs together. Signature policy and system linking are
   already decided and are not optional downgrade mechanisms.
 - Finish process/database downgrade/re-upgrade testing from design section
-  10, including legacy binaries that rewrite newer schema markers. Prevent
-  unsupported rollback and test the coordinated backup recovery procedure.
+  10 across this project's own releases. Prevent unsupported rollback and
+  test the coordinated backup recovery procedure.
 
 **Acceptance:** all design cases have recorded passing enforcement checks
 and documented expected limitations. Review findings are resolved or the
