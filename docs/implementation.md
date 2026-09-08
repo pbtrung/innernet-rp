@@ -846,3 +846,77 @@ Explicitly out of scope for M7: automatic/mailbox-driven rotation
 (design 5.10 is explicit that this is not part of v1); this project has
 no old/new binary compatibility requirement, so no legacy-binary
 rotation interop was tested (consistent with M6's scope decision).
+
+## M8 — Build targets and runtime dependencies
+
+M8's job (design case 18) is real aarch64 build/test evidence alongside
+x86_64, plus a scope decision: this project supports **Linux amd64 and
+aarch64 only** -- macOS and OpenBSD support is removed entirely, not
+preserved. Every `target_os = "macos"`/`"openbsd"` code branch is gone:
+`wireguard-control`'s `Backend::OpenBSD` variant and its 255-line
+backend module, `shared::wg`'s ifconfig-based `set_addr`/`set_up`/
+`add_route`, `shared`'s `getifaddrs`-based `_get_local_addrs`, the
+per-OS `DEFAULT_DATA_DIR`/CLI-default/install-message branches in
+`client-core`, `server`, and `client`. `Backend::Userspace` itself is
+kept -- it is Linux-selectable too (`--backend userspace`), not
+exclusively a non-Linux fallback. The two now-dead `nix`-dependency
+`[target.'cfg(...)']` sections (openbsd in `wireguard-control`, macOS/
+openbsd in `shared`) are removed, and the remaining Linux-only sections
+in `wireguard-control`, `shared`, and `server` collapse into plain
+`[dependencies]` since Linux is now the only target. No CI is created
+(explicit decision -- none existed before this milestone either, despite
+a stale reference to `.github/workflows/rust.yml` in the local commit
+skill, now removed); "establish release/build automation" is satisfied
+by `tests/run.sh`'s existing local-runner pattern, extended with a new
+`aarch64` case.
+
+Real aarch64 evidence came from an **emulated-native build**, not
+host-to-target cross-compilation: `docker buildx build --platform
+linux/arm64` under QEMU user-mode emulation (registered via `docker run
+--privileged --rm tonistiigi/binfmt --install arm64` -- a systemic,
+host-kernel-level change made with the user's explicit approval) gives
+cargo an aarch64 *host* triple inside the container, so `pq/build.rs`'s
+plain `pkg_config::probe()` needed zero cross-compilation-specific
+`PKG_CONFIG_SYSROOT_DIR` plumbing. Arch Linux ARM (`menci/archlinuxarm`,
+pinned by digest) packages the exact same `leancrypto 1.8.0-1`/
+`openssl 3.6.4-1` versions already pinned for x86_64 in M0, plus
+`rust 1.98.1-1` matching this repo's toolchain exactly -- confirmed by
+running `pkg-config --modversion`/`rustc --version` inside the built
+image before relying on it. One real hurdle: newer pacman's
+Landlock-based download-sandbox privilege drop isn't supported under
+QEMU user-mode emulation (`switching to sandbox user 'alpm' failed`),
+fixed with `DisableSandbox` in `pacman.conf`.
+`tests/docker/scenarios/aarch64_checks.sh` (`tests/run.sh aarch64`)
+builds the workspace and runs `cargo test -p innernet-pq --locked`
+(canonical ML-KEM/X448/signature vectors, durability/store tests, and
+the real `native_interop` openssl/leancrypto check, all of
+`pq/tests/*.rs`) against genuinely aarch64-compiled binaries executing
+under real emulation. Ran clean: full suite passed, including the
+300-schedule property test (which took ~300s under emulation vs. ~25s
+natively on x86_64 -- expected QEMU overhead, not a failure).
+
+What this real emulation *cannot* do, and what stays a documented gap
+rather than something faked: QEMU user-mode emulation translates
+instructions only -- syscalls still reach the host's x86_64 kernel, so
+no aarch64 kernel-module (WireGuard, nftables gate) behavior is
+reachable this way. No ARM hardware or full-system aarch64 VM is
+available in this environment. Gate/WireGuard convergence checks on
+aarch64 are therefore untested, matching this project's established
+pattern of documenting real constraints (M5's keepalive gap, M6's
+legacy-binary scope-out, M7's rollback-repair verification approach)
+rather than silently skipping or claiming coverage that doesn't exist.
+
+Tested on Linux x86_64, Arch Linux, 2026-09-08, Docker 29.7.2:
+
+| Check | Result |
+| --- | --- |
+| `cargo build --workspace --locked` / `cargo test --workspace --locked` | pass, with zero non-Linux `cfg` branches remaining |
+| `cargo clippy --workspace --locked --all-targets -- -D warnings` (default, and again with `--features pq-dev-harness,test-harness`) | passed both ways |
+| `bash tests/run.sh unit` / `integration` | passed |
+| `bash tests/run.sh aarch64` | real emulated-native aarch64 build succeeded; `cargo test -p innernet-pq --locked` passed in full under real QEMU aarch64 emulation |
+
+Explicitly out of scope for M8: aarch64 gate/nftables/WireGuard kernel-
+module evidence (no ARM hardware or full-system aarch64 VM available in
+this environment -- QEMU user-mode emulation cannot substitute for a
+real aarch64 kernel); any CI pipeline (explicit decision); non-Linux
+(macOS/OpenBSD) support of any kind (removed, not a project goal).

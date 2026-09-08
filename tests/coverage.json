@@ -261,8 +261,10 @@
       "design_case": 18,
       "unit": [],
       "integration": [],
-      "docker": [],
-      "status": "planned"
+      "docker": [
+        "aarch64_checks: cargo test -p innernet-pq --locked (the same crypto vectors from case 1, durability/store tests from cases 4/5/7, and the real openssl/leancrypto native_interop check) executed on real aarch64-compiled binaries under docker buildx --platform linux/arm64 QEMU emulation"
+      ],
+      "status": "m8-aarch64-crypto-durability-verified-under-emulation-gate-wireguard-on-aarch64-not-obtainable"
     }
   ]
 }

@@ -1,0 +1,38 @@
+{
+  "milestone": 8,
+  "revision": "the commit introducing this record",
+  "date": "2026-09-08",
+  "kernel": "Linux 7.2.2-1-cachyos x86_64",
+  "rust": "1.98.1",
+  "leancrypto": "1.8.0-1",
+  "openssl": "3.6.4-1",
+  "sqlite": "3.53.4-1",
+  "docker": "29.7.2",
+  "container_base": "archlinux@sha256:82b1b08faae9d61e3e7e13d562f4d09114d939105b0d59ff34140f3bd418593a",
+  "aarch64_container_base": "menci/archlinuxarm@sha256:a8d02c1dbaa387901a5ad89763d134163387ad329edce1f97678e9cadaf9eb15",
+  "aarch64_rust": "1.98.1-1",
+  "aarch64_leancrypto": "1.8.0-1",
+  "aarch64_openssl": "3.6.4-1",
+  "package_snapshot": "2026/09/07",
+  "schema": 5,
+  "checks": [
+    {"command": "cargo fmt --all", "result": "passed; stable fallback because nightly is unavailable"},
+    {"command": "cargo clippy --workspace --locked --all-targets -- -D warnings", "result": "passed (default build)"},
+    {"command": "cargo clippy --workspace --locked --all-targets --features pq-dev-harness,test-harness -- -D warnings", "result": "passed (dev-harness build)"},
+    {"command": "cargo test --workspace --locked", "result": "all suites passed, zero non-Linux cfg branches remaining"},
+    {"command": "bash tests/run.sh unit", "result": "passed"},
+    {"command": "bash tests/run.sh integration", "result": "passed"},
+    {"command": "bash tests/run.sh aarch64", "result": "passed: real emulated-native aarch64 build (docker buildx --platform linux/arm64 under QEMU) succeeded; cargo test -p innernet-pq --locked (canonical crypto vectors, durability/store tests, native_interop) passed in full, including the 300-schedule property test (~300s under emulation vs ~25s native x86_64)"}
+  ],
+  "aarch64_evidence": {
+    "method": "emulated-native build via docker buildx build --platform linux/arm64 under QEMU user-mode emulation (registered via `docker run --privileged --rm tonistiigi/binfmt --install arm64`, a host-kernel-level change made with explicit user approval), not host-to-target cross-compilation -- cargo's host triple is aarch64 inside the container, so pq/build.rs's plain pkg-config probe needed no cross-compilation-specific sysroot plumbing",
+    "real_finding": "newer pacman's Landlock-based download-sandbox privilege drop isn't supported under QEMU user-mode emulation ('switching to sandbox user alpm failed'); fixed with DisableSandbox in pacman.conf",
+    "covered": "crypto vectors, durability/store tests, native_interop (real openssl/leancrypto interop) -- all genuinely executed on aarch64-compiled binaries under real emulation",
+    "not_covered": "gate/nftables/WireGuard kernel-module behavior on aarch64: QEMU user-mode emulation translates instructions only, syscalls still reach the host's x86_64 kernel, so no aarch64 kernel-module behavior is reachable this way. No ARM hardware or full-system aarch64 VM is available in this environment"
+  },
+  "limitations": [
+    "aarch64 gate/nftables/WireGuard kernel-module evidence is not obtainable in this environment (no ARM hardware or full-system aarch64 VM)",
+    "no CI pipeline exists or was created (explicit decision); tests/run.sh's local-runner pattern is this project's release/build automation",
+    "non-Linux (macOS/OpenBSD) support has been removed entirely -- not a project goal, not a limitation to track"
+  ]
+}
