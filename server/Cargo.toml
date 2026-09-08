@@ -27,6 +27,11 @@ path = "src/main.rs"
 [features]
 v6-test = []
 selinux = ["innernet-shared/selinux"]
+# Exposes the in-process test harness (server::test::Server) to other
+# crates' own tests, so a cross-crate integration test can drive the real
+# API/session/db path without a real socket, root, or kernel WireGuard.
+# Never enabled in a normal build.
+test-harness = ["dep:tempfile"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -57,6 +62,7 @@ rusqlite = "0.40.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 subtle = "2.6.1"
+tempfile = { version = "3.27.0", optional = true }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time", "net", "sync"] }
 toml = "1.1.5"

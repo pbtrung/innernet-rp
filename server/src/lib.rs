@@ -41,8 +41,8 @@ pub mod gate;
 pub mod initialize;
 pub mod management;
 pub mod pq;
-#[cfg(test)]
-mod test;
+#[cfg(any(test, feature = "test-harness"))]
+pub mod test;
 mod util;
 
 pub use error::ServerError;

@@ -837,9 +837,13 @@ name = "innernet-client-core"
 version = "2.0.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "colored",
  "env_logger 0.11.11",
+ "http-body-util",
+ "hyper",
  "innernet-pq",
+ "innernet-server",
  "innernet-shared",
  "log",
  "once_cell",
@@ -848,7 +852,9 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "ureq",
+ "url",
  "wireguard-control",
 ]
 

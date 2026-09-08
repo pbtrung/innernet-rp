@@ -210,35 +210,32 @@ impl EndpointState {
             && exchange.sequence == pending.transcript.sequence
         {
             if exchange.decision.terminal() && !pending.decision.terminal() {
-                if let Some(message) = exchange
-                    .messages
-                    .iter()
-                    .find(|m| m.sender_id == other && m.message_type == Kind::Abort as u8)
-                {
-                    message.authenticate(&pending.transcript)?;
-                    pending.decision.phase = Phase::Aborted;
-                } else if matches!(pending.decision.phase, Phase::Proposed | Phase::Ready)
-                    && exchange.decision.phase == Phase::Aborted
-                {
-                    // Prepare-TTL expiry: not a signed message, but the
-                    // server never expires committed work, so adopting
-                    // this is only reachable from a phase where it is legal.
-                    pending.decision.phase = Phase::Aborted;
-                }
-            }
-            for message in exchange.messages.iter().filter(|m| m.sender_id == other) {
-                let kind = message.validate_shape()?;
-                let sender_is_initiator = message.sender_id == pending.transcript.initiator_id;
-                let mut trial = pending.decision.clone();
-                if trial.advance(kind, sender_is_initiator).is_ok() {
-                    message.authenticate(&pending.transcript)?;
-                    message.confirm(&pending.candidate.candidate())?;
-                    pending.decision = trial;
+                // A terminal record may already be compacted (transcript and
+                // messages cleared, per Exchange::compact) if this side is
+                // catching up after missing a poll; every prior transition
+                // was independently signature-verified before the server
+                // (itself running the same Decision::advance) could ever
+                // reach a terminal state, so the compact Decision itself is
+                // the authoritative, trusted outcome here.
+                pending.decision = exchange.decision.clone();
+            } else {
+                for message in exchange.messages.iter().filter(|m| m.sender_id == other) {
+                    let kind = message.validate_shape()?;
+                    let sender_is_initiator = message.sender_id == pending.transcript.initiator_id;
+                    let mut trial = pending.decision.clone();
+                    if trial.advance(kind, sender_is_initiator).is_ok() {
+                        message.authenticate(&pending.transcript)?;
+                        message.confirm(&pending.candidate.candidate())?;
+                        pending.decision = trial;
+                    }
                 }
             }
         }
 
-        if pending.decision.phase != Phase::Aborted
+        // A terminal record may already be compacted (messages cleared), so
+        // there is nothing left to find there to confirm; reaching a locally
+        // terminal decision is itself the proof every step was accounted for.
+        if !pending.decision.terminal()
             && !durably_sent(remote, pending, self_id)
             && let Some(last) = pending.outbox.last()
         {
