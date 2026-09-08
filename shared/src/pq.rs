@@ -14,6 +14,15 @@ pub struct PqOptions {
     /// interval never supersedes pending work: this is a target, not an SLA.
     #[arg(long, global = true, default_value = "300")]
     pub pq_psk_rotation_interval: u64,
+    /// Pause starting a new data-peer PSK rotation once this many seconds of
+    /// tunnel inactivity (no traffic at all, including keepalives) have
+    /// elapsed since the relationship's last completed rotation; 0 disables
+    /// pausing. This measures tunnel inactivity, not application idleness:
+    /// a link with a working persistent keepalive never pauses. Never
+    /// delays an initial exchange, receipt processing, reconciliation, or
+    /// recovery -- only a repeat rotation that would otherwise be due.
+    #[arg(long, global = true, default_value = "900")]
+    pub pq_psk_idle_timeout: u64,
 }
 
 impl Default for PqOptions {
@@ -22,6 +31,7 @@ impl Default for PqOptions {
             enable_pq_psk: false,
             pq_psk_permissive: false,
             pq_psk_rotation_interval: 300,
+            pq_psk_idle_timeout: 900,
         }
     }
 }
@@ -38,6 +48,11 @@ impl PqOptions {
         // any value that could overflow later monotonic-clock arithmetic.
         if self.pq_psk_rotation_interval == 0 || self.pq_psk_rotation_interval > u64::MAX / 4 {
             return Err("--pq-psk-rotation-interval must be positive and non-overflowing");
+        }
+        // Unlike the rotation interval, 0 is a valid, meaningful value here
+        // ("pausing disabled"), so only the overflow bound is rejected.
+        if self.pq_psk_idle_timeout > u64::MAX / 4 {
+            return Err("--pq-psk-idle-timeout must be non-overflowing");
         }
         Ok(())
     }
@@ -105,6 +120,26 @@ mod tests {
                 .pq
                 .validate()
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn idle_timeout_defaults_and_accepts_zero_but_rejects_overflow() {
+        let default = Cli::try_parse_from(["test"]).unwrap();
+        assert_eq!(default.pq.pq_psk_idle_timeout, 900);
+        default.pq.validate().unwrap();
+        // Unlike the rotation interval, 0 ("pausing disabled") is valid.
+        assert!(Cli::try_parse_from(["test", "--pq-psk-idle-timeout", "0"])
+            .unwrap()
+            .pq
+            .validate()
+            .is_ok());
+        assert!(
+            Cli::try_parse_from(["test", "--pq-psk-idle-timeout", &u64::MAX.to_string()])
+                .unwrap()
+                .pq
+                .validate()
+                .is_err()
         );
     }
 }
