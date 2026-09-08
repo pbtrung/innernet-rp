@@ -12,9 +12,13 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context as _, Error};
 use colored::{ColoredString, Colorize};
-use innernet_pq::{crypto::SystemRandom, protocol::Binary, store::Store};
+use innernet_pq::{
+    crypto::SystemRandom,
+    protocol::{Binary, Number},
+    store::Store,
+};
 use innernet_shared::{
-    get_local_addrs,
+    get_local_addrs, peer_allowed_ip,
     pq::PqOptions,
     update_hosts_file,
     wg::{self, DeviceExt as _},
@@ -299,6 +303,56 @@ pub fn fetch(
         }
     }
 
+    // Opened before the ordinary peer diff/apply below (not after): a peer
+    // that just became newly visible through the ordinary directory must
+    // never carry application traffic on an unconfirmed PQ link, even for
+    // the single tick before the PQ engine itself discovers/creates its
+    // Relationship. Gating here, before that peer gets its ordinary
+    // WireGuard connectivity, closes that window.
+    let mut pq_activation = if pq.enable_pq_psk && server_is_reachable {
+        let public_key = wireguard_control::Key::from_base64(&config.interface.private_key)
+            .map_err(|e| anyhow!("parsing this interface's own public key: {e}"))?
+            .get_public();
+        let mut rng = SystemRandom;
+        let (pq_store, state) = pq_sync::open_or_register(
+            data_dir,
+            interface,
+            &rest_client,
+            Binary(public_key.0),
+            &mut rng,
+        )
+        .context("opening or registering PQ activation state")?;
+
+        let unconfirmed: Vec<_> = peers
+            .iter()
+            .filter(|peer| {
+                // The coordination server itself is never a PQ data-peer
+                // relationship (pq_sync::apply's own loop excludes it the
+                // same way); including it here would gate the very link
+                // this activation needs to complete over.
+                let Ok(id) = Number::new(peer.id as u64) else {
+                    return false;
+                };
+                if id == state.server_id || id == state.peer_id {
+                    return false;
+                }
+                state
+                    .relationships
+                    .get(&id)
+                    .and_then(|r| r.confirmed.as_ref())
+                    .is_none()
+            })
+            .map(peer_allowed_ip)
+            .collect();
+        if !unconfirmed.is_empty() {
+            gate::block(interface, &unconfirmed)
+                .map_err(|e| anyhow!("gating newly visible PQ peers: {e}"))?;
+        }
+        Some((pq_store, state, rng))
+    } else {
+        None
+    };
+
     let device = Device::get(interface, network_opts.backend)?;
     let modifications = device.diff(&peers);
 
@@ -348,19 +402,7 @@ pub fn fetch(
     // cold boot closes every gate above, and a merely-confirmed
     // relationship still needs one fresh post-boot handshake before its
     // gate reopens, since the gate itself did not survive the reboot).
-    if pq.enable_pq_psk && server_is_reachable {
-        let public_key = wireguard_control::Key::from_base64(&config.interface.private_key)
-            .map_err(|e| anyhow!("parsing this interface's own public key: {e}"))?
-            .get_public();
-        let mut rng = SystemRandom;
-        let (mut pq_store, mut state) = pq_sync::open_or_register(
-            data_dir,
-            interface,
-            &rest_client,
-            Binary(public_key.0),
-            &mut rng,
-        )
-        .context("opening or registering PQ activation state")?;
+    if let Some((mut pq_store, mut state, mut rng)) = pq_activation.take() {
         let (pq_peers, exchanges) =
             pq_sync::fetch_state(&rest_client).context("fetching PQ exchange state")?;
         let now = SystemTime::now()

@@ -1,0 +1,78 @@
+# M4 scenario: one server, three data peers (A, B, C). A-B is the pair that
+# activates/rotates under real production --enable-pq-psk; C is testing.md's
+# cooperating "A-C traffic/progress control", proving the per-peer gate never
+# affects an unrelated relationship. Uses the plain production runtime image
+# (no pq-dev-harness feature): real activation no longer needs a bypass.
+services:
+  server:
+    image: innernet-pq-runtime:m4
+    cap_add: [NET_ADMIN]
+    networks:
+      pq_m4:
+        ipv4_address: 10.90.0.2
+    volumes:
+      - server_config:/etc/innernet-server
+      - server_data:/var/lib/innernet-server
+      - invites:/invites
+      - ./scenarios/server-entrypoint-m4.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  peer-a:
+    image: innernet-pq-runtime:m4
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m4:
+        ipv4_address: 10.90.0.3
+    volumes:
+      - peer_a_config:/etc/innernet
+      - peer_a_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m4.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-a"]
+
+  peer-b:
+    image: innernet-pq-runtime:m4
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m4:
+        ipv4_address: 10.90.0.4
+    volumes:
+      - peer_b_config:/etc/innernet
+      - peer_b_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m4.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-b"]
+
+  peer-c:
+    image: innernet-pq-runtime:m4
+    cap_add: [NET_ADMIN]
+    depends_on: [server]
+    networks:
+      pq_m4:
+        ipv4_address: 10.90.0.5
+    volumes:
+      - peer_c_config:/etc/innernet
+      - peer_c_data:/var/lib/innernet
+      - invites:/invites
+      - ./scenarios/peer-entrypoint-m4.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh", "peer-c"]
+
+networks:
+  pq_m4:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.90.0.0/24
+
+volumes:
+  server_config:
+  server_data:
+  peer_a_config:
+  peer_a_data:
+  peer_b_config:
+  peer_b_data:
+  peer_c_config:
+  peer_c_data:
+  invites:
